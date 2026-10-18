@@ -80,6 +80,8 @@ pub struct ArrangeState {
     /// Vertical scroll of the track rows (points).
     pub vscroll: f32,
     pub layout: Layout,
+    /// The track menu's open "Instrument" submenu entries (`value` is the plug-in id).
+    pub menu: Vec<crate::mixer::MenuItem>,
 }
 
 /// Timeline mapping: x ↔ samples, from the session's shared zoom (`edit.zoom`).
@@ -136,6 +138,7 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     };
     let selected_tracks = s.edit.selected_tracks.clone();
     let focus = app.focus_track();
+    app.arrange.menu.clear();
     for (i, t) in rows.iter().enumerate() {
         let y0 = tl.min.y + i as f32 * rh - app.arrange.vscroll;
         let header = Rect::from_min_max(pos2(list.min.x, y0), pos2(list.max.x, y0 + rh));
@@ -277,6 +280,24 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
 /// The track's right-click menu.
 fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, has_instrument: bool) {
     if kind == TrackKind::Instrument {
+        // Instrument ▸: the device chain's instrument menu (a click in its filter box keeps it open).
+        let config = egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        let mut picked = None;
+        let (button, _) = egui::containers::menu::SubMenuButton::new("Instrument").config(config).ui(ui, |ui| {
+            let lists = app.instrument_lists();
+            let current = app.engine.session().track(id).and_then(|t| t.instrument.as_ref()).map(|i| i.plugin.clone());
+            let mut filter = std::mem::take(&mut app.mixer.instrument_filter);
+            let mut items = Vec::new();
+            picked = crate::devices::instrument_menu(ui, &lists, current.as_deref(), &mut filter, &mut items);
+            app.mixer.instrument_filter = filter;
+            app.arrange.menu.extend(items);
+        });
+        app.arrange.menu.push(crate::mixer::MenuItem { label: "Instrument".into(), value: String::new(), rect: r4(button.rect) });
+        if let Some(plugin) = picked {
+            app.mixer.instrument_filter.clear();
+            let _ = app.set_instrument(id, &plugin);
+            ui.close();
+        }
         if ui.add_enabled(has_instrument && app.player.is_some(), egui::Button::new("Open Instrument Editor")).clicked() {
             app.want_editor((id, soundcraft_mix::INSTRUMENT_SLOT));
             ui.close();

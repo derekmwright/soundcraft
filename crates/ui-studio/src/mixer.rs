@@ -14,13 +14,19 @@
 //!   whose input is the bus), not the bus. "Add FX Channel" is four commands, one undo step.
 //! - L12: the master is an optional track. Without one the main-out strip shows the main meter
 //!   and offers to add a master fader.
+//! - L4: sends are ten fixed slots. A strip lists the occupied ones as rows (target, level,
+//!   remove) under its input, Logic style, and "+ Send" fills the first free slot.
+//!
+//! Routing never offers a target that would close a loop of any length: the engine accepts
+//! loops (`track.output`, `track.input` and `mix.send` don't check), and the mix only bounds the
+//! aux depth, so the menus walk the graph themselves ([`feeding_loops`], [`listening_loops`]).
 
 use crate::StudioApp;
 use crate::arrange::R4;
 use crate::theme::{self, TOKENS};
 use egui::{Align2, Color32, CursorIcon, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::{Value, json};
-use soundcraft_model::{Route, Session, Track, TrackId, TrackKind};
+use soundcraft_model::{BusId, Route, SendSlot, Session, Track, TrackId, TrackKind};
 
 /// Strip width and gap (points).
 pub const STRIP_W: f32 = 88.0;
@@ -33,6 +39,28 @@ pub const FADER_MAX_DB: f32 = 12.0;
 pub enum MixGesture {
     Fader { track: TrackId, start_k: f32, height: f32 },
     Knob { track: TrackId, start: f32 },
+    Send { track: TrackId, slot: usize, start_k: f32 },
+}
+
+/// The value a "+ Send" menu entry carries for "New FX Channel…".
+pub const NEW_FX: &str = "\u{1}new-fx-channel";
+
+/// One send row as last drawn (a strip's or the device chain's).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SendRow {
+    pub slot: usize,
+    /// What the target reads as: the FX channel's name, or "Bus: name".
+    pub target: String,
+    pub level_db: f32,
+    pub pre_fader: bool,
+    pub rect: R4,
+    /// Click: a menu to send somewhere else.
+    pub target_rect: R4,
+    /// Drag: the level (one undo step); double-click: 0 dB.
+    pub level_rect: R4,
+    pub remove: R4,
+    /// The pre/post toggle (device chain only; strips have it in the row's right-click menu).
+    pub pre: R4,
 }
 
 /// One dropdown or menu entry as last drawn (for `ui.inspect`; scripts click them).
@@ -68,6 +96,11 @@ pub struct StripLayout {
     /// The track's panners as the engine holds them.
     pub pan: Vec<f32>,
     pub level: [f32; 2],
+    /// An FX (aux) channel: tagged "FX", its name muted.
+    pub fx: bool,
+    pub sends: Vec<SendRow>,
+    /// "+ Send" (zero when the strip takes no sends or all ten are in use).
+    pub add_send: R4,
 }
 
 /// Last frame's mixer geometry.
@@ -97,6 +130,8 @@ pub struct DeviceCard {
     pub remove_button: R4,
     pub editor_button: R4,
     pub editor_enabled: bool,
+    /// The instrument card's name (or "Choose…" when there is none): opens the instrument menu.
+    pub pick_button: R4,
 }
 
 /// Last frame's device chain geometry.
@@ -107,8 +142,12 @@ pub struct DevicesLayout {
     pub area: R4,
     pub cards: Vec<DeviceCard>,
     pub add: R4,
-    /// The open "+" menu's entries (`value` is the plug-in id).
+    /// The open menu's entries: "+" or the instrument menu (`value` is the plug-in id), or a
+    /// send menu (`value` is the bus name, or [`NEW_FX`]).
     pub menu: Vec<MenuItem>,
+    /// The focused track's sends.
+    pub sends: Vec<SendRow>,
+    pub add_send: R4,
 }
 
 /// A plug-in the "+" menu offers.
@@ -131,6 +170,8 @@ pub struct MixerState {
     pub(crate) builtin: Option<Vec<PluginEntry>>,
     /// Display names of hosted plug-ins by id, filled from the scan caches as cards need them.
     pub(crate) names: std::collections::HashMap<String, String>,
+    /// The instrument menu's filter text (shown when the list is long).
+    pub instrument_filter: String,
     /// Gestures started, to give each composite its own merge key.
     serial: u64,
 }
@@ -187,8 +228,82 @@ fn meter_k(lin: f32) -> f32 {
 }
 
 /// The aux track fed by `bus`, if any: an FX or group channel.
-fn channel_of_bus(s: &Session, bus: soundcraft_model::BusId) -> Option<&Track> {
+fn channel_of_bus(s: &Session, bus: BusId) -> Option<&Track> {
     s.tracks.iter().find(|t| t.kind == TrackKind::Aux && t.mixer.input == Route::Bus(bus))
+}
+
+/// A bus as a routing target reads: the FX channel it feeds, else "Bus: name".
+pub fn bus_label(s: &Session, bus: BusId) -> String {
+    channel_of_bus(s, bus).map_or_else(|| format!("Bus: {}", s.bus(bus).map_or("?", |b| b.name.as_str())), |c| c.name.clone())
+}
+
+/// The busses a track feeds: its output and its sends' targets.
+fn bus_targets(t: &Track) -> impl Iterator<Item = BusId> + '_ {
+    std::iter::once(&t.mixer.output).chain(t.mixer.sends.iter().flatten().map(|s| &s.target)).filter_map(|r| match r {
+        Route::Bus(b) => Some(*b),
+        _ => None,
+    })
+}
+
+/// Whether audio put on bus `from` reaches bus `to`: through every track listening to a bus and
+/// on through its output and sends, any number of hops (`from == to` counts).
+pub fn reaches(s: &Session, from: BusId, to: BusId) -> bool {
+    let mut seen: Vec<BusId> = Vec::new();
+    let mut todo = vec![from];
+    while let Some(b) = todo.pop() {
+        if b == to {
+            return true;
+        }
+        if seen.contains(&b) {
+            continue;
+        }
+        seen.push(b);
+        for t in s.tracks.iter().filter(|t| t.mixer.input == Route::Bus(b)) {
+            todo.extend(bus_targets(t));
+        }
+    }
+    false
+}
+
+/// Whether `t` feeding bus `b` (output or send) would close a loop back to `t`'s own input.
+pub fn feeding_loops(s: &Session, t: &Track, b: BusId) -> bool {
+    matches!(t.mixer.input, Route::Bus(input) if reaches(s, b, input))
+}
+
+/// Whether `t` listening to bus `b` would close a loop: something `t` feeds reaches `b`.
+pub fn listening_loops(s: &Session, t: &Track, b: BusId) -> bool {
+    bus_targets(t).any(|o| reaches(s, o, b))
+}
+
+/// Whether a track kind has sends here: audio, instrument and FX channels.
+pub fn takes_sends(kind: TrackKind) -> bool {
+    matches!(kind, TrackKind::Audio | TrackKind::Instrument | TrackKind::Aux)
+}
+
+/// Where a send from `t` can go: `(label, bus name)` for every bus that is not already one of its
+/// sends (`except` slot aside) and would not close a loop.
+pub fn send_targets(s: &Session, t: &Track, except: Option<usize>) -> Vec<(String, String)> {
+    let taken: Vec<&Route> =
+        t.mixer.sends.iter().enumerate().filter(|(i, _)| Some(*i) != except).filter_map(|(_, x)| x.as_ref()).map(|x| &x.target).collect();
+    s.busses
+        .iter()
+        .filter(|b| !taken.contains(&&Route::Bus(b.id)) && !feeding_loops(s, t, b.id))
+        .map(|b| (bus_label(s, b.id), b.name.clone()))
+        .collect()
+}
+
+/// Whether picking `value` from a route dropdown would leave the route as it is: the same route,
+/// or the label the current one already reads as (an audio track's default input, L15).
+fn same_route(s: &Session, cur: &Route, cur_label: &str, value: &str, label: &str) -> bool {
+    if label == cur_label {
+        return true;
+    }
+    let parsed = match value.to_ascii_lowercase().as_str() {
+        "" | "none" | "no input" | "no output" => Route::None,
+        "main" | "out 1-2" | "master" => Route::Main,
+        _ => s.bus_by_name(value).map_or_else(|| Route::Hardware(value.to_string()), |b| Route::Bus(b.id)),
+    };
+    &parsed == cur
 }
 
 /// How a route reads in a dropdown: busses by the channel they feed (L5). An audio track whose
@@ -199,10 +314,8 @@ pub fn route_label(s: &Session, r: &Route, input: bool, format_channels: usize) 
         Route::None | Route::Main if input && format_channels > 0 => if format_channels >= 2 { "In 1-2" } else { "In 1" }.into(),
         Route::None => if input { "No input" } else { "No output" }.into(),
         Route::Main => "Main".into(),
-        Route::Bus(b) => match channel_of_bus(s, *b) {
-            Some(t) if !input => t.name.clone(),
-            _ => s.bus(*b).map_or_else(|| "Bus".into(), |b| b.name.clone()),
-        },
+        Route::Bus(b) if input => s.bus(*b).map_or_else(|| "Bus".into(), |b| format!("Bus: {}", b.name)),
+        Route::Bus(b) => bus_label(s, *b),
         Route::Hardware(h) => h.clone(),
     }
 }
@@ -211,12 +324,11 @@ pub fn route_label(s: &Session, r: &Route, input: bool, format_channels: usize) 
 pub fn output_choices(s: &Session, t: &Track) -> Vec<(String, String)> {
     let mut v = vec![("Main".to_string(), "main".to_string())];
     for b in &s.busses {
-        // Not into its own input (a loop), and not into a folder's own bus from outside it.
-        if t.mixer.input == Route::Bus(b.id) {
+        // Never a bus that comes back to this track's input, however many hops away.
+        if feeding_loops(s, t, b.id) {
             continue;
         }
-        let label = channel_of_bus(s, b.id).map_or_else(|| format!("Bus: {}", b.name), |c| c.name.clone());
-        v.push((label, b.name.clone()));
+        v.push((bus_label(s, b.id), b.name.clone()));
     }
     v.push(("No output".into(), "none".into()));
     v
@@ -238,7 +350,7 @@ pub fn input_choices(s: &Session, t: &Track, device_inputs: usize) -> Vec<(Strin
         }
     }
     for b in &s.busses {
-        if t.mixer.output == Route::Bus(b.id) {
+        if listening_loops(s, t, b.id) {
             continue;
         }
         v.push((format!("Bus: {}", b.name), b.name.clone()));
@@ -286,20 +398,51 @@ impl StudioApp {
         Ok(last)
     }
 
-    /// Route a track's output (`track.output`), by the value an output choice carries.
+    /// Route a track's output (`track.output`), by the value an output choice carries. Picking
+    /// what the output already is changes nothing (no document edit, no undo step).
     pub fn set_output(&mut self, t: TrackId, value: &str) -> Result<Value, String> {
+        let s = self.engine.session_arc();
+        if let Some(tr) = s.track(t) {
+            let cur = route_label(&s, &tr.mixer.output, false, tr.channels());
+            let label = output_choices(&s, tr).into_iter().find(|(_, v)| v == value).map_or_else(|| value.to_string(), |(l, _)| l);
+            if same_route(&s, &tr.mixer.output, &cur, value, &label) {
+                return Ok(json!({"unchanged": true}));
+            }
+        }
         self.run("track.output", json!({"tracks": [t.0], "output": value}))
     }
 
-    /// Route a track's input (`track.input`).
+    /// Route a track's input (`track.input`). Picking what the input already reads as (an audio
+    /// track's default "In 1-2", L15) changes nothing.
     pub fn set_input(&mut self, t: TrackId, value: &str) -> Result<Value, String> {
+        let s = self.engine.session_arc();
+        if let Some(tr) = s.track(t) {
+            let ch = if tr.kind == TrackKind::Audio { tr.channels() } else { 0 };
+            let cur = route_label(&s, &tr.mixer.input, true, ch);
+            let label =
+                input_choices(&s, tr, self.device_inputs()).into_iter().find(|(_, v)| v == value).map_or_else(|| value.to_string(), |(l, _)| l);
+            if same_route(&s, &tr.mixer.input, &cur, value, &label) {
+                return Ok(json!({"unchanged": true}));
+            }
+        }
         self.run("track.input", json!({"tracks": [t.0], "input": value}))
     }
 
-    /// Add a device to the end of the track's chain (`mix.insert` takes the first free slot;
-    /// ten at most, plan 06 L1).
+    /// Add a device at the end of the track's chain: the slot after the last occupied one, so it
+    /// lands after every device already there. Ten slots at most (plan 06, L1): when the last
+    /// slot is taken but an earlier one is free, the device goes there and the status line says so.
     pub fn add_device(&mut self, t: TrackId, plugin: &str) -> Result<Value, String> {
-        self.run("mix.insert", json!({"track": t.0, "plugin": plugin}))
+        let ins = self.engine.session().track(t).map(|tr| tr.mixer.inserts.clone()).unwrap_or_default();
+        let next = ins.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+        if next < ins.len() {
+            return self.run("mix.insert", json!({"track": t.0, "slot": next, "plugin": plugin}));
+        }
+        let r = self.run("mix.insert", json!({"track": t.0, "plugin": plugin}));
+        if r.is_ok() {
+            self.status =
+                "The last device slot is in use, so the new device went into a free slot earlier in the chain (ten slots, plan 06 L1).".into();
+        }
+        r
     }
 
     pub fn toggle_bypass(&mut self, t: TrackId, slot: usize) -> Result<Value, String> {
@@ -315,13 +458,46 @@ impl StudioApp {
         self.run("mix.insert_remove", json!({"track": t.0, "slot": slot}))
     }
 
-    /// Add FX Channel (plan 06, L5): a bus, an aux track listening to it, and a send to it from
-    /// the focused track, as one undo step. Returns the new channel's track id.
+    /// Put `plugin` on an instrument track as its instrument (`mix.instrument`, one undo step),
+    /// replacing the one there. The old instrument's editor window closes first. Picking the
+    /// instrument the track already has changes nothing.
+    pub fn set_instrument(&mut self, t: TrackId, plugin: &str) -> Result<Value, String> {
+        if self.engine.session().track(t).and_then(|tr| tr.instrument.as_ref()).is_some_and(|i| i.plugin == plugin) {
+            return Ok(json!({"unchanged": true}));
+        }
+        let key = (t, soundcraft_mix::INSTRUMENT_SLOT);
+        if let Some(p) = &self.player {
+            p.close_editor(key.0, key.1);
+        }
+        self.ui.plugin_windows.retain(|k| *k != key);
+        self.editors.retain(|e| e.key != key);
+        self.run("mix.instrument", json!({"track": t.0, "plugin": plugin}))
+    }
+
+    /// "+ FX Channel" after the strips: a new FX channel with a send from the focused track
+    /// (not from an FX channel or the master) at -12 dB.
     pub fn add_fx_channel(&mut self) -> Result<TrackId, String> {
         let s = self.engine.session();
+        let from = self.focus_track().filter(|t| s.track(*t).is_some_and(|t| t.kind != TrackKind::Aux && takes_sends(t.kind)));
+        self.new_fx_channel(from, -12.0)
+    }
+
+    /// New FX Channel (plan 06, L5): a bus, an FX (aux) channel listening to it and, from `from`,
+    /// a send to it at `level_db`, as one undo step. Returns the new channel's track id.
+    ///
+    /// When `from` has no free send slot nothing is made. If a step fails anyway, the steps
+    /// already run are undone, so no bus or channel is left behind. The undo step reads "New Bus"
+    /// (its first command's label): the engine has no way to name a composite (plan 06, L20).
+    pub fn new_fx_channel(&mut self, from: Option<TrackId>, level_db: f32) -> Result<TrackId, String> {
+        let s = self.engine.session_arc();
         let name =
             (1..).map(|i| format!("FX {i}")).find(|n| s.bus_by_name(n).is_none() && s.track_by_name(n).is_none()).unwrap_or_else(|| "FX".into());
-        let from = self.focus_track().filter(|t| s.track(*t).is_some_and(|t| !matches!(t.kind, TrackKind::Master | TrackKind::Aux)));
+        let slot = from.and_then(|f| s.track(f)).map(|t| (t.name.clone(), t.mixer.sends.iter().position(Option::is_none)));
+        if let Some((track, None)) = &slot {
+            self.status = format!("New FX Channel: all ten sends of {track} are in use");
+            return Err(self.status.clone());
+        }
+        let slot = slot.and_then(|(_, s)| s);
         self.mixer.serial += 1;
         let key = format!("fx-channel:{}", self.mixer.serial);
         self.engine.end_merge();
@@ -332,21 +508,59 @@ impl StudioApp {
             let id = r.get("tracks").and_then(|t| t.get(0)).and_then(Value::as_u64).unwrap_or(0);
             e.execute_merged("track.input", &json!({"tracks": [id], "input": name}), &key)?;
             if let Some(f) = from {
-                e.execute_merged("mix.send", &json!({"track": f.0, "bus": name, "level_db": -12.0}), &key)?;
+                let mut p = json!({"track": f.0, "bus": name, "level_db": level_db});
+                if let Some(slot) = slot {
+                    p["slot"] = json!(slot);
+                }
+                e.execute_merged("mix.send", &p, &key)?;
             }
             Ok::<u64, soundcraft_engine::EngineError>(id)
         })();
         self.engine.end_merge();
         match r {
             Ok(id) => {
-                self.status = format!("Added {name}{}", from.map_or(String::new(), |_| ", with a send from the focused track".into()));
+                self.status = format!("Added {name}{}", from.map_or(String::new(), |_| " with a send to it".into()));
                 Ok(TrackId(id))
             }
             Err(e) => {
-                self.status = format!("Add FX Channel: {e}");
+                // Take back what the composite did so far (one merged undo step).
+                if !std::sync::Arc::ptr_eq(&s, &self.engine.session_arc()) {
+                    self.engine.undo();
+                }
+                self.status = format!("New FX Channel: {e}");
                 Err(self.status.clone())
             }
         }
+    }
+
+    /// "+ Send": a send from `t` to bus `value` at 0 dB in the first free slot, or a new FX
+    /// channel with its send for [`NEW_FX`].
+    pub fn add_send(&mut self, t: TrackId, value: &str) -> Result<Value, String> {
+        if value == NEW_FX {
+            return self.new_fx_channel(Some(t), 0.0).map(|id| json!({"track": id.0}));
+        }
+        self.run("mix.send", json!({"track": t.0, "bus": value, "level_db": 0.0}))
+    }
+
+    /// Send slot `slot` somewhere else; its level and pre/post setting stay.
+    pub fn retarget_send(&mut self, t: TrackId, slot: usize, bus: &str) -> Result<Value, String> {
+        self.run("mix.send", json!({"track": t.0, "slot": slot, "bus": bus}))
+    }
+
+    /// Send level gesture: one undo step per drag (merge key `send:<track>:<slot>`).
+    pub fn set_send_level_merged(&mut self, t: TrackId, slot: usize, db: f32) -> Result<Value, String> {
+        self.engine
+            .execute_merged("mix.send_level", &json!({"track": t.0, "slot": slot, "db": db}), &format!("send:{}:{slot}", t.0))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn remove_send(&mut self, t: TrackId, slot: usize) -> Result<Value, String> {
+        self.run("mix.send_remove", json!({"track": t.0, "slot": slot}))
+    }
+
+    /// Pre-fader or post-fader (`mix.send_level {pre_fader}`).
+    pub fn set_send_pre(&mut self, t: TrackId, slot: usize, pre: bool) -> Result<Value, String> {
+        self.run("mix.send_level", json!({"track": t.0, "slot": slot, "pre_fader": pre}))
     }
 
     /// The number of audio inputs offered in input dropdowns: the open input's, else 8.
@@ -392,13 +606,18 @@ fn strips(app: &mut StudioApp, ui: &mut Ui) {
     let content_w = channels.len() as f32 * (STRIP_W + GAP) + 110.0;
     app.mixer.hscroll = app.mixer.hscroll.clamp(0.0, (content_w - lane.width()).max(0.0));
     let mut layout = MixerLayout { visible: true, area: r4(area), menu: std::mem::take(&mut app.mixer.layout.menu), ..MixerLayout::default() };
+    // The sends block is as tall on every strip (the most sends plus "+ Send"), so the faders
+    // line up, and never so tall that a fader gets shorter than MIN_FADER.
+    let wanted = channels.iter().filter(|t| takes_sends(t.kind)).map(|t| send_rows_of(t)).max().unwrap_or(0);
+    let room = ((lane.height() - STRIP_FIXED_H - MIN_FADER) / SEND_ROW_H).floor().max(0.0) as usize;
+    let rows = wanted.min(room);
     for (i, t) in channels.iter().enumerate() {
         let x = lane.min.x + i as f32 * (STRIP_W + GAP) - app.mixer.hscroll;
         let r = Rect::from_min_size(pos2(x, lane.min.y), vec2(STRIP_W, lane.height()));
         if r.max.x < lane.min.x || r.min.x > lane.max.x {
             continue;
         }
-        let sl = strip(app, ui, &s, t, r, lane, focus == Some(t.id), &mut layout.menu);
+        let sl = strip(app, ui, &s, t, r, lane, focus == Some(t.id), rows, &mut layout.menu);
         layout.strips.push(sl);
     }
     // "Add FX Channel" after the last strip.
@@ -418,7 +637,7 @@ fn strips(app: &mut StudioApp, ui: &mut Ui) {
     ui.painter().line_segment([pos2(master_rect.min.x - 5.0, area.min.y), pos2(master_rect.min.x - 5.0, area.max.y)], Stroke::new(1.0, TOKENS.line));
     match master {
         Some(m) => {
-            let sl = strip(app, ui, &s, m, master_rect, master_rect, focus == Some(m.id), &mut layout.menu);
+            let sl = strip(app, ui, &s, m, master_rect, master_rect, focus == Some(m.id), rows, &mut layout.menu);
             layout.master = Some(sl);
         }
         None => {
@@ -514,9 +733,21 @@ fn dropdown(ui: &mut Ui, clip: Rect, r: Rect, id: egui::Id, current: &str, choic
         TOKENS.text_dim,
         Stroke::NONE,
     ));
+    choice_menu(&resp, current, choices, menu)
+}
+
+/// The menu of a dropdown-like field: `choices` as `(label, value)`, the `current` label marked.
+/// A [`NEW_FX`] entry comes after a separator. Returns the value picked.
+fn choice_menu(resp: &egui::Response, current: &str, choices: &[(String, String)], menu: &mut Vec<MenuItem>) -> Option<String> {
     let mut picked = None;
-    egui::Popup::menu(&resp).width(150.0).show(|ui| {
+    egui::Popup::menu(resp).width(150.0).show(|ui| {
+        if choices.is_empty() {
+            ui.weak("Nothing to pick");
+        }
         for (label, value) in choices {
+            if value == NEW_FX {
+                ui.separator();
+            }
             let b = ui.add(egui::Button::selectable(label == current, label.as_str()));
             menu.push(MenuItem { label: label.clone(), value: value.clone(), rect: r4(b.rect) });
             if b.clicked() {
@@ -528,9 +759,244 @@ fn dropdown(ui: &mut Ui, clip: Rect, r: Rect, id: egui::Id, current: &str, choic
     picked
 }
 
+/// Height of one send row, and of the strip without its sends block and fader.
+pub const SEND_ROW_H: f32 = 17.0;
+const STRIP_FIXED_H: f32 = 195.0;
+const MIN_FADER: f32 = 80.0;
+
+/// The rows a track's sends block wants: its sends plus "+ Send" while a slot is free.
+fn send_rows_of(t: &Track) -> usize {
+    let used = t.mixer.sends.iter().flatten().count();
+    used + usize::from(used < t.mixer.sends.len())
+}
+
+/// How a send level reads: whole dB in a strip, tenths in the device chain.
+fn level_text(db: f32, wide: bool) -> String {
+    if db <= -144.0 {
+        "-inf".into()
+    } else if wide {
+        format!("{db:.1} dB")
+    } else if db.abs() < 0.5 {
+        "0".into()
+    } else {
+        format!("{db:.0}")
+    }
+}
+
+/// One send row: the target (click: send it somewhere else; right-click: pre/post and remove),
+/// the level (drag like a fader, one undo step; double-click: 0 dB) and remove. `wide` (the
+/// device chain) adds a Pre/Post toggle; a strip marks a pre-fader send with a "P".
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_row(
+    app: &mut StudioApp,
+    ui: &mut Ui,
+    s: &Session,
+    t: &Track,
+    slot: usize,
+    snd: &SendSlot,
+    r: Rect,
+    clip: Rect,
+    wide: bool,
+    menu: &mut Vec<MenuItem>,
+) -> SendRow {
+    let id = t.id;
+    let salt = (id.0, slot, wide);
+    let p = ui.painter().with_clip_rect(clip);
+    let target = match &snd.target {
+        Route::Bus(b) => bus_label(s, *b),
+        other => route_label(s, other, false, 0),
+    };
+    let mut row = SendRow { slot, target: target.clone(), level_db: snd.level_db, pre_fader: snd.pre_fader, rect: r4(r), ..SendRow::default() };
+    p.rect_filled(r, 2.0, TOKENS.bg);
+    // The level as a thin line along the bottom, so the row reads as a small fader.
+    let k = db_to_k(snd.level_db);
+    p.rect_filled(
+        Rect::from_min_size(pos2(r.min.x, r.max.y - 2.0), vec2(r.width() * k, 2.0)),
+        0.0,
+        if snd.mute { TOKENS.text_dim } else { TOKENS.accent },
+    );
+    let xb = Rect::from_min_max(pos2(r.max.x - 14.0, r.min.y), r.max);
+    let lr = Rect::from_min_max(pos2(xb.min.x - if wide { 50.0 } else { 24.0 }, r.min.y), pos2(xb.min.x, r.max.y));
+    let pr = Rect::from_min_max(
+        pos2(lr.min.x - if wide { 34.0 } else { 0.0 }, r.min.y + 2.0),
+        pos2(lr.min.x - if wide { 4.0 } else { 0.0 }, r.max.y - 3.0),
+    );
+    let mut tr = Rect::from_min_max(r.min, pos2(pr.min.x - 1.0, r.max.y));
+    if !wide && snd.pre_fader {
+        p.text(pos2(tr.min.x + 7.0, tr.center().y), Align2::CENTER_CENTER, "P", FontId::proportional(9.5), TOKENS.text_dim);
+        tr.min.x += 12.0;
+    }
+    // Target: another bus, or right-click for pre/post and remove.
+    let resp = ui.interact(tr.intersect(clip), ui.id().with(("send_target", salt)), Sense::click());
+    if resp.hovered() {
+        p.rect_filled(tr, 2.0, TOKENS.button_hover);
+    }
+    let text_r = tr.shrink2(vec2(4.0, 0.0));
+    p.with_clip_rect(text_r.intersect(clip)).text(text_r.left_center(), Align2::LEFT_CENTER, &target, FontId::proportional(10.5), TOKENS.text);
+    row.target_rect = r4(tr);
+    let mut choices = send_targets(s, t, Some(slot));
+    if !choices.iter().any(|(l, _)| *l == target) {
+        choices.insert(0, (target.clone(), String::new()));
+    }
+    if let Some(v) = choice_menu(&resp, &target, &choices, menu)
+        && !v.is_empty()
+        && v != target
+    {
+        let _ = app.retarget_send(id, slot, &v);
+    }
+    resp.context_menu(|ui| {
+        let label = if snd.pre_fader { "Post-fader" } else { "Pre-fader" };
+        if ui.button(label).clicked() {
+            let _ = app.set_send_pre(id, slot, !snd.pre_fader);
+            ui.close();
+        }
+        if ui.button("Remove Send").clicked() {
+            let _ = app.remove_send(id, slot);
+            ui.close();
+        }
+    });
+    // Pre/Post (device chain).
+    if wide {
+        let resp = ui.interact(pr.intersect(clip), ui.id().with(("send_pre", salt)), Sense::click());
+        p.rect_filled(pr, 2.0, if snd.pre_fader || resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+        p.text(
+            pr.center(),
+            Align2::CENTER_CENTER,
+            if snd.pre_fader { "Pre" } else { "Post" },
+            FontId::proportional(10.0),
+            if snd.pre_fader { TOKENS.text } else { TOKENS.text_dim },
+        );
+        if resp.on_hover_text("Pre-fader or post-fader send").clicked() {
+            let _ = app.set_send_pre(id, slot, !snd.pre_fader);
+        }
+        row.pre = r4(pr);
+    }
+    // Level: drag up or right to raise it, like the fader (fourth-root law).
+    let resp = ui.interact(lr.intersect(clip), ui.id().with(("send_level", salt)), Sense::click_and_drag());
+    let hot = resp.hovered() || matches!(app.mixer.gesture, Some(MixGesture::Send { track, slot: sl, .. }) if track == id && sl == slot);
+    p.text(
+        pos2(lr.max.x - 2.0, lr.center().y - 1.0),
+        Align2::RIGHT_CENTER,
+        level_text(snd.level_db, wide),
+        FontId::monospace(10.0),
+        if hot { TOKENS.accent } else { TOKENS.text },
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+    }
+    if resp.drag_started() {
+        app.mixer.gesture = Some(MixGesture::Send { track: id, slot, start_k: k });
+    }
+    if resp.dragged()
+        && let Some(MixGesture::Send { track, slot: sl, start_k }) = app.mixer.gesture
+        && track == id
+        && sl == slot
+    {
+        let d = ui.input(|i| i.pointer.press_origin().zip(i.pointer.latest_pos()).map_or(0.0, |(a, b)| (b.x - a.x) - (b.y - a.y)));
+        let fine = ui.input(|i| i.modifiers.shift);
+        let nk = (start_k + d / 150.0 * if fine { 0.2 } else { 1.0 }).clamp(0.0, 1.0);
+        let _ = app.set_send_level_merged(id, slot, k_to_db(nk));
+    }
+    if resp.drag_stopped() {
+        app.mixer.gesture = None;
+    }
+    if resp.double_clicked() {
+        let _ = app.run("mix.send_level", json!({"track": id.0, "slot": slot, "db": 0.0}));
+    }
+    let _ = resp.on_hover_text(format!(
+        "{target}: {} ({}). Drag to change, double-click for 0 dB",
+        level_text(snd.level_db, true),
+        if snd.pre_fader { "pre-fader" } else { "post-fader" }
+    ));
+    row.level_rect = r4(lr);
+    // Remove.
+    let resp = ui.interact(xb.intersect(clip), ui.id().with(("send_remove", salt)), Sense::click());
+    p.text(xb.center(), Align2::CENTER_CENTER, "×", FontId::proportional(12.0), if resp.hovered() { TOKENS.record } else { TOKENS.text_dim });
+    if resp.on_hover_text("Remove send").clicked() {
+        let _ = app.remove_send(id, slot);
+    }
+    row.remove = r4(xb);
+    row
+}
+
+/// "+ Send": the busses a send from `t` can go to, then "New FX Channel…". Returns its rect.
+pub(crate) fn add_send_row(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, r: Rect, clip: Rect, menu: &mut Vec<MenuItem>) -> R4 {
+    let resp = ui.interact(r.intersect(clip), ui.id().with(("add_send", t.id.0, r.min.x as i32)), Sense::click());
+    let p = ui.painter().with_clip_rect(clip);
+    if resp.hovered() {
+        p.rect_filled(r, 2.0, TOKENS.button_hover);
+    }
+    p.text(pos2(r.min.x + 4.0, r.center().y), Align2::LEFT_CENTER, "+ Send", FontId::proportional(10.5), TOKENS.text_dim);
+    let mut choices = send_targets(s, t, None);
+    choices.push(("New FX Channel…".into(), NEW_FX.into()));
+    if let Some(v) = choice_menu(&resp, "", &choices, menu) {
+        let _ = app.add_send(t.id, &v);
+    }
+    r4(r)
+}
+
+/// A strip's sends block: `rows` rows at `y`, the sends in slot order, then "+ Send". When the
+/// sends don't all fit, the last row says how many more there are (the device chain lists all).
+#[allow(clippy::too_many_arguments)]
+fn sends_block(
+    app: &mut StudioApp,
+    ui: &mut Ui,
+    s: &Session,
+    t: &Track,
+    x0: f32,
+    w: f32,
+    y: f32,
+    rows: usize,
+    clip: Rect,
+    sl: &mut StripLayout,
+    menu: &mut Vec<MenuItem>,
+) {
+    if rows == 0 || !takes_sends(t.kind) {
+        return;
+    }
+    let sends: Vec<(usize, SendSlot)> = t.mixer.sends.iter().enumerate().filter_map(|(i, x)| x.clone().map(|x| (i, x))).collect();
+    let free = sends.len() < t.mixer.sends.len();
+    let row_r = |i: usize| Rect::from_min_size(pos2(x0, y + i as f32 * SEND_ROW_H), vec2(w, SEND_ROW_H - 2.0));
+    let fits = sends.len() + usize::from(free) <= rows;
+    let shown = if fits { sends.len() } else { rows.saturating_sub(1) };
+    for (i, (slot, snd)) in sends.iter().take(shown).enumerate() {
+        let row = send_row(app, ui, s, t, *slot, snd, row_r(i), clip, false, menu);
+        sl.sends.push(row);
+    }
+    if fits {
+        if free {
+            sl.add_send = add_send_row(app, ui, s, t, row_r(shown), clip, menu);
+        }
+    } else {
+        let r = row_r(shown);
+        let resp = ui.interact(r.intersect(clip), ui.id().with(("more_sends", t.id.0)), Sense::click());
+        ui.painter().with_clip_rect(clip).text(
+            pos2(r.min.x + 4.0, r.center().y),
+            Align2::LEFT_CENTER,
+            format!("{} more…", sends.len() - shown),
+            FontId::proportional(10.5),
+            TOKENS.text_dim,
+        );
+        if resp.on_hover_text("Show all sends in the device chain").clicked() {
+            app.focus(t.id);
+            app.ui.show_devices = true;
+        }
+    }
+}
+
 /// One channel strip.
 #[allow(clippy::too_many_arguments)]
-fn strip(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, r: Rect, clip: Rect, focused: bool, menu: &mut Vec<MenuItem>) -> StripLayout {
+fn strip(
+    app: &mut StudioApp,
+    ui: &mut Ui,
+    s: &Session,
+    t: &Track,
+    r: Rect,
+    clip: Rect,
+    focused: bool,
+    rows: usize,
+    menu: &mut Vec<MenuItem>,
+) -> StripLayout {
     let id = t.id;
     let m = &t.mixer;
     let p = ui.painter().with_clip_rect(clip);
@@ -544,6 +1010,7 @@ fn strip(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, r: Rect, clip
         balance: balance_of(&m.pan),
         pan: m.pan.clone(),
         level: app.meters.get(&id).map_or([0.0; 2], |d| d.level),
+        fx: t.kind == TrackKind::Aux,
         ..StripLayout::default()
     };
     let x0 = r.min.x + 4.0;
@@ -551,13 +1018,20 @@ fn strip(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, r: Rect, clip
     // Name and color: click focuses the track.
     let name_r = Rect::from_min_size(pos2(r.min.x, r.min.y), vec2(r.width(), 22.0));
     p.rect_filled(Rect::from_min_size(name_r.min, vec2(r.width(), 4.0)), egui::CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 }, theme::rgb(t.color));
-    let tr = name_r.shrink2(vec2(5.0, 0.0));
+    let mut tr = name_r.shrink2(vec2(5.0, 0.0));
+    if sl.fx {
+        // FX channels: a small "FX" tag and a muted name.
+        let tag = Rect::from_min_size(pos2(tr.max.x - 18.0, tr.center().y - 5.0), vec2(18.0, 13.0));
+        p.rect_filled(tag, 2.0, TOKENS.button);
+        p.text(tag.center(), Align2::CENTER_CENTER, "FX", FontId::proportional(9.5), TOKENS.text_dim);
+        tr.max.x = tag.min.x - 3.0;
+    }
     p.with_clip_rect(tr.intersect(clip)).text(
         pos2(tr.min.x, tr.center().y + 2.0),
         Align2::LEFT_CENTER,
         &t.name,
         FontId::proportional(13.0),
-        TOKENS.text,
+        if sl.fx { TOKENS.text_dim } else { TOKENS.text },
     );
     sl.name_rect = r4(name_r);
     let resp = ui.interact(name_r.intersect(clip), ui.id().with(("strip_name", id.0)), Sense::click());
@@ -580,6 +1054,9 @@ fn strip(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, r: Rect, clip
         p.text(in_r.left_center() + vec2(4.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(10.0), TOKENS.text_dim);
     }
     y += 19.0;
+    // Sends (Logic: between the input and the output).
+    sends_block(app, ui, s, t, x0, w, y, rows, clip, &mut sl, menu);
+    y += rows as f32 * SEND_ROW_H;
     // Output.
     let out_r = Rect::from_min_size(pos2(x0, y), vec2(w, 16.0));
     let cur = route_label(s, &m.output, false, t.channels());

@@ -1,11 +1,12 @@
 //! The device chain of the focused track, under the arrangement (Ableton's detail view): the
-//! instrument first on instrument tracks, then the occupied insert slots as cards in slot order,
-//! then "+", which lists the built-in effects and the scanned VST3 and CLAP effects.
+//! instrument first on instrument tracks (its name opens the instrument menu; "Choose…" when
+//! there is none), then the occupied insert slots as cards in slot order, then "+", which lists
+//! the built-in effects and the scanned VST3 and CLAP effects, then the track's sends.
 //!
 //! Plan 06 leaks: inserts are ten fixed slots (L1), so the chain shows only the occupied ones and
-//! "+" uses `mix.insert` without a slot (the first free one); an eleventh device is refused. There
-//! is no drag-reorder: `mix.insert_move` is a swap that leaves slot-keyed automation (L2) and live
-//! instances (L3) behind.
+//! "+" puts the new device in the slot after the last occupied one, so it lands at the end of the
+//! chain; an eleventh device is refused. There is no drag-reorder: `mix.insert_move` is a swap
+//! that leaves slot-keyed automation (L2) and live instances (L3) behind.
 
 use crate::StudioApp;
 use crate::mixer::{DeviceCard, DevicesLayout, MenuItem, PluginEntry};
@@ -104,21 +105,20 @@ pub fn chain(app: &mut StudioApp, ui: &mut Ui) {
     let used = t.mixer.inserts.iter().filter(|i| i.is_some()).count();
     let lane = Rect::from_min_max(pos2(tab.max.x + 8.0, area.min.y + 8.0), pos2(area.max.x - 8.0, area.max.y - 8.0));
     let mut x = lane.min.x;
-    let mut cards: Vec<(Option<usize>, Insert)> = Vec::new();
-    if t.kind == TrackKind::Instrument
-        && let Some(i) = &t.instrument
-    {
-        cards.push((None, i.clone()));
+    // An instrument track's instrument comes first, even when it has none yet ("Choose…").
+    let mut cards: Vec<(Option<usize>, Option<Insert>)> = Vec::new();
+    if t.kind == TrackKind::Instrument {
+        cards.push((None, t.instrument.clone()));
     }
     for (slot, ins) in t.mixer.inserts.iter().enumerate() {
         if let Some(i) = ins {
-            cards.push((Some(slot), i.clone()));
+            cards.push((Some(slot), Some(i.clone())));
         }
     }
     for (slot, ins) in cards {
         let r = Rect::from_min_size(pos2(x, lane.min.y), vec2(CARD_W, lane.height()));
         if r.min.x < lane.max.x {
-            let c = card(app, ui, &p, lane, tid, slot, &ins, r);
+            let c = card(app, ui, &p, lane, tid, slot, ins.as_ref(), r, &mut layout.menu);
             layout.cards.push(c);
         }
         // An arrow between devices: the signal flows left to right.
@@ -153,14 +153,15 @@ pub fn chain(app: &mut StudioApp, ui: &mut Ui) {
             for (format, list) in [("VST3", vst3), ("CLAP", clap)] {
                 ui.separator();
                 ui.menu_button(format, |ui| match list {
-                    None => {
-                        if crate::plugin_scan::state() == "running" {
-                            ui.weak("Scanning…");
+                    None => match crate::plugin_scan::scanning_label() {
+                        Some(text) => {
+                            ui.weak(text);
                             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
-                        } else {
+                        }
+                        None => {
                             ui.weak("Not scanned yet (Audio › Scan Plug-ins)");
                         }
-                    }
+                    },
                     Some(l) if l.is_empty() => {
                         ui.weak(format!("No {format} effects found"));
                     }
@@ -181,19 +182,40 @@ pub fn chain(app: &mut StudioApp, ui: &mut Ui) {
             let _ = app.add_device(tid, &id);
         }
     }
+    // Sends of the focused track, after the chain.
+    if crate::mixer::takes_sends(t.kind) {
+        let sx = add.max.x + 24.0;
+        if sx < lane.max.x {
+            sends_section(app, ui, &p, &s, t, sx, lane, &mut layout);
+        }
+    }
     app.mixer.devices = layout;
 }
 
-/// One device card: bypass (power), name, remove; kind; "Open editor".
+/// One device card: bypass (power), name, remove; kind; "Open editor". The instrument card has
+/// no bypass or remove (plan 06, L17); its name opens the instrument menu, and with no
+/// instrument it offers "Choose…".
 #[allow(clippy::too_many_arguments)]
-fn card(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, lane: Rect, t: TrackId, slot: Option<usize>, ins: &Insert, r: Rect) -> DeviceCard {
+fn card(
+    app: &mut StudioApp,
+    ui: &mut Ui,
+    p: &egui::Painter,
+    lane: Rect,
+    t: TrackId,
+    slot: Option<usize>,
+    ins: Option<&Insert>,
+    r: Rect,
+    menu: &mut Vec<MenuItem>,
+) -> DeviceCard {
     let pc = p.with_clip_rect(lane);
-    let on = !ins.bypass;
+    let on = ins.is_some_and(|i| !i.bypass);
     pc.rect_filled(r, 4.0, TOKENS.panel_raised);
     let title = Rect::from_min_size(r.min, vec2(r.width(), 22.0));
     pc.rect_filled(title, egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 }, if on { TOKENS.button } else { TOKENS.bg });
-    let name = app.plugin_name(&ins.plugin);
-    let mut c = DeviceCard { slot, plugin: ins.plugin.clone(), name: name.clone(), bypass: ins.bypass, rect: r4(r), ..DeviceCard::default() };
+    let plugin = ins.map(|i| i.plugin.clone()).unwrap_or_default();
+    let name = if plugin.is_empty() { "No instrument".to_string() } else { app.plugin_name(&plugin) };
+    let mut c =
+        DeviceCard { slot, plugin: plugin.clone(), name: name.clone(), bypass: ins.is_some_and(|i| i.bypass), rect: r4(r), ..DeviceCard::default() };
     let salt = slot.map_or(u64::MAX, |s| s as u64);
     // Power button (bypass) on inserts; the instrument has none (no instrument bypass command).
     let mut name_x = r.min.x + 8.0;
@@ -222,22 +244,66 @@ fn card(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, lane: Rect, t: Trac
         FontId::proportional(13.0),
         if on { TOKENS.text } else { TOKENS.text_dim },
     );
-    let kind = match (slot, ins.plugin.split(':').next()) {
-        (None, _) => "Instrument".to_string(),
+    let kind = match (slot, plugin.split(':').next()) {
+        (None, Some("vst3")) => "VST3 instrument".to_string(),
+        (None, Some("clap")) => "CLAP instrument".into(),
+        (None, _) => "Instrument".into(),
         (_, Some("vst3")) => "VST3 effect".into(),
         (_, Some("clap")) => "CLAP effect".into(),
         (_, Some("au")) => "Audio Unit".into(),
-        _ => app.builtin_plugins().iter().find(|p| p.id == ins.plugin).map_or("Built-in".into(), |p| format!("Built-in · {}", p.category)),
+        _ => app.builtin_plugins().iter().find(|p| p.id == plugin).map_or("Built-in".into(), |p| format!("Built-in · {}", p.category)),
     };
     pc.text(pos2(r.min.x + 8.0, title.max.y + 12.0), Align2::LEFT_CENTER, kind, FontId::proportional(10.0), TOKENS.text_dim);
-    if ins.bypass {
+    if c.bypass {
         pc.text(pos2(r.min.x + 8.0, title.max.y + 28.0), Align2::LEFT_CENTER, "Bypassed", FontId::proportional(10.0), TOKENS.mute);
+    }
+    let eb = Rect::from_min_size(pos2(r.min.x + 8.0, r.max.y - 26.0), vec2(r.width() - 16.0, 20.0));
+    if slot.is_none() {
+        // The instrument menu: from the name, or from "Choose…" when there is no instrument.
+        let pick = if ins.is_some() { Rect::from_min_max(title.min, pos2(r.max.x, title.max.y)) } else { eb };
+        let resp = ui.interact(pick.intersect(lane), ui.id().with(("pick_instrument", t.0)), Sense::click());
+        if ins.is_some() {
+            if resp.hovered() {
+                pc.rect_filled(pick, egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 }, TOKENS.button_hover);
+                pc.with_clip_rect(name_r.intersect(lane)).text(
+                    name_r.left_center(),
+                    Align2::LEFT_CENTER,
+                    &name,
+                    FontId::proportional(13.0),
+                    TOKENS.text,
+                );
+            }
+            let a = pos2(pick.max.x - 10.0, pick.center().y);
+            pc.add(egui::Shape::convex_polygon(
+                vec![pos2(a.x - 3.0, a.y - 1.5), pos2(a.x + 3.0, a.y - 1.5), pos2(a.x, a.y + 2.0)],
+                TOKENS.text_dim,
+                Stroke::NONE,
+            ));
+        } else {
+            pc.rect_filled(eb, 3.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+            pc.text(eb.center(), Align2::CENTER_CENTER, "Choose…", FontId::proportional(10.5), TOKENS.text);
+        }
+        c.pick_button = r4(pick);
+        let resp = resp.on_hover_text(if ins.is_some() { "Replace the instrument" } else { "Choose an instrument" });
+        let mut filter = std::mem::take(&mut app.mixer.instrument_filter);
+        let mut picked = None;
+        egui::Popup::menu(&resp).width(260.0).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            let lists = app.instrument_lists();
+            picked = instrument_menu(ui, &lists, ins.map(|i| i.plugin.as_str()), &mut filter, menu);
+        });
+        app.mixer.instrument_filter = filter;
+        if let Some(id) = picked {
+            app.mixer.instrument_filter.clear();
+            let _ = app.set_instrument(t, &id);
+        }
+        if ins.is_none() {
+            return c;
+        }
     }
     // Open editor: the plug-in's own window, through the same path as `ui.set {plugin_windows}`.
     let key_slot = slot.unwrap_or(soundcraft_mix::INSTRUMENT_SLOT);
-    let enabled = app.player.as_ref().is_some_and(|pl| hosted(&ins.plugin) || pl.has_editor(t, key_slot));
+    let enabled = app.player.as_ref().is_some_and(|pl| hosted(&plugin) || pl.has_editor(t, key_slot));
     let open = app.ui.plugin_windows.contains(&(t, key_slot));
-    let eb = Rect::from_min_size(pos2(r.min.x + 8.0, r.max.y - 26.0), vec2(r.width() - 16.0, 20.0));
     let resp = ui.interact(eb.intersect(lane), ui.id().with(("editor", t.0, salt)), Sense::click());
     pc.rect_filled(eb, 3.0, if resp.hovered() && enabled { TOKENS.button_hover } else { TOKENS.button });
     let label = if open { "Editor open" } else { "Open editor" };
@@ -255,4 +321,139 @@ fn card(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, lane: Rect, t: Trac
     c.editor_button = r4(eb);
     c.editor_enabled = enabled;
     c
+}
+
+/// A hosted plug-in the instrument menu offers.
+#[derive(Debug, Clone)]
+pub struct HostedEntry {
+    pub id: String,
+    pub name: String,
+    pub vendor: String,
+}
+
+/// What the instrument menu lists: built-in instruments, then the scanned VST3 and CLAP
+/// instruments (`None` while a format has no scan result).
+#[derive(Debug, Clone, Default)]
+pub struct InstrumentLists {
+    pub builtin: Vec<PluginEntry>,
+    pub vst3: Option<Vec<HostedEntry>>,
+    pub clap: Option<Vec<HostedEntry>>,
+}
+
+/// More entries than this and the instrument menu gets a filter box.
+const FILTER_OVER: usize = 15;
+
+impl StudioApp {
+    /// The instruments to offer, read from `engine.plugins` and the scan caches (never a scan).
+    pub fn instrument_lists(&mut self) -> InstrumentLists {
+        let hosted = |list: Vec<(String, String, String, bool)>| -> Vec<HostedEntry> {
+            let mut v: Vec<HostedEntry> = list.into_iter().filter(|d| d.3).map(|(id, name, vendor, _)| HostedEntry { id, name, vendor }).collect();
+            v.sort_by_key(|e| (e.vendor.to_lowercase(), e.name.to_lowercase()));
+            v
+        };
+        InstrumentLists {
+            builtin: self.builtin_plugins().into_iter().filter(|p| p.instrument).collect(),
+            vst3: soundcraft_vst3_host::cached().map(|l| hosted(l.into_iter().map(|d| (d.id, d.name, d.vendor, d.is_instrument)).collect())),
+            clap: soundcraft_clap_host::cached().map(|l| hosted(l.into_iter().map(|d| (d.id, d.name, d.vendor, d.is_instrument)).collect())),
+        }
+    }
+}
+
+/// The instrument menu's contents: a filter box when the list is long, built-in instruments,
+/// then VST3 and CLAP instruments grouped by vendor. Returns the id picked (the caller runs
+/// `mix.instrument` through [`StudioApp::set_instrument`]). Entries go to `menu` for `ui.inspect`.
+pub fn instrument_menu(ui: &mut Ui, lists: &InstrumentLists, current: Option<&str>, filter: &mut String, menu: &mut Vec<MenuItem>) -> Option<String> {
+    let mut picked = None;
+    let total = lists.builtin.len() + lists.vst3.as_ref().map_or(0, Vec::len) + lists.clap.as_ref().map_or(0, Vec::len);
+    if total > FILTER_OVER {
+        ui.add(egui::TextEdit::singleline(filter).hint_text("Filter").desired_width(f32::INFINITY));
+    }
+    let f = filter.trim().to_lowercase();
+    let keep = |name: &str, vendor: &str| f.is_empty() || name.to_lowercase().contains(&f) || vendor.to_lowercase().contains(&f);
+    let heading = |ui: &mut Ui, text: &str| {
+        ui.label(egui::RichText::new(text).color(TOKENS.text_dim).size(10.5));
+    };
+    let mut item = |ui: &mut Ui, id: &str, label: &str, picked: &mut Option<String>| {
+        let b = ui.add(egui::Button::selectable(current == Some(id), label));
+        menu.push(MenuItem { label: label.to_string(), value: id.to_string(), rect: r4(b.rect) });
+        if b.clicked() {
+            *picked = Some(id.to_string());
+            ui.close();
+        }
+    };
+    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+        heading(ui, "Built-in");
+        for e in lists.builtin.iter().filter(|e| keep(&e.name, "")) {
+            item(ui, &e.id, &e.name, &mut picked);
+        }
+        for (format, list) in [("VST3", &lists.vst3), ("CLAP", &lists.clap)] {
+            ui.separator();
+            heading(ui, format);
+            match list {
+                None => match crate::plugin_scan::scanning_label() {
+                    Some(text) => {
+                        ui.weak(text);
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                    }
+                    None => {
+                        ui.weak("Not scanned yet (Audio › Scan Plug-ins)");
+                    }
+                },
+                Some(l) if l.is_empty() => {
+                    ui.weak(format!("No {format} instruments found"));
+                }
+                Some(l) => {
+                    let mut vendor: Option<&str> = None;
+                    let mut any = false;
+                    for e in l.iter().filter(|e| keep(&e.name, &e.vendor)) {
+                        let v = if e.vendor.is_empty() { "Other" } else { e.vendor.as_str() };
+                        if vendor != Some(v) {
+                            ui.label(egui::RichText::new(v).color(TOKENS.text_dim).size(10.0));
+                            vendor = Some(v);
+                        }
+                        item(ui, &e.id, &e.name, &mut picked);
+                        any = true;
+                    }
+                    if !any {
+                        ui.weak("No match");
+                    }
+                }
+            }
+        }
+    });
+    picked
+}
+
+/// The device chain's "Sends" section for the focused track: rows in columns, then "+ Send".
+#[allow(clippy::too_many_arguments)]
+fn sends_section(
+    app: &mut StudioApp,
+    ui: &mut Ui,
+    p: &egui::Painter,
+    s: &soundcraft_model::Session,
+    t: &soundcraft_model::Track,
+    x: f32,
+    lane: Rect,
+    layout: &mut DevicesLayout,
+) {
+    const COL_W: f32 = 230.0;
+    const ROW_H: f32 = 18.0;
+    let pc = p.with_clip_rect(lane);
+    pc.text(pos2(x, lane.min.y + 6.0), Align2::LEFT_CENTER, "Sends", FontId::proportional(10.5), TOKENS.text_dim);
+    let top = lane.min.y + 16.0;
+    let per_col = (((lane.max.y - top) / ROW_H).floor() as usize).max(1);
+    let at =
+        |i: usize| Rect::from_min_size(pos2(x + (i / per_col) as f32 * (COL_W + 10.0), top + (i % per_col) as f32 * ROW_H), vec2(COL_W, ROW_H - 2.0));
+    let mut i = 0;
+    let mut menu = std::mem::take(&mut layout.menu);
+    for (slot, snd) in t.mixer.sends.iter().enumerate() {
+        let Some(snd) = snd else { continue };
+        let row = crate::mixer::send_row(app, ui, s, t, slot, snd, at(i), lane, true, &mut menu);
+        layout.sends.push(row);
+        i += 1;
+    }
+    if i < t.mixer.sends.len() {
+        layout.add_send = crate::mixer::add_send_row(app, ui, s, t, at(i), lane, &mut menu);
+    }
+    layout.menu = menu;
 }

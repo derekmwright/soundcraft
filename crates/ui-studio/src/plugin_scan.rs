@@ -72,6 +72,20 @@ pub fn state() -> String {
     }
 }
 
+/// "Scanning…" for menus that list scanned plug-ins, with the file the scan is on when it says
+/// (`progress`); `None` when no scan runs. The host crates expose no count of plug-ins found so far
+/// (`cached()` is empty until a format's scan ends), so that is all a menu can show.
+pub fn scanning_label() -> Option<String> {
+    if state() != "running" {
+        return None;
+    }
+    let at = soundcraft_vst3_host::progress().map(|p| ("VST3", p)).or_else(|| soundcraft_clap_host::progress().map(|p| ("CLAP", p)));
+    Some(match at {
+        Some((format, (i, n, _))) => format!("Scanning… ({format} file {} of {n})", (i + 1).min(n)),
+        None => "Scanning…".to_string(),
+    })
+}
+
 /// `plugin_scan` for `ui.inspect`: the [`state`] and the counts found so far.
 pub fn inspect() -> serde_json::Value {
     let count = |n: Option<usize>| n.map_or(serde_json::Value::Null, Into::into);
