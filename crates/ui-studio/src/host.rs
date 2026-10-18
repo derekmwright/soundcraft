@@ -450,7 +450,9 @@ impl StudioApp {
                     self.copied.clear();
                     self.meters.clear();
                     self.main_meter = MeterDisplay::default();
-                    self.normalize_edit_mode();
+                    // The cursor is per-session view state.
+                    self.ui.cursor = 0;
+                    self.ui.cursor_track = None;
                     self.engine.transport.position = self.cursor();
                 }
                 TransportRequest::Play => {

@@ -78,6 +78,11 @@ impl StudioApp {
         let Some((from, range)) = self.engine.session().find_clip(clip).map(|(t, c)| (t, Range::new(c.start, c.end()))) else {
             return Err("no such clip".into());
         };
+        let target = Range::new(at.max(0), at.max(0).saturating_add((range.end - range.start).max(1)));
+        if from == to_track && range.start < target.end && target.start < range.end {
+            self.status = "Copy would land on the original clip and replace part of it: drag it further.".into();
+            return Err(self.status.clone());
+        }
         let before = self.clip_ids();
         let clipboard = self.engine.clipboard.clone();
         let copied = self.run("edit.copy", json!({"tracks": [from.0], "start": range.start, "end": range.end}));

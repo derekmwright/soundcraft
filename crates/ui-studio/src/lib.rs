@@ -26,11 +26,6 @@ use std::sync::mpsc::Receiver;
 
 pub use control::ControlRequest;
 
-/// Keys this UI keeps in the session's `edit.values` (plan 06, L6 and section 6): view state that
-/// belongs to the session, with no model change.
-pub const CURSOR_KEY: &str = "studio.cursor";
-pub const CURSOR_TRACK_KEY: &str = "studio.cursor_track";
-
 /// Our own UI state (serde, so agents can read and set it; saved as `ui.json` in the transit
 /// settings folder). Not `soundcraft-ui-egui`'s `UiState` (plan 06, L13).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -51,6 +46,13 @@ pub struct UiState {
     /// The main window's size (logical points) and maximized state.
     pub window_size: [f32; 2],
     pub window_maximized: bool,
+    /// The edit cursor: where Play starts and Paste lands. View state of the open session, not
+    /// part of the document (setting it never dirties it) and not saved with the preferences.
+    #[serde(skip)]
+    pub cursor: Samples,
+    /// The track the cursor was last set on (paste target).
+    #[serde(skip)]
+    pub cursor_track: Option<TrackId>,
 }
 
 impl Default for UiState {
@@ -63,6 +65,8 @@ impl Default for UiState {
             header_width: 236.0,
             window_size: [1600.0, 1000.0],
             window_maximized: false,
+            cursor: 0,
+            cursor_track: None,
         }
     }
 }
@@ -151,7 +155,7 @@ pub struct StudioApp {
 
 impl StudioApp {
     pub fn new(engine: Engine, player: Option<Player>, services: Services) -> Self {
-        let mut app = StudioApp {
+        StudioApp {
             engine,
             player,
             recorder: None,
@@ -189,9 +193,7 @@ impl StudioApp {
             editors: Vec::new(),
             arrange: arrange::ArrangeState::default(),
             copied: Vec::new(),
-        };
-        app.normalize_edit_mode();
-        app
+        }
     }
 
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
@@ -199,47 +201,42 @@ impl StudioApp {
         self
     }
 
-    /// Plan 06, L7: this UI offers neither Shuffle nor Spot. A session that arrives in either
-    /// (saved by `apps/soundcraft`) is put in Slip, without an undo step.
-    fn normalize_edit_mode(&mut self) {
-        use soundcraft_model::EditMode;
-        if matches!(self.engine.session().edit.edit_mode, EditMode::Shuffle | EditMode::Spot) {
-            let _ = self.engine.execute("edit.mode", &json!({"mode": "slip"}));
-        }
-    }
-
     /// The edit cursor: where Play starts and Paste lands. Distinct from the selection
-    /// (`edit.selection`), kept in `edit.values` under [`CURSOR_KEY`].
+    /// (`edit.selection`); view state in [`UiState`], never in the document.
     pub fn cursor(&self) -> Samples {
-        let v = self.engine.session().edit.values.get(CURSOR_KEY).copied().unwrap_or(0.0);
-        if v.is_finite() { (v.clamp(0.0, 9.0e15)) as Samples } else { 0 }
+        self.ui.cursor.max(0)
     }
 
     /// The track the cursor was last set on (paste target), if it still exists.
     pub fn cursor_track(&self) -> Option<TrackId> {
-        let s = self.engine.session();
-        let v = s.edit.values.get(CURSOR_TRACK_KEY).copied().filter(|v| v.is_finite() && *v >= 0.0)?;
-        let id = TrackId(v as u64);
-        s.track(id).map(|t| t.id)
+        let id = self.ui.cursor_track?;
+        self.engine.session().track(id).map(|t| t.id)
     }
 
-    /// Set the cursor (and its track). There is no engine command for a cursor that leaves the
-    /// selection alone (`transport.locate` collapses it, plan 06 L6), so this writes `edit.values`
-    /// directly, as the host loop writes the stop position. Unchanged values are not written.
+    /// Set the cursor (and its track). View state only: the document is untouched.
     pub fn set_cursor(&mut self, at: Samples, track: Option<TrackId>) {
-        let at = at.max(0);
-        let same_track = track.is_none_or(|t| self.cursor_track() == Some(t));
-        if self.cursor() == at && same_track && self.engine.session().edit.values.contains_key(CURSOR_KEY) {
-            return;
-        }
-        let values = &mut self.engine.session_mut().edit.values;
-        values.insert(CURSOR_KEY.into(), at as f64);
+        self.ui.cursor = at.max(0);
         if let Some(t) = track {
-            values.insert(CURSOR_TRACK_KEY.into(), t.0 as f64);
+            self.ui.cursor_track = Some(t);
         }
         if !self.engine.transport.playing {
-            self.engine.transport.position = at;
+            self.engine.transport.position = self.ui.cursor;
         }
+    }
+
+    /// Plan 06, L7: this UI offers neither Shuffle nor Spot, so edit commands run as Slip while the
+    /// document keeps the mode it was saved with. Only the commands see the override.
+    fn slip_override(&mut self, id: &str) -> bool {
+        use soundcraft_model::EditMode;
+        let edits = id.starts_with("edit.") || id.starts_with("clip.") || id.starts_with("midi.");
+        if !edits || matches!(id, "edit.mode" | "edit.undo" | "edit.redo") {
+            return false;
+        }
+        if matches!(self.engine.session().edit.edit_mode, EditMode::Shuffle | EditMode::Spot) {
+            self.engine.session_mut().edit.edit_mode = EditMode::Slip;
+            return true;
+        }
+        false
     }
 
     /// Run a command; errors go to the status line. Plug-in state is captured before saves.
@@ -252,7 +249,15 @@ impl StudioApp {
             self.capture_plugin_states();
         }
         let replacing = matches!(id, "session.new" | "session.open" | "session.close" | "session.revert");
-        match self.engine.execute(id, &params) {
+        let (restore, mode) = {
+            let m = self.engine.session().edit.edit_mode;
+            (self.slip_override(id), m)
+        };
+        let result = self.engine.execute(id, &params);
+        if restore && self.engine.session().edit.edit_mode == soundcraft_model::EditMode::Slip {
+            self.engine.session_mut().edit.edit_mode = mode;
+        }
+        match result {
             Ok(v) => {
                 if replacing || (id.starts_with("session.save") && !self.engine.is_dirty()) {
                     self.release_autosave(false);
@@ -282,6 +287,8 @@ impl StudioApp {
         if ns.plugin_dirs != self.ui.plugin_dirs {
             return Err("plugin folders can't be changed over the control channel".into());
         }
+        let mut ns = ns;
+        (ns.cursor, ns.cursor_track) = (self.ui.cursor, self.ui.cursor_track);
         let before = std::mem::replace(&mut self.ui, ns);
         // Editors no longer listed close; newly listed ones open (retried until loaded).
         for key in before.plugin_windows.iter().filter(|k| !self.ui.plugin_windows.contains(k)) {

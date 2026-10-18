@@ -124,14 +124,6 @@ fn new_session_stops_playback() {
 }
 
 #[test]
-fn shuffle_sessions_open_in_slip() {
-    let mut e = soundcraft_engine::Engine::default();
-    e.execute("edit.mode", &json!({"mode": "shuffle"})).unwrap();
-    let app = StudioApp::new(e, None, Services::default());
-    assert_eq!(app.engine.session().edit.edit_mode, soundcraft_model::EditMode::Slip);
-}
-
-#[test]
 fn ui_set_lists_editors_without_a_player() {
     let mut app = app();
     let v = app.run("ui.set", json!({"plugin_windows": [[3, usize::MAX]]})).unwrap();
@@ -204,4 +196,49 @@ fn dragging_a_clip_in_the_window_moves_copies_and_constrains_it() {
     assert_eq!(after.len(), 1, "constrained to its track: {after:?}");
     assert!(after[0].1 > start);
     assert_eq!(clips_on(&app, t).len(), 1);
+}
+
+#[test]
+fn setting_the_cursor_does_not_dirty_the_document() {
+    let mut app = app();
+    let (t, _clip, bar) = track_with_clip(&mut app);
+    let path = std::env::temp_dir().join(format!("transit-cursor-{}.sc", std::process::id()));
+    app.run("session.save_as", json!({"path": path.to_string_lossy(), "replace": true})).unwrap();
+    assert!(!app.engine.is_dirty());
+    app.set_cursor(bar, Some(t));
+    assert_eq!(app.cursor(), bar);
+    assert!(!app.engine.is_dirty(), "the cursor is view state");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_shuffle_document_keeps_its_mode_and_stays_clean() {
+    let mut e = soundcraft_engine::Engine::default();
+    e.execute("edit.mode", &json!({"mode": "shuffle"})).unwrap();
+    let path = std::env::temp_dir().join(format!("transit-shuffle-{}.sc", std::process::id()));
+    e.execute("session.save_as", &json!({"path": path.to_string_lossy(), "replace": true})).unwrap();
+    let mut app = StudioApp::new(e, None, Services::default());
+    assert_eq!(app.engine.session().edit.edit_mode, soundcraft_model::EditMode::Shuffle);
+    assert!(!app.engine.is_dirty());
+    app.run("session.open", json!({"path": path.to_string_lossy()})).unwrap();
+    app.handle_transport(0.0);
+    assert_eq!(app.engine.session().edit.edit_mode, soundcraft_model::EditMode::Shuffle);
+    assert!(!app.engine.is_dirty());
+    // Edits still behave as Slip, and the mode is put back afterwards.
+    let (t, clip, bar) = track_with_clip(&mut app);
+    app.run("edit.mode", json!({"mode": "shuffle"})).unwrap();
+    app.move_clips(&[clip], bar, None).unwrap();
+    assert_eq!(clips_on(&app, t), vec![(clip.0, bar, 2 * bar)]);
+    assert_eq!(app.engine.session().edit.edit_mode, soundcraft_model::EditMode::Shuffle);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn alt_drag_onto_its_own_range_is_refused() {
+    let mut app = app();
+    let (t, clip, _bar) = track_with_clip(&mut app);
+    let before = clips_on(&app, t);
+    assert!(app.copy_clip_to(clip, 10_000, t).is_err());
+    assert_eq!(clips_on(&app, t), before, "the original is not truncated");
+    assert!(app.status.contains("Copy would land"));
 }
