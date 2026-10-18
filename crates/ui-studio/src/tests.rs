@@ -1241,3 +1241,105 @@ fn run_probe(ctx: &egui::Context) {
     let mut out = ctx.run_ui(egui::RawInput::default(), |ui| crate::theme::probe_fonts(ui.ctx()));
     out.textures_delta.clear();
 }
+
+#[test]
+fn the_master_or_main_out_strip_is_inside_the_mixer_pane_at_any_scale() {
+    for ppp in [1.0f32, 1.5] {
+        for master in [false, true] {
+            let (mut app, ctx, mut time, _t) = mixer_app();
+            ctx.set_pixels_per_point(ppp);
+            app.new_fx_channel(None, 0.0).unwrap();
+            if master {
+                app.run("track.new", json!({"kind": "master"})).unwrap();
+            }
+            frames(&mut app, &ctx, 6, &mut time);
+            let l = &app.mixer.layout;
+            let m = l.master.clone().unwrap_or_else(|| panic!("no master strip (ppp {ppp}, master {master})"));
+            let (a, r) = (l.area, m.rect);
+            eprintln!("ppp {ppp} master {master}: area {a:?} strip {r:?} strips {}", l.strips.len());
+            assert!(r[0] >= a[0] && r[2] <= a[2] && r[1] >= a[1] && r[3] <= a[3], "ppp {ppp}, master {master}: {r:?} not inside {a:?}");
+            assert!(r[2] > r[0] && r[3] > r[1]);
+            if master {
+                assert_eq!(m.kind, Some(soundcraft_model::TrackKind::Master));
+            } else {
+                assert!(l.add_master[2] > l.add_master[0], "the offer to add a master fader");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_strip_plus_adds_an_insert_to_that_track_whatever_is_focused() {
+    let (mut app, ctx, mut time, a) = mixer_app();
+    let r = app.run("track.new", json!({"kind": "audio", "format": "stereo", "name": "Vox"})).unwrap();
+    let b = TrackId(r["tracks"][0].as_u64().unwrap());
+    app.focus(a);
+    frames(&mut app, &ctx, 3, &mut time);
+    assert!(strip(&app, a).focused && !strip(&app, b).focused, "the focused strip is marked");
+    let before = undo_len(&mut app);
+    let plus = mid(strip(&app, b).add_insert);
+    click(&mut app, plus);
+    frames(&mut app, &ctx, 6, &mut time);
+    let item = app.mixer.layout.menu.iter().find(|m| m.value == "gain").cloned().expect("the strip + menu lists Gain");
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    let s = app.engine.session();
+    assert!(s.track(b).unwrap().mixer.inserts[0].is_some(), "Vox got the insert");
+    assert!(s.track(a).unwrap().mixer.inserts.iter().all(Option::is_none), "the focused track did not");
+    assert_eq!(undo_len(&mut app), before + 1);
+    assert_eq!(strip(&app, b).inserts.len(), 1);
+    assert_eq!(strip(&app, b).inserts[0].name, "Gain");
+    // Right-click: bypass, then remove.
+    let row = strip(&app, b).inserts[0].rect;
+    click_right(&mut app, mid(row));
+    frames(&mut app, &ctx, 6, &mut time);
+    let item = app.mixer.layout.menu.iter().find(|m| m.value == "bypass").cloned().expect("Bypass");
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert!(app.engine.session().track(b).unwrap().mixer.inserts[0].as_ref().unwrap().bypass);
+    let row = strip(&app, b).inserts[0].rect;
+    click_right(&mut app, mid(row));
+    frames(&mut app, &ctx, 6, &mut time);
+    let item = app.mixer.layout.menu.iter().find(|m| m.value == "remove").cloned().expect("Remove");
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert!(app.engine.session().track(b).unwrap().mixer.inserts.iter().all(Option::is_none));
+}
+
+#[test]
+fn insert_rows_cap_at_three_and_keep_every_fader_aligned() {
+    let (mut app, ctx, mut time, a) = mixer_app();
+    let r = app.run("track.new", json!({"kind": "audio", "format": "stereo", "name": "Vox"})).unwrap();
+    let b = TrackId(r["tracks"][0].as_u64().unwrap());
+    for _ in 0..5 {
+        app.add_device(a, "gain").unwrap();
+    }
+    frames(&mut app, &ctx, 3, &mut time);
+    let (sa, sb) = (strip(&app, a), strip(&app, b));
+    assert_eq!(sa.inserts.len(), 3, "three rows and an n-more row");
+    assert_eq!(sa.add_insert, [0.0; 4], "no + while the list overflows");
+    assert_eq!((sa.fader[1], sa.fader[3]), (sb.fader[1], sb.fader[3]), "the faders line up with and without inserts");
+    app.focus(a);
+    frames(&mut app, &ctx, 3, &mut time);
+    let more = [sa.rect[0] + 10.0, sa.inserts[2].rect[3] + 8.0];
+    click(&mut app, (more[0], more[1]));
+    frames(&mut app, &ctx, 4, &mut time);
+    assert!(app.ui.show_devices, "n more… points at the device chain");
+}
+
+#[test]
+fn clicking_anywhere_on_a_strip_focuses_it_and_the_highlight_follows() {
+    let (mut app, ctx, mut time, a) = mixer_app();
+    let r = app.run("track.new", json!({"kind": "audio", "format": "stereo", "name": "Vox"})).unwrap();
+    let b = TrackId(r["tracks"][0].as_u64().unwrap());
+    frames(&mut app, &ctx, 3, &mut time);
+    for t in [b, a, b] {
+        let s = strip(&app, t);
+        // The strip's empty margin below the input row, not a control.
+        click(&mut app, (s.rect[0] + 2.0, (s.rect[1] + s.rect[3]) / 2.0));
+        frames(&mut app, &ctx, 4, &mut time);
+        assert_eq!(app.focus_track(), Some(t));
+        let other = if t == a { b } else { a };
+        assert!(strip(&app, t).focused && !strip(&app, other).focused, "highlight follows focus");
+    }
+}

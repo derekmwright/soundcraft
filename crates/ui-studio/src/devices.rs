@@ -24,7 +24,7 @@ fn r4(r: Rect) -> crate::arrange::R4 {
 }
 
 /// Whether `id` names a hosted (third-party) plug-in.
-fn hosted(id: &str) -> bool {
+pub(crate) fn hosted(id: &str) -> bool {
     id.starts_with("vst3:") || id.starts_with("clap:") || id.starts_with("au:")
 }
 
@@ -106,6 +106,56 @@ fn hosted_effects() -> (Option<Vec<(String, String)>>, Option<Vec<(String, Strin
     (vst3, clap)
 }
 
+/// The "+" menu of a device list, on `resp`: built-in effects, then the scanned VST3 and CLAP
+/// effects. A pick adds the device to the end of `tid`'s chain. Shared by the device chain and
+/// the mixer strips, so a strip adds to its own track whichever one is focused.
+pub(crate) fn add_device_menu(app: &mut StudioApp, resp: &egui::Response, tid: TrackId, menu: &mut Vec<MenuItem>) {
+    let builtin: Vec<PluginEntry> = app.builtin_plugins().into_iter().filter(|p| !p.instrument).collect();
+    let mut picked: Option<String> = None;
+    egui::Popup::menu(resp).width(220.0).show(|ui| {
+        ui.label(egui::RichText::new("Built-in").color(TOKENS.text_dim).size(10.5));
+        for e in &builtin {
+            let b = ui.add(egui::Button::new(e.name.as_str()).right_text(egui::RichText::new(&e.category).color(TOKENS.text_dim).size(10.0)));
+            menu.push(MenuItem::at(ui, e.name.clone(), e.id.clone(), b.rect));
+            if b.clicked() {
+                picked = Some(e.id.clone());
+                ui.close();
+            }
+        }
+        let (vst3, clap) = hosted_effects();
+        for (format, list) in [("VST3", vst3), ("CLAP", clap)] {
+            ui.separator();
+            ui.menu_button(format, |ui| match list {
+                None => match crate::plugin_scan::scanning_label() {
+                    Some(text) => {
+                        ui.weak(text);
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                    }
+                    None => {
+                        ui.weak("Not scanned yet (Audio › Scan Plug-ins)");
+                    }
+                },
+                Some(l) if l.is_empty() => {
+                    ui.weak(format!("No {format} effects found"));
+                }
+                Some(l) => {
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        for (id, label) in l {
+                            if ui.button(&label).clicked() {
+                                picked = Some(id.clone());
+                                ui.close();
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    });
+    if let Some(id) = picked {
+        let _ = app.add_device(tid, &id);
+    }
+}
+
 pub fn chain(app: &mut StudioApp, ui: &mut Ui) {
     let area = ui.max_rect();
     let p = ui.painter().clone();
@@ -158,51 +208,7 @@ pub fn chain(app: &mut StudioApp, ui: &mut Ui) {
     pc.text(add.center(), Align2::CENTER_CENTER, "+", FontId::proportional(20.0), if full { TOKENS.text_dim } else { TOKENS.text });
     let resp = resp.on_hover_text(if full { "All ten device slots are in use" } else { "Add an effect" });
     if !full {
-        let builtin: Vec<PluginEntry> = app.builtin_plugins().into_iter().filter(|p| !p.instrument).collect();
-        let mut picked: Option<String> = None;
-        let menu = &mut layout.menu;
-        egui::Popup::menu(&resp).width(220.0).show(|ui| {
-            ui.label(egui::RichText::new("Built-in").color(TOKENS.text_dim).size(10.5));
-            for e in &builtin {
-                let b = ui.add(egui::Button::new(e.name.as_str()).right_text(egui::RichText::new(&e.category).color(TOKENS.text_dim).size(10.0)));
-                menu.push(MenuItem::at(ui, e.name.clone(), e.id.clone(), b.rect));
-                if b.clicked() {
-                    picked = Some(e.id.clone());
-                    ui.close();
-                }
-            }
-            let (vst3, clap) = hosted_effects();
-            for (format, list) in [("VST3", vst3), ("CLAP", clap)] {
-                ui.separator();
-                ui.menu_button(format, |ui| match list {
-                    None => match crate::plugin_scan::scanning_label() {
-                        Some(text) => {
-                            ui.weak(text);
-                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
-                        }
-                        None => {
-                            ui.weak("Not scanned yet (Audio › Scan Plug-ins)");
-                        }
-                    },
-                    Some(l) if l.is_empty() => {
-                        ui.weak(format!("No {format} effects found"));
-                    }
-                    Some(l) => {
-                        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                            for (id, label) in l {
-                                if ui.button(&label).clicked() {
-                                    picked = Some(id.clone());
-                                    ui.close();
-                                }
-                            }
-                        });
-                    }
-                });
-            }
-        });
-        if let Some(id) = picked {
-            let _ = app.add_device(tid, &id);
-        }
+        add_device_menu(app, &resp, tid, &mut layout.menu);
     }
     // Sends of the focused track, after the chain.
     if crate::mixer::takes_sends(t.kind) {

@@ -83,7 +83,7 @@ impl Default for UiState {
             show_mixer: false,
             show_devices: true,
             mixer_full: false,
-            mixer_height: 340.0,
+            mixer_height: 420.0,
             cursor: 0,
             cursor_track: None,
             focus_track: None,

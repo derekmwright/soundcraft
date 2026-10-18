@@ -125,6 +125,21 @@ pub struct StripLayout {
     pub sends: Vec<SendRow>,
     /// "+ Send" (zero when the strip takes no sends or all ten are in use).
     pub add_send: R4,
+    /// The occupied insert slots listed under the input (at most three rows).
+    pub inserts: Vec<InsertRow>,
+    /// The "+" row that adds an effect to this track (zero when all ten slots are in use).
+    pub add_insert: R4,
+    /// The strip is the focused track's (the device chain follows it).
+    pub focused: bool,
+}
+
+/// One insert row of a strip.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct InsertRow {
+    pub slot: usize,
+    pub name: String,
+    pub bypass: bool,
+    pub rect: R4,
 }
 
 /// Last frame's mixer geometry.
@@ -731,7 +746,10 @@ fn strips(app: &mut StudioApp, ui: &mut Ui) {
     // The sends block is as tall on every strip (the most sends plus "+ Send"), so the faders
     // line up, and never so tall that a fader gets shorter than MIN_FADER.
     let wanted = channels.iter().filter(|t| takes_sends(t.kind)).map(|t| send_rows_of(t)).max().unwrap_or(0);
-    let room = ((lane.height() - STRIP_FIXED_H - MIN_FADER) / SEND_ROW_H).floor().max(0.0) as usize;
+    // Insert rows come first (up to INSERT_ROWS, fewer in a short pane); sends get what is left.
+    let free = lane.height() - STRIP_FIXED_H - MIN_FADER;
+    let ins_rows = (((free - 2.0 * SEND_ROW_H) / INSERT_ROW_H).floor().max(1.0) as usize).min(INSERT_ROWS);
+    let room = ((free - ins_rows as f32 * INSERT_ROW_H) / SEND_ROW_H).floor().max(0.0) as usize;
     let rows = wanted.min(room);
     for (i, t) in channels.iter().enumerate() {
         let x = lane.min.x + i as f32 * (STRIP_W + GAP) - app.mixer.hscroll;
@@ -739,7 +757,7 @@ fn strips(app: &mut StudioApp, ui: &mut Ui) {
         if r.max.x < lane.min.x || r.min.x > lane.max.x {
             continue;
         }
-        let sl = strip(app, ui, &s, t, r, lane, focus == Some(t.id), rows, &mut layout.menu);
+        let sl = strip(app, ui, &s, t, r, lane, focus == Some(t.id), (rows, ins_rows), &mut layout.menu);
         layout.strips.push(sl);
     }
     // "Add FX Channel" after the last strip.
@@ -759,7 +777,7 @@ fn strips(app: &mut StudioApp, ui: &mut Ui) {
     ui.painter().line_segment([pos2(master_rect.min.x - 5.0, area.min.y), pos2(master_rect.min.x - 5.0, area.max.y)], Stroke::new(1.0, TOKENS.line));
     match master {
         Some(m) => {
-            let sl = strip(app, ui, &s, m, master_rect, master_rect, focus == Some(m.id), rows, &mut layout.menu);
+            let sl = strip(app, ui, &s, m, master_rect, master_rect, focus == Some(m.id), (rows, ins_rows), &mut layout.menu);
             layout.master = Some(sl);
         }
         None => {
@@ -887,6 +905,10 @@ pub const SEND_ROW_H: f32 = 17.0;
 /// The send level bar along a row's bottom edge.
 const BAR_H: f32 = 5.0;
 const STRIP_FIXED_H: f32 = 195.0;
+/// Height of an insert row, and the most rows a strip has for them: three inserts and "+", or
+/// two and "n more…" in a short pane.
+const INSERT_ROW_H: f32 = 15.0;
+const INSERT_ROWS: usize = 4;
 const MIN_FADER: f32 = 80.0;
 
 /// The rows a track's sends block wants: its sends plus "+ Send" while a slot is free.
@@ -1121,6 +1143,99 @@ fn sends_block(
     }
 }
 
+/// A strip's insert rows at `y`: one per occupied slot (click: the plug-in's editor; right-click:
+/// bypass and remove), then a "+" row that adds an effect to this track. `rows` rows in all, so
+/// every strip's faders line up; with more inserts than fit, the last row says how many more.
+#[allow(clippy::too_many_arguments)]
+fn inserts_block(
+    app: &mut StudioApp,
+    ui: &mut Ui,
+    t: &Track,
+    x0: f32,
+    w: f32,
+    y: f32,
+    rows: usize,
+    clip: Rect,
+    sl: &mut StripLayout,
+    menu: &mut Vec<MenuItem>,
+) {
+    let list: Vec<(usize, soundcraft_model::Insert)> = t.mixer.inserts.iter().enumerate().filter_map(|(i, x)| x.clone().map(|x| (i, x))).collect();
+    let free = list.len() < t.mixer.inserts.len();
+    let row_r = |i: usize| Rect::from_min_size(pos2(x0, y + i as f32 * INSERT_ROW_H), vec2(w, INSERT_ROW_H - 2.0));
+    let fits = list.len() + usize::from(free) <= rows;
+    let shown = if fits { list.len() } else { rows.saturating_sub(1) };
+    let p = ui.painter().with_clip_rect(clip);
+    let id = t.id;
+    for (i, (slot, ins)) in list.iter().take(shown).enumerate() {
+        let rr = row_r(i);
+        let name = app.plugin_name(&ins.plugin, false);
+        let resp = ui.interact(rr.intersect(clip), ui.id().with(("insert", id.0, *slot)), Sense::click());
+        p.rect_filled(rr, 2.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.bg });
+        let text_r = rr.shrink2(vec2(4.0, 0.0));
+        p.with_clip_rect(text_r.intersect(clip)).text(
+            text_r.left_center(),
+            Align2::LEFT_CENTER,
+            &name,
+            FontId::proportional(10.5),
+            if ins.bypass { TOKENS.text_dim } else { TOKENS.text },
+        );
+        let enabled = app.player.as_ref().is_some_and(|pl| crate::devices::hosted(&ins.plugin) || pl.has_editor(id, *slot));
+        if resp.clicked() && enabled {
+            app.want_editor((id, *slot));
+        }
+        let state = if ins.bypass { " (bypassed)" } else { "" };
+        let resp = resp.on_hover_text(format!("{name}{state}. Click for its window, right-click for more"));
+        let slot = *slot;
+        let bypass = ins.bypass;
+        egui::Popup::context_menu(&resp).id(resp.id.with("insert_ctx")).show(|ui| {
+            let label = if bypass { "Turn On" } else { "Bypass" };
+            let b = ui.button(label);
+            menu.push(MenuItem::at(ui, label.into(), "bypass".into(), b.rect));
+            if b.clicked() {
+                let _ = app.toggle_bypass(id, slot);
+                ui.close();
+            }
+            let b = ui.button("Remove");
+            menu.push(MenuItem::at(ui, "Remove".into(), "remove".into(), b.rect));
+            if b.clicked() {
+                let _ = app.remove_device(id, slot);
+                ui.close();
+            }
+        });
+        sl.inserts.push(InsertRow { slot, name, bypass, rect: r4(rr) });
+    }
+    if rows == 0 {
+        return;
+    }
+    if fits {
+        if free {
+            let rr = row_r(shown);
+            let resp = ui.interact(rr.intersect(clip), ui.id().with(("add_insert", id.0)), Sense::click());
+            if resp.hovered() {
+                p.rect_filled(rr, 2.0, TOKENS.button_hover);
+            }
+            p.text(pos2(rr.min.x + 4.0, rr.center().y), Align2::LEFT_CENTER, "+", FontId::proportional(11.0), TOKENS.text_dim);
+            let resp = resp.on_hover_text("Add an effect to this track");
+            crate::devices::add_device_menu(app, &resp, id, menu);
+            sl.add_insert = r4(rr);
+        }
+    } else {
+        let rr = row_r(shown);
+        let resp = ui.interact(rr.intersect(clip), ui.id().with(("more_inserts", id.0)), Sense::click());
+        p.text(
+            pos2(rr.min.x + 4.0, rr.center().y),
+            Align2::LEFT_CENTER,
+            format!("{} more…", list.len() - shown),
+            FontId::proportional(10.5),
+            TOKENS.text_dim,
+        );
+        if resp.on_hover_text("Show all devices in the device chain").clicked() {
+            app.focus(id);
+            app.ui.show_devices = true;
+        }
+    }
+}
+
 /// One channel strip.
 #[allow(clippy::too_many_arguments)]
 fn strip(
@@ -1131,7 +1246,7 @@ fn strip(
     r: Rect,
     clip: Rect,
     focused: bool,
-    rows: usize,
+    (rows, ins_rows): (usize, usize),
     menu: &mut Vec<MenuItem>,
 ) -> StripLayout {
     let id = t.id;
@@ -1148,6 +1263,7 @@ fn strip(
         pan: m.pan.clone(),
         level: app.meters.get(&id).map_or([0.0; 2], |d| d.level),
         fx: t.kind == TrackKind::Aux,
+        focused,
         ..StripLayout::default()
     };
     let x0 = r.min.x + 4.0;
@@ -1168,10 +1284,17 @@ fn strip(
         Align2::LEFT_CENTER,
         &t.name,
         FontId::proportional(13.0),
-        if sl.fx { TOKENS.text_dim } else { TOKENS.text },
+        if focused {
+            TOKENS.accent
+        } else if sl.fx {
+            TOKENS.text_dim
+        } else {
+            TOKENS.text
+        },
     );
     sl.name_rect = r4(name_r);
-    let resp = ui.interact(name_r.intersect(clip), ui.id().with(("strip_name", id.0)), Sense::click());
+    // Anywhere on the strip focuses it; controls drawn after this take their own clicks.
+    let resp = ui.interact(r.intersect(clip), ui.id().with(("strip_name", id.0)), Sense::click());
     if resp.clicked() {
         app.focus(id);
     }
@@ -1191,6 +1314,9 @@ fn strip(
         p.text(in_r.left_center() + vec2(4.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(10.0), TOKENS.text_dim);
     }
     y += 19.0;
+    // Inserts (Logic: under the input), then sends.
+    inserts_block(app, ui, t, x0, w, y, ins_rows, clip, &mut sl, menu);
+    y += ins_rows as f32 * INSERT_ROW_H;
     // Sends (Logic: between the input and the output).
     sends_block(app, ui, s, t, x0, w, y, rows, clip, &mut sl, menu);
     y += rows as f32 * SEND_ROW_H;
