@@ -502,9 +502,12 @@ pub struct Mixer {
     pub solo: bool,
     #[serde(default)]
     pub solo_safe: bool,
-    #[serde(default)]
+    /// Runtime state: never saved, and false whenever a session is opened (old files that still
+    /// carry the field are read and ignored), so opening a session never activates an input path.
+    #[serde(skip)]
     pub record_arm: bool,
-    #[serde(default)]
+    /// Runtime state, like `record_arm`.
+    #[serde(skip)]
     pub input_monitor: bool,
     #[serde(default)]
     pub phase_invert: bool,
@@ -708,5 +711,41 @@ mod tests {
     fn formats() {
         assert_eq!(ChannelFormat::for_channels(6), ChannelFormat::Surround51);
         assert_eq!(ChannelFormat::from_id("stereo"), Some(ChannelFormat::Stereo));
+    }
+
+    #[test]
+    fn arm_and_monitor_are_runtime_only() {
+        use crate::{ChannelFormat, Session, TrackKind};
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        {
+            let m = &mut s.track_mut(t).unwrap().mixer;
+            m.record_arm = true;
+            m.input_monitor = true;
+            m.volume_db = -6.0;
+            m.solo_safe = true;
+            m.trim_db = 3.0;
+        }
+        let text = s.to_json().unwrap();
+        assert!(!text.contains("record_arm") && !text.contains("input_monitor"), "runtime state was saved");
+        let back = Session::from_json(&text).unwrap();
+        let m = &back.track(t).unwrap().mixer;
+        assert!(!m.record_arm && !m.input_monitor);
+        let mut expected = s.track(t).unwrap().mixer.clone();
+        (expected.record_arm, expected.input_monitor) = (false, false);
+        assert_eq!(*m, expected, "every other mixer field round-trips");
+    }
+
+    #[test]
+    fn old_files_with_arm_and_monitor_open_disarmed() {
+        use crate::{ChannelFormat, Session, TrackKind};
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let mut v = serde_json::to_value(&s).unwrap();
+        v["tracks"][0]["mixer"]["record_arm"] = serde_json::json!(true);
+        v["tracks"][0]["mixer"]["input_monitor"] = serde_json::json!(true);
+        let back = Session::from_json(&v.to_string()).unwrap();
+        let m = &back.track(t).unwrap().mixer;
+        assert!(!m.record_arm && !m.input_monitor);
     }
 }

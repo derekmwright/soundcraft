@@ -246,6 +246,7 @@ impl Engine {
         let Some(h) = self.undo.pop() else { return false };
         let cur = std::mem::replace(&mut self.doc, h.doc);
         self.keep_edit_mode(&cur);
+        self.keep_runtime_state(&cur);
         self.redo.push(HistoryEntry { label: h.label, doc: cur });
         self.revision = self.revision.wrapping_add(1);
         self.dirty = true;
@@ -256,6 +257,7 @@ impl Engine {
         let Some(h) = self.redo.pop() else { return false };
         let cur = std::mem::replace(&mut self.doc, h.doc);
         self.keep_edit_mode(&cur);
+        self.keep_runtime_state(&cur);
         self.undo.push(HistoryEntry { label: h.label, doc: cur });
         self.revision = self.revision.wrapping_add(1);
         self.dirty = true;
@@ -272,6 +274,22 @@ impl Engine {
             ed.edit_mode = from.edit.edit_mode;
             for f in flags {
                 ed.set_flag(f, from.edit.flag(f));
+            }
+        }
+    }
+
+    /// Undo and Redo never change record-arm or input-monitor, which are runtime state: tracks keep
+    /// what they have now, whatever the restored snapshot held.
+    fn keep_runtime_state(&mut self, from: &Session) {
+        let differs = |t: &soundcraft_model::Track| {
+            from.track(t.id).is_some_and(|f| f.mixer.record_arm != t.mixer.record_arm || f.mixer.input_monitor != t.mixer.input_monitor)
+        };
+        if self.doc.tracks.iter().any(differs) {
+            for t in &mut Arc::make_mut(&mut self.doc).tracks {
+                if let Some(f) = from.track(t.id) {
+                    t.mixer.record_arm = f.mixer.record_arm;
+                    t.mixer.input_monitor = f.mixer.input_monitor;
+                }
             }
         }
     }
@@ -419,6 +437,9 @@ impl Engine {
 /// Equal apart from what changes without editing: the selection, the playhead and the zoom.
 fn same_document(saved: &Session, doc: &Session) -> bool {
     let mut doc = doc.clone();
+    for (t, f) in doc.tracks.iter_mut().zip(&saved.tracks) {
+        (t.mixer.record_arm, t.mixer.input_monitor) = (f.mixer.record_arm, f.mixer.input_monitor);
+    }
     let (from, to) = (&saved.edit, &mut doc.edit);
     to.selection = from.selection;
     to.timeline_selection = from.timeline_selection;

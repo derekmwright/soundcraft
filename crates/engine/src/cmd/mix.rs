@@ -40,7 +40,7 @@ pub fn specs() -> Vec<CommandSpec> {
             }
             Ok(json!({}))
         }),
-        cmd!("mix.record_arm", "Record Enable", [], Some("Shift+R"), "{tracks?, value?: bool}", has_selection, |e, p| toggle(
+        cmd!(noundo "mix.record_arm", "Record Enable", [], Some("Shift+R"), "{tracks?, value?: bool}", has_selection, |e, p| toggle(
             e,
             p,
             "mix.record_arm",
@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             }),
             |tr| tr.mixer.record_arm
         )),
-        cmd!("mix.input_monitor", "Input Monitoring", [], Some("Shift+I"), "{tracks?, value?: bool}", has_selection, |e, p| toggle(
+        cmd!(noundo "mix.input_monitor", "Input Monitoring", [], Some("Shift+I"), "{tracks?, value?: bool}", has_selection, |e, p| toggle(
             e,
             p,
             "mix.input_monitor",

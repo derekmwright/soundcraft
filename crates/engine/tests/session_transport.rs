@@ -28,3 +28,27 @@ fn failed_new_session_keeps_the_current_transport() {
     assert_eq!(engine.transport, status);
     assert_eq!(engine.transport_requests, requests);
 }
+
+#[test]
+fn undo_and_redo_never_change_record_arm_or_monitor() {
+    let mut e = Engine::default();
+    let id = e.execute("track.new", &json!({"name": "Vox", "format": "mono"})).unwrap()["tracks"][0].as_u64().unwrap();
+    e.execute("mix.record_arm", &json!({"tracks": [id], "value": true})).unwrap();
+    e.execute("mix.input_monitor", &json!({"tracks": [id], "value": true})).unwrap();
+    e.execute("mix.volume", &json!({"tracks": [id], "db": -3.0})).unwrap();
+    let armed = |e: &Engine| e.session().tracks[0].mixer.record_arm && e.session().tracks[0].mixer.input_monitor;
+    assert!(e.undo() && armed(&e));
+    assert!(e.redo() && armed(&e));
+    e.execute("mix.record_arm", &json!({"tracks": [id], "value": false})).unwrap();
+    assert!(e.undo());
+    assert!(!e.session().tracks[0].mixer.record_arm, "undo does not re-arm");
+}
+
+#[test]
+fn arming_does_not_make_the_document_dirty() {
+    let mut e = Engine::default();
+    e.execute("track.new", &json!({"name": "Vox", "format": "mono"})).unwrap();
+    e.mark_clean();
+    e.execute("mix.record_arm", &json!({"tracks": [e.session().tracks[0].id.0], "value": true})).unwrap();
+    assert!(!e.is_dirty());
+}
