@@ -141,6 +141,8 @@ pub struct NoteRect {
     pub length: i64,
     pub velocity: u8,
     pub selected: bool,
+    /// Starts at or past the clip's end: it never sounds (drawn dimmed and hatched).
+    pub outside: bool,
     pub rect: R4,
     /// The note's stem in the velocity lane.
     pub vel_rect: R4,
@@ -179,6 +181,8 @@ pub struct KeysLayout {
     pub clip_ticks: i64,
     pub grid_ticks: Option<i64>,
     pub notes: Vec<NoteRect>,
+    /// Instrument/MIDI tracks with no clips, which show the "create a clip" hint (set by the arrangement).
+    pub hint_tracks: Vec<u64>,
     pub selected: usize,
     /// Notes auditioned so far, and the last one as (pitch, velocity): with or without a player.
     pub auditions: u64,
@@ -293,6 +297,14 @@ impl Map {
         let x0 = self.x(n.start);
         let y = self.y(n.pitch);
         Rect::from_min_max(pos2(x0, y + 1.0), pos2(self.x(n.end()).max(x0 + 3.0), y + self.kh - 1.0))
+    }
+}
+
+impl KeysState {
+    /// Pitches of auditioned notes still held.
+    #[cfg(test)]
+    pub fn held_pitches(&self) -> Vec<u8> {
+        self.held.iter().map(|h| h.1).collect()
     }
 }
 
@@ -603,8 +615,12 @@ pub fn pane(app: &mut StudioApp, ui: &mut Ui) -> bool {
     }
     let now = ui.input(|i| i.time);
     let down = ui.input(|i| i.pointer.any_down());
-    app.release_auditions(now, down);
+    // Focus lost: nothing may keep sounding.
+    let blurred = ui.input(|i| i.viewport().focused == Some(false));
+    app.release_auditions(if blurred { f64::INFINITY } else { now }, down && !blurred);
     if !app.keys_shown() {
+        // Hidden by a tab switch or a closed pane: let go of everything.
+        app.release_auditions(f64::INFINITY, false);
         app.keys.layout = KeysLayout { auditions: app.keys.auditions, last_audition: app.keys.last_audition, ..KeysLayout::default() };
         return false;
     }
@@ -613,6 +629,10 @@ pub fn pane(app: &mut StudioApp, ui: &mut Ui) -> bool {
     let max_h = (ui.ctx().content_rect().height() - 200.0).max(MIN_H);
     let h = app.ui.keys.height.clamp(MIN_H, max_h);
     egui::Panel::bottom("keys").exact_size(h).frame(egui::Frame::NONE.fill(TOKENS.panel)).show(ui, |ui| editor(app, ui));
+    // A pending note-off needs a frame to happen on, even with the mouse still.
+    if !app.keys.held.is_empty() {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+    }
     true
 }
 
@@ -665,7 +685,7 @@ fn editor(app: &mut StudioApp, ui: &mut Ui) {
     pane_handle(app, ui, handle, &mut layout);
     paint_grid(ui, &s, &map, grid, ruler, &cv);
     let preview = preview(app, ui, &map, vel, &cv.notes);
-    paint_notes(app, ui, &map, grid, vel, &cv.notes, preview.as_ref(), &mut layout);
+    paint_notes(app, ui, &map, grid, vel, &cv.notes, cv.len, preview.as_ref(), &mut layout);
     grid_input(app, ui, &map, grid, vel, &cv, now, &mut layout);
     lane_input(app, ui, &map, vel, &cv, &layout);
     paint_keyboard(app, ui, &map, keyboard);
@@ -953,6 +973,7 @@ fn paint_notes(
     grid: Rect,
     vel: Rect,
     notes: &[Note],
+    clip_len: i64,
     preview: Option<&(Vec<(Note, Note)>, bool)>,
     layout: &mut KeysLayout,
 ) {
@@ -971,11 +992,22 @@ fn paint_notes(
     };
     let draw = |n: &Note, selected: bool, alpha: f32| {
         let r = map.note_rect(n);
+        let outside = n.start >= clip_len;
+        let alpha = if outside { alpha * 0.4 } else { alpha };
         let a = 0.45 + 0.55 * f32::from(n.velocity) / 127.0;
         let fill = if selected { theme::lighten(TOKENS.accent, 0.25) } else { TOKENS.accent.gamma_multiply(a) };
         p.rect_filled(r, 2.0, fill.gamma_multiply(alpha));
         if selected {
             p.rect_stroke(r, 2.0, Stroke::new(1.0, TOKENS.selection_outline.gamma_multiply(alpha)), StrokeKind::Inside);
+        }
+        if outside {
+            // Diagonal hatch: past the clip's end the note is silent.
+            let hp = p.with_clip_rect(r.intersect(grid));
+            let mut x = r.min.x - r.height();
+            while x < r.max.x {
+                hp.line_segment([pos2(x, r.max.y), pos2(x + r.height(), r.min.y)], Stroke::new(1.0, TOKENS.text_dim.gamma_multiply(0.7)));
+                x += 5.0;
+            }
         }
         let s = stem(n);
         let c = if selected { TOKENS.selection_outline } else { TOKENS.accent };
@@ -992,6 +1024,7 @@ fn paint_notes(
             length: n.length,
             velocity: n.velocity,
             selected,
+            outside: n.start >= clip_len,
             rect: r4(r),
             vel_rect: r4(stem(n)),
         });
@@ -1048,7 +1081,9 @@ fn grid_input(app: &mut StudioApp, ui: &mut Ui, map: &Map, grid: Rect, vel: Rect
             None => {
                 let pitch = map.pitch(pos.y);
                 let start = map.floor(map.tick(pos.x));
-                if (0..=127).contains(&pitch) && start >= 0 {
+                if start >= cv.len {
+                    app.status = "Outside the clip: extend the clip in the arrangement first".into();
+                } else if (0..=127).contains(&pitch) && start >= 0 {
                     let n = Note {
                         pitch: pitch as u8,
                         velocity: app.ui.keys.velocity.clamp(1, 127),
@@ -1399,4 +1434,28 @@ fn wheel(app: &mut StudioApp, ui: &Ui, map: &Map, body: Rect) {
     if dy.abs() > 0.1 {
         app.keys.top += dy / map.kh;
     }
+}
+
+/// The arrangement's empty-lane hint: instrument and MIDI tracks with no clip say how to make one.
+pub fn lane_hints(app: &mut StudioApp, ui: &Ui, tl: Rect, tracks: &[crate::arrange::TrackRow]) {
+    let s = app.engine.session_arc();
+    let mut ids = Vec::new();
+    for row in tracks {
+        let Some(t) = s.track(TrackId(row.id)) else { continue };
+        if !t.kind.is_midi() || !t.clips().is_empty() {
+            continue;
+        }
+        ids.push(row.id);
+        let lane = Rect::from_min_max(pos2(row.lane[0], row.lane[1]), pos2(row.lane[2], row.lane[3])).intersect(tl);
+        if lane.height() > 12.0 {
+            ui.painter().with_clip_rect(tl).text(
+                pos2(lane.min.x + 12.0, lane.center().y),
+                Align2::LEFT_CENTER,
+                "Double-click a lane to create a MIDI clip",
+                FontId::proportional(11.5),
+                TOKENS.text_dim,
+            );
+        }
+    }
+    app.keys.layout.hint_tracks = ids;
 }

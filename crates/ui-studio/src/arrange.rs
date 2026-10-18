@@ -175,6 +175,7 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
 
     grid_and_ruler(app, ui, &s, map, ruler, tl);
     clips(app, ui, &s, map, tl, &rows, rh, &mut layout);
+    crate::keys::lane_hints(app, ui, tl, &layout.tracks);
     timeline_input(app, ui, &s, map, tl, &rows, rh, &layout);
     ruler_input(app, ui, map, ruler);
     overlays(app, ui, &s, map, ruler, tl, &rows, rh);

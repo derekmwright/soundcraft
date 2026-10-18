@@ -409,3 +409,90 @@ fn the_playhead_follows_and_the_editor_stays_on_its_clip() {
     t.frames(2);
     assert!(!t.app.keys.layout.visible && t.app.keys.clip.is_none());
 }
+
+impl T {
+    /// One frame with the given focus state; returns the repaint delay egui was asked for.
+    fn frame_with(&mut self, focused: Option<bool>) -> std::time::Duration {
+        self.time += 1.0 / 60.0;
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 800.0))),
+            time: Some(self.time),
+            ..Default::default()
+        };
+        raw.viewports.entry(egui::ViewportId::ROOT).or_default().focused = focused;
+        self.app.raw_input_hook(&mut raw);
+        let app = &mut self.app;
+        let out = self.ctx.run_ui(raw, |ui| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        });
+        out.viewport_output.get(&egui::ViewportId::ROOT).map_or(std::time::Duration::MAX, |v| v.repaint_delay)
+    }
+}
+
+#[test]
+fn an_audition_releases_by_itself_with_the_mouse_still_and_on_focus_loss_or_a_tab_switch() {
+    let mut t = T::open();
+    t.app.audition(60, 100, t.time);
+    let delay = t.frame_with(None);
+    assert!(delay <= std::time::Duration::from_millis(50), "a repaint is requested while a note is held: {delay:?}");
+    assert_eq!(t.app.keys.layout.sounding, vec![60]);
+    // No input at all: frames spaced like the repaint requests release it after 150 ms.
+    for _ in 0..3 {
+        t.time += 0.05;
+        t.frame_with(None);
+    }
+    assert!(t.app.keys.layout.sounding.is_empty(), "released without any event");
+    // Focus loss releases at once.
+    t.app.audition(61, 100, t.time);
+    t.frame_with(None);
+    assert_eq!(t.app.keys.layout.sounding, vec![61]);
+    t.frame_with(Some(false));
+    assert!(t.app.keys.layout.sounding.is_empty(), "released on focus loss");
+    // A tab switch (pane hidden) releases too.
+    t.app.audition(62, 100, t.time);
+    t.frame_with(None);
+    t.app.ui.keys.show = false;
+    t.frame_with(None);
+    assert!(t.app.keys.held_pitches().is_empty(), "released when the pane is hidden");
+    let delay = t.frame_with(None);
+    assert!(delay > std::time::Duration::from_millis(50), "no repaint once nothing is held");
+}
+
+#[test]
+fn notes_past_the_clip_end_are_refused_on_add_and_flagged_when_moved_or_loaded() {
+    let mut t = T::open();
+    let len = t.app.keys.layout.clip_ticks;
+    assert!(len > 0);
+    t.add(60, 0, 240);
+    // A double-click past the end adds nothing and says why.
+    let undo = t.undo_len();
+    t.click_n(t.at(len as f64 + 480.0, 64), 2, json!({}));
+    assert_eq!(t.notes().len(), 1, "no note added past the end");
+    assert_eq!(t.undo_len(), undo);
+    assert_eq!(t.app.status, "Outside the clip: extend the clip in the arrangement first");
+    assert!(t.app.keys.layout.notes.iter().all(|n| !n.outside));
+    // Moving a note past the end is allowed; it is flagged (drawn dimmed and hatched).
+    t.app.keys.selection = t.notes();
+    t.app.keys_move(len + 480, 0).unwrap();
+    t.frames(2);
+    assert_eq!(t.notes()[0].start, len + 480);
+    assert!(t.app.keys.layout.notes[0].outside, "{:?}", t.app.keys.layout.notes);
+    // A note already past the end (a loaded session) is flagged the same way.
+    t.add(65, len + 10, 120);
+    let n = t.app.keys.layout.notes.iter().find(|n| n.pitch == 65).unwrap();
+    assert!(n.outside);
+}
+
+#[test]
+fn an_empty_instrument_lane_shows_the_create_clip_hint_until_a_clip_exists() {
+    let mut app = StudioApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+    let r = app.run("track.new", json!({"kind": "instrument"})).unwrap();
+    let track = TrackId(r["tracks"][0].as_u64().unwrap());
+    let mut t = T { app, ctx: egui::Context::default(), time: 0.0, track, clip: ClipId(0) };
+    t.frames(3);
+    assert_eq!(t.app.keys.layout.hint_tracks, vec![track.0], "hint on the empty instrument lane");
+    let lane = t.app.arrange.layout.tracks[0].lane;
+    t.click_n(mid(lane), 2, json!({}));
+    assert!(t.app.keys.layout.hint_tracks.is_empty(), "gone once a clip exists");
+}
