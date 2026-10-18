@@ -567,6 +567,13 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
     {
         let _ = app.new_midi_clip(Some(track));
     }
+    // Slice 3: double-click a MIDI clip to edit it in the piano roll.
+    if resp.double_clicked()
+        && let Some(pos) = resp.interact_pointer_pos()
+        && let (Some((clip, ..)), _) = hit(layout, pos)
+    {
+        app.open_keys(clip);
+    }
     resp.context_menu(|ui| {
         if ui.button("Add Audio Track").clicked() {
             let _ = app.add_track("audio");

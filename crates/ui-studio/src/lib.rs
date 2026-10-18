@@ -12,6 +12,7 @@ pub mod control;
 pub mod devices;
 pub mod fine;
 pub mod host;
+pub mod keys;
 pub mod menus;
 pub mod mixer;
 pub mod plugin_scan;
@@ -68,6 +69,8 @@ pub struct UiState {
     /// Follows clicks in both views. View state, never in the document.
     #[serde(skip)]
     pub focus_track: Option<TrackId>,
+    /// The piano roll's view preferences (slice 3).
+    pub keys: keys::KeysPrefs,
 }
 
 impl Default for UiState {
@@ -87,6 +90,7 @@ impl Default for UiState {
             cursor: 0,
             cursor_track: None,
             focus_track: None,
+            keys: keys::KeysPrefs::default(),
         }
     }
 }
@@ -176,6 +180,8 @@ pub struct StudioApp {
     pub copied: Vec<(TrackId, Range)>,
     /// The mixer and device chain: gesture in progress, scroll, and last frame's layout.
     pub mixer: mixer::MixerState,
+    /// The piano roll (slice 3): open clip, selection, gesture, scroll, last frame's layout.
+    pub keys: keys::KeysState,
 }
 
 impl StudioApp {
@@ -219,6 +225,7 @@ impl StudioApp {
             arrange: arrange::ArrangeState::default(),
             copied: Vec::new(),
             mixer: mixer::MixerState::default(),
+            keys: keys::KeysState::default(),
         }
     }
 
@@ -508,11 +515,15 @@ impl StudioApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.set_style(ctx.global_style());
+        keys::shortcuts(self, &ctx); // slice 3: before the arrangement's keys
         menus::shortcuts(self, &ctx);
         menus::menu_bar(self, ui);
         transport::bar(self, ui);
         menus::status_bar(self, ui);
-        mixer::panes(self, ui);
+        // Slice 3: the piano roll replaces the mixer and device chain panes while it is open.
+        if !keys::pane(self, ui) {
+            mixer::panes(self, ui);
+        }
         if self.ui.mixer_full {
             mixer::show_full(self, ui);
         } else {
@@ -563,9 +574,12 @@ impl StudioApp {
             })),
             "wheel_merge": self.mixer.wheel.is_some(),
             "plugin_scan": plugin_scan::inspect(),
+            "keys": self.keys.layout,
         })
     }
 }
 
+#[cfg(test)]
+mod keys_tests;
 #[cfg(test)]
 mod tests;
