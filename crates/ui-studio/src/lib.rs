@@ -9,8 +9,10 @@
 pub mod actions;
 pub mod arrange;
 pub mod control;
+pub mod devices;
 pub mod host;
 pub mod menus;
+pub mod mixer;
 pub mod plugin_scan;
 pub mod theme;
 pub mod transport;
@@ -46,6 +48,14 @@ pub struct UiState {
     /// The main window's size (logical points) and maximized state.
     pub window_size: [f32; 2],
     pub window_maximized: bool,
+    /// The mixer as a pane under the arrangement (Ableton's Ctrl+Alt+M).
+    pub show_mixer: bool,
+    /// The device chain of the focused track under the arrangement (Ableton's detail view, Ctrl+Alt+L).
+    pub show_devices: bool,
+    /// The mixer fills the window instead of the arrangement (Cubase's F3).
+    pub mixer_full: bool,
+    /// Height of the mixer pane in points.
+    pub mixer_height: f32,
     /// The edit cursor: where Play starts and Paste lands. View state of the open session, not
     /// part of the document (setting it never dirties it) and not saved with the preferences.
     #[serde(skip)]
@@ -53,6 +63,10 @@ pub struct UiState {
     /// The track the cursor was last set on (paste target).
     #[serde(skip)]
     pub cursor_track: Option<TrackId>,
+    /// The focused track: the one the device chain shows and the mixer and track list highlight.
+    /// Follows clicks in both views. View state, never in the document.
+    #[serde(skip)]
+    pub focus_track: Option<TrackId>,
 }
 
 impl Default for UiState {
@@ -65,8 +79,13 @@ impl Default for UiState {
             header_width: 236.0,
             window_size: [1600.0, 1000.0],
             window_maximized: false,
+            show_mixer: false,
+            show_devices: true,
+            mixer_full: false,
+            mixer_height: 340.0,
             cursor: 0,
             cursor_track: None,
+            focus_track: None,
         }
     }
 }
@@ -151,6 +170,8 @@ pub struct StudioApp {
     pub arrange: arrange::ArrangeState,
     /// What the last Copy took, so a Paste onto the original is refused (UX gap, plan 06).
     pub copied: Vec<(TrackId, Range)>,
+    /// The mixer and device chain: gesture in progress, scroll, and last frame's layout.
+    pub mixer: mixer::MixerState,
 }
 
 impl StudioApp {
@@ -193,6 +214,7 @@ impl StudioApp {
             editors: Vec::new(),
             arrange: arrange::ArrangeState::default(),
             copied: Vec::new(),
+            mixer: mixer::MixerState::default(),
         }
     }
 
@@ -288,7 +310,7 @@ impl StudioApp {
             return Err("plugin folders can't be changed over the control channel".into());
         }
         let mut ns = ns;
-        (ns.cursor, ns.cursor_track) = (self.ui.cursor, self.ui.cursor_track);
+        (ns.cursor, ns.cursor_track, ns.focus_track) = (self.ui.cursor, self.ui.cursor_track, self.ui.focus_track);
         let before = std::mem::replace(&mut self.ui, ns);
         // Editors no longer listed close; newly listed ones open (retried until loaded).
         for key in before.plugin_windows.iter().filter(|k| !self.ui.plugin_windows.contains(k)) {
@@ -480,7 +502,12 @@ impl StudioApp {
         menus::menu_bar(self, ui);
         transport::bar(self, ui);
         menus::status_bar(self, ui);
-        arrange::show(self, ui);
+        mixer::panes(self, ui);
+        if self.ui.mixer_full {
+            mixer::show_full(self, ui);
+        } else {
+            arrange::show(self, ui);
+        }
         menus::dialogs(self, &ctx);
         menus::recovery(self, &ctx);
         if self.is_playing() || self.engine.transport.recording {
@@ -514,6 +541,9 @@ impl StudioApp {
             "main_meter": self.main_meter.level,
             "status": self.status,
             "layout": self.arrange.layout,
+            "focus_track": self.focus_track(),
+            "mixer": self.mixer.layout,
+            "devices": self.mixer.devices,
         })
     }
 }

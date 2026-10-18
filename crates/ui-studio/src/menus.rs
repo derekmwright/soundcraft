@@ -97,9 +97,27 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         let _ = app.add_track("instrument");
                         ui.close();
                     }
+                    if ui.button("Add FX Channel").clicked() {
+                        let _ = app.add_fx_channel();
+                        ui.close();
+                    }
                     if ui.button("New MIDI Clip at Cursor").clicked() {
                         let _ = app.new_midi_clip(None);
                         ui.close();
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    let u = &mut app.ui;
+                    for (label, key, flag) in [
+                        ("Mixer", "Ctrl+Alt+M", &mut u.show_mixer),
+                        ("Devices", "Ctrl+Alt+L", &mut u.show_devices),
+                        ("Full Mixer Window", "F3", &mut u.mixer_full),
+                    ] {
+                        let text = if *flag { format!("✓ {label}") } else { format!("   {label}") };
+                        if ui.add(egui::Button::new(text).shortcut_text(key)).clicked() {
+                            *flag = !*flag;
+                            ui.close();
+                        }
                     }
                 });
                 ui.menu_button("Transport", |ui| {
@@ -215,6 +233,18 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
     }
     if pressed(ctx, Modifiers::NONE, Key::Delete) || pressed(ctx, Modifiers::NONE, Key::Backspace) {
         let _ = app.delete_selected();
+    }
+    // Views (Ableton where it has a key: Ctrl+Alt+M mixer, Ctrl+Alt+L detail view; Cubase's F3
+    // MixConsole for the full mixer, which Ableton has no key for).
+    let cmd_alt = Modifiers::COMMAND | Modifiers::ALT;
+    if pressed(ctx, cmd_alt, Key::M) {
+        app.ui.show_mixer = !app.ui.show_mixer;
+    }
+    if pressed(ctx, cmd_alt, Key::L) {
+        app.ui.show_devices = !app.ui.show_devices;
+    }
+    if pressed(ctx, Modifiers::NONE, Key::F3) {
+        app.ui.mixer_full = !app.ui.mixer_full;
     }
     if pressed(ctx, Modifiers::NONE, Key::Escape) {
         let _ = app.run("edit.select_none", json!({}));

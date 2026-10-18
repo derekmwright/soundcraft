@@ -1,5 +1,5 @@
 //! The arrangement window: a track list on the left, a bar/beat ruler, and the timeline with
-//! clips as coloured regions. Clicking a clip selects it; dragging moves it (Alt-drag copies,
+//! clips as colored regions. Clicking a clip selects it; dragging moves it (Alt-drag copies,
 //! Ctrl-drag keeps it on its track); dragging an edge trims it; clicking empty timeline sets the
 //! cursor. Every edit goes through engine commands (see `actions`).
 
@@ -135,14 +135,14 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
         ..Layout::default()
     };
     let selected_tracks = s.edit.selected_tracks.clone();
-    let cursor_track = app.cursor_track();
+    let focus = app.focus_track();
     for (i, t) in rows.iter().enumerate() {
         let y0 = tl.min.y + i as f32 * rh - app.arrange.vscroll;
         let header = Rect::from_min_max(pos2(list.min.x, y0), pos2(list.max.x, y0 + rh));
         let lane = Rect::from_min_max(pos2(tl.min.x, y0), pos2(tl.max.x, y0 + rh));
         let mut row = TrackRow { id: t.id.0, name: t.name.clone(), kind: t.kind, header: r4(header), lane: r4(lane), ..TrackRow::default() };
         if header.max.y >= list.min.y && header.min.y <= list.max.y {
-            let selected = selected_tracks.contains(&t.id) || cursor_track == Some(t.id);
+            let selected = selected_tracks.contains(&t.id) || focus == Some(t.id);
             track_header(app, ui, t, header, list, selected, &mut row);
         }
         let lane_fill = if i % 2 == 0 { TOKENS.lane } else { TOKENS.lane_alt };
@@ -178,7 +178,7 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     app.arrange.layout = layout;
 }
 
-/// One track's header: colour strip, name, M S R I toggles, volume readout.
+/// One track's header: color strip, name, M S R I toggles, volume readout.
 fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect, selected: bool, row: &mut TrackRow) {
     let p = ui.painter().with_clip_rect(list);
     let bg = if selected { TOKENS.header_selected } else { TOKENS.header };
@@ -266,9 +266,7 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     let name_area = Rect::from_min_max(r.min, pos2(r.max.x - 92.0, r.max.y));
     let resp = ui.interact(name_area.intersect(list), ui.id().with(("hdr", t.id.0)), Sense::click());
     if resp.clicked() {
-        let _ = app.run("edit.select", json!({"tracks": [t.id.0]}));
-        let at = app.cursor();
-        app.set_cursor(at, Some(t.id));
+        app.focus(t.id);
     }
     let id = t.id;
     let kind = t.kind;
@@ -289,7 +287,7 @@ fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, ha
         let _ = app.new_midi_clip(Some(id));
         ui.close();
     }
-    ui.menu_button("Colour", |ui| {
+    ui.menu_button("Color", |ui| {
         for (i, c) in PALETTE.iter().enumerate() {
             let (r, resp) = ui.allocate_exact_size(vec2(120.0, 16.0), Sense::click());
             ui.painter().rect_filled(r.shrink(1.0), 2.0, theme::rgb(*c));
@@ -307,7 +305,7 @@ fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, ha
     }
 }
 
-/// Track colours offered in the track menu (muted, distinguishable on the dark lanes).
+/// Track colors offered in the track menu (muted, distinguishable on the dark lanes).
 const PALETTE: [[u8; 3]; 10] = [
     [0xd9, 0x5f, 0x5f],
     [0xe0, 0x8c, 0x4a],
@@ -398,7 +396,7 @@ fn drag_preview(app: &StudioApp, ui: &Ui, map: Map, rows: &[&Track], tl: Rect, r
     })
 }
 
-/// Clips as solid regions in the track colour, with a name strip and their content.
+/// Clips as solid regions in the track color, with a name strip and their content.
 #[allow(clippy::too_many_arguments)]
 fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Track], rh: f32, layout: &mut Layout) {
     let p = ui.painter().with_clip_rect(tl);

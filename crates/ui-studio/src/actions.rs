@@ -28,6 +28,9 @@ impl StudioApp {
 
     /// Click on a clip: select it (`additive` adds it to or removes it from the selection).
     pub fn click_clip(&mut self, clip: ClipId, additive: bool) {
+        if let Some((t, _)) = self.engine.session().find_clip(clip) {
+            self.ui.focus_track = Some(t);
+        }
         let mut clips: Vec<u64> = if additive { self.engine.session().edit.selected_clips.iter().map(|c| c.0).collect() } else { Vec::new() };
         if additive && clips.contains(&clip.0) {
             clips.retain(|c| *c != clip.0);
@@ -50,6 +53,9 @@ impl StudioApp {
             None => json!({"start": at}),
         };
         let _ = self.run("edit.select", params);
+        if track.is_some() {
+            self.ui.focus_track = track;
+        }
         self.set_cursor(at, track);
         self.locate_playing(at);
     }
@@ -210,6 +216,7 @@ impl StudioApp {
         if let Some(id) = r.get("tracks").and_then(|t| t.get(0)).and_then(Value::as_u64) {
             let at = self.cursor();
             self.set_cursor(at, Some(TrackId(id)));
+            self.ui.focus_track = Some(TrackId(id));
         }
         Ok(r)
     }

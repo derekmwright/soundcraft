@@ -1,9 +1,9 @@
 //! The minimal theme: tokens only (no fonts or images yet, plan 06 slice 5). Dark, neutral greys,
-//! one accent; record, mute and solo keep their conventional state colours.
+//! one accent; record, mute and solo keep their conventional state colors.
 
 use egui::Color32;
 
-/// Colour and size tokens. Everything the studio UI paints takes its colours from here.
+/// Color and size tokens. Everything the studio UI paints takes its colors from here.
 pub struct Tokens {
     pub bg: Color32,
     pub panel: Color32,
@@ -83,7 +83,7 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_visuals(v);
 }
 
-/// A readable text colour on `bg`: near-black on light clip colours, near-white on dark ones.
+/// A readable text color on `bg`: near-black on light clip colors, near-white on dark ones.
 pub fn text_on(bg: Color32) -> Color32 {
     let l = 0.2126 * f32::from(bg.r()) + 0.7152 * f32::from(bg.g()) + 0.0722 * f32::from(bg.b());
     if l > 150.0 { Color32::from_rgb(0x14, 0x14, 0x16) } else { Color32::from_rgb(0xf6, 0xf6, 0xf8) }

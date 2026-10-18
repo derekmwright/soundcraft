@@ -453,6 +453,8 @@ impl StudioApp {
                     // The cursor is per-session view state.
                     self.ui.cursor = 0;
                     self.ui.cursor_track = None;
+                    self.ui.focus_track = None;
+                    self.mixer.gesture = None;
                     self.engine.transport.position = self.cursor();
                 }
                 TransportRequest::Play => {
