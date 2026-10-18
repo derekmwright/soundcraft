@@ -465,3 +465,273 @@ fn focus_follows_both_views_and_views_never_dirty_the_document() {
     assert!(!app.engine.is_dirty(), "focus and panes are view state");
     let _ = std::fs::remove_file(&path);
 }
+
+// --- Slice 2b: instrument menu, sends, routing loops, review follow-ups ---
+
+fn new_track(app: &mut StudioApp, p: Value) -> TrackId {
+    TrackId(app.run("track.new", p).unwrap()["tracks"][0].as_u64().unwrap())
+}
+
+fn right_click(app: &mut StudioApp, at: (f32, f32)) {
+    let (req, _rx) = crate::ControlRequest::new("ui.click", json!({"x": at.0, "y": at.1, "button": "right"}));
+    let ctx = egui::Context::default();
+    let _ = crate::control::handle_for_test(app, &ctx, &req);
+}
+
+fn hover(app: &mut StudioApp, at: (f32, f32)) {
+    let (req, _rx) = crate::ControlRequest::new("ui.move", json!({"x": at.0, "y": at.1}));
+    let ctx = egui::Context::default();
+    let _ = crate::control::handle_for_test(app, &ctx, &req);
+}
+
+fn instrument_of(app: &StudioApp, t: TrackId) -> Option<soundcraft_model::Insert> {
+    app.engine.session().track(t).unwrap().instrument.clone()
+}
+
+#[test]
+fn the_instrument_menu_runs_mix_instrument_and_a_replace_is_one_undo_step() {
+    let mut app = app();
+    let t = new_track(&mut app, json!({"kind": "instrument", "name": "Keys"}));
+    let t2 = new_track(&mut app, json!({"kind": "instrument", "name": "Direct"}));
+    app.ui.show_devices = true;
+    app.focus(t);
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    frames(&mut app, &ctx, 3, &mut time);
+    let card = app.mixer.devices.cards.first().cloned().unwrap();
+    assert_eq!((card.slot, card.plugin.as_str()), (None, "subtractive_synth"));
+    let before = undo_len(&mut app);
+    click(&mut app, mid(card.pick_button));
+    frames(&mut app, &ctx, 6, &mut time);
+    let menu = app.mixer.devices.menu.clone();
+    assert!(menu.iter().any(|m| m.value == "sampler"), "built-in instruments are listed: {menu:?}");
+    assert!(menu.iter().all(|m| m.value != "gain"), "no effects in the instrument menu");
+    assert!(menu.iter().all(|m| !m.value.contains(':')), "no hosted plug-ins in a hermetic test");
+    let item = menu.iter().find(|m| m.value == "drum_synth").cloned().unwrap();
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert_eq!(instrument_of(&app, t).unwrap().plugin, "drum_synth");
+    assert_eq!(undo_len(&mut app), before + 1, "a replace is one undo step");
+    app.run("mix.instrument", json!({"track": t2.0, "plugin": "drum_synth"})).unwrap();
+    assert_eq!(instrument_of(&app, t), instrument_of(&app, t2), "the menu and mix.instrument give the same instrument");
+    assert_eq!(app.mixer.devices.cards[0].plugin, "drum_synth");
+    // Picking the instrument it already has changes nothing.
+    let n = undo_len(&mut app);
+    app.set_instrument(t, "drum_synth").unwrap();
+    assert_eq!(undo_len(&mut app), n);
+    app.run("edit.undo", json!({})).unwrap();
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(instrument_of(&app, t).unwrap().plugin, "subtractive_synth");
+}
+
+#[test]
+fn an_instrument_track_without_an_instrument_offers_choose() {
+    let mut app = app();
+    let t = new_track(&mut app, json!({"kind": "instrument"}));
+    // A session saved without an instrument (test setup; the UI itself only executes commands).
+    app.engine.session_mut().track_mut(t).unwrap().instrument = None;
+    app.ui.show_devices = true;
+    app.focus(t);
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    frames(&mut app, &ctx, 3, &mut time);
+    let card = app.mixer.devices.cards.first().cloned().unwrap();
+    assert_eq!((card.slot, card.plugin.as_str(), card.name.as_str()), (None, "", "No instrument"));
+    assert_ne!(card.pick_button, [0.0; 4], "a Choose… button");
+    click(&mut app, mid(card.pick_button));
+    frames(&mut app, &ctx, 6, &mut time);
+    let item = app.mixer.devices.menu.iter().find(|m| m.value == "sampler").cloned().unwrap();
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert_eq!(instrument_of(&app, t).unwrap().plugin, "sampler");
+}
+
+#[test]
+fn the_track_menu_has_an_instrument_submenu() {
+    let mut app = app();
+    let t = new_track(&mut app, json!({"kind": "instrument"}));
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    frames(&mut app, &ctx, 3, &mut time);
+    let hdr = app.arrange.layout.tracks.iter().find(|r| r.id == t.0).unwrap().header;
+    right_click(&mut app, (hdr[0] + 30.0, (hdr[1] + hdr[3]) / 2.0));
+    frames(&mut app, &ctx, 6, &mut time);
+    let sub = app.arrange.menu.iter().find(|m| m.label == "Instrument").cloned().expect("Instrument in the track menu");
+    hover(&mut app, mid(sub.rect));
+    frames(&mut app, &ctx, 10, &mut time);
+    let item = app.arrange.menu.iter().find(|m| m.value == "drum_synth").cloned().expect("the submenu lists the instruments");
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert_eq!(instrument_of(&app, t).unwrap().plugin, "drum_synth");
+}
+
+#[test]
+fn a_long_instrument_list_filters_and_groups_by_vendor() {
+    use crate::devices::{HostedEntry, InstrumentLists, instrument_menu};
+    let hosted =
+        |v: &'static str, n: usize| (0..n).map(move |i| HostedEntry { id: format!("vst3:{v}{i}"), name: format!("{v} Synth {i}"), vendor: v.into() });
+    let lists =
+        InstrumentLists { builtin: Vec::new(), vst3: Some(hosted("Arturia", 10).chain(hosted("Native", 10)).collect()), clap: Some(Vec::new()) };
+    let ctx = egui::Context::default();
+    let mut items = Vec::new();
+    let mut filter = "arturia".to_string();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        instrument_menu(ui, &lists, None, &mut filter, &mut items);
+    });
+    out.textures_delta.clear();
+    assert_eq!(items.len(), 10, "{items:?}");
+    assert!(items.iter().all(|m| m.value.starts_with("vst3:Arturia")));
+}
+
+#[test]
+fn a_send_row_drag_is_one_undo_step() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    app.new_fx_channel(Some(t), 0.0).unwrap();
+    frames(&mut app, &ctx, 3, &mut time);
+    let row = strip(&app, t).sends.first().cloned().expect("a send row");
+    assert_eq!((row.slot, row.target.as_str(), row.level_db), (0, "FX 1", 0.0));
+    let before = undo_len(&mut app);
+    let (x, y) = mid(row.level_rect);
+    drag(&mut app, (x, y), (x, y + 30.0), json!({}));
+    frames(&mut app, &ctx, 30, &mut time);
+    let level = app.engine.session().track(t).unwrap().mixer.sends[0].as_ref().unwrap().level_db;
+    assert!(level < -3.0, "the drag lowered the send: {level}");
+    assert_eq!(undo_len(&mut app), before + 1, "one gesture, one undo step");
+    assert_eq!(strip(&app, t).sends[0].level_db, level, "the row shows mix.send's level");
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(app.engine.session().track(t).unwrap().mixer.sends[0].as_ref().unwrap().level_db, 0.0);
+}
+
+#[test]
+fn new_fx_channel_from_a_strip_is_one_undo_step_at_0_db() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    let tracks = app.engine.session().tracks.len();
+    let before = undo_len(&mut app);
+    let at = mid(strip(&app, t).add_send);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 6, &mut time);
+    let item = app.mixer.layout.menu.iter().find(|m| m.value == crate::mixer::NEW_FX).cloned().expect("New FX Channel… in + Send");
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    let s = app.engine.session();
+    let bus = s.bus_by_name("FX 1").expect("a bus").id;
+    let fx = s.tracks.iter().find(|x| x.name == "FX 1").expect("an FX channel");
+    assert_eq!((fx.kind, &fx.mixer.input), (soundcraft_model::TrackKind::Aux, &soundcraft_model::Route::Bus(bus)));
+    let send = s.track(t).unwrap().mixer.sends[0].clone().unwrap();
+    assert_eq!((send.target, send.level_db), (soundcraft_model::Route::Bus(bus), 0.0));
+    let fx_id = TrackId(fx.id.0);
+    assert_eq!(undo_len(&mut app), before + 1);
+    let fs = strip(&app, fx_id);
+    assert!(fs.fx, "the FX channel's strip is marked");
+    assert_eq!(fs.input_label, "Bus: FX 1", "its input shows the bus");
+    app.run("edit.undo", json!({})).unwrap();
+    let s = app.engine.session();
+    assert_eq!(s.tracks.len(), tracks);
+    assert!(s.bus_by_name("FX 1").is_none() && s.track(t).unwrap().mixer.sends.iter().all(Option::is_none));
+}
+
+#[test]
+fn no_free_send_slot_leaves_no_bus_or_channel_behind() {
+    let mut app = app();
+    let t = new_track(&mut app, json!({"kind": "audio", "name": "Gtr"}));
+    for i in 0..10 {
+        app.run("mix.send", json!({"track": t.0, "bus": format!("B{i}")})).unwrap();
+    }
+    let (busses, tracks, undo) = (app.engine.session().busses.len(), app.engine.session().tracks.len(), undo_len(&mut app));
+    assert!(app.new_fx_channel(Some(t), 0.0).is_err());
+    assert!(app.status.contains("sends"), "{}", app.status);
+    let s = app.engine.session();
+    assert_eq!((s.busses.len(), s.tracks.len()), (busses, tracks));
+    assert_eq!(undo_len(&mut app), undo);
+    // A step that fails after the bus is made (no such track to send from) is taken back.
+    assert!(app.new_fx_channel(Some(TrackId(999_999)), 0.0).is_err());
+    let s = app.engine.session();
+    assert_eq!((s.busses.len(), s.tracks.len()), (busses, tracks), "rolled back");
+    assert_eq!(undo_len(&mut app), undo);
+}
+
+#[test]
+fn picking_the_default_input_changes_nothing() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    assert_eq!(strip(&app, t).input_label, "In 1-2");
+    let before = undo_len(&mut app);
+    let at = mid(strip(&app, t).input);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 6, &mut time);
+    let item = app.mixer.layout.menu.iter().find(|m| m.label == "In 1-2").cloned().unwrap();
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert_eq!(undo_len(&mut app), before, "no document edit");
+    assert_eq!(app.engine.session().track(t).unwrap().mixer.input, soundcraft_model::Route::None);
+    // Another input is a real change.
+    app.set_input(t, "In 3-4").unwrap();
+    assert_eq!(undo_len(&mut app), before + 1);
+}
+
+#[test]
+fn plus_adds_after_the_last_device() {
+    let mut app = app();
+    let t = new_track(&mut app, json!({"kind": "audio"}));
+    app.add_device(t, "gain").unwrap();
+    app.add_device(t, "eq_7band").unwrap();
+    app.remove_device(t, 0).unwrap();
+    let r = app.add_device(t, "gain").unwrap();
+    assert_eq!(r["slot"], 2, "after the last occupied slot, not into the gap");
+    let order: Vec<&str> = app.engine.session().track(t).unwrap().mixer.inserts.iter().flatten().map(|i| i.plugin.as_str()).collect();
+    assert_eq!(order, vec!["eq_7band", "gain"]);
+}
+
+#[test]
+fn routing_menus_never_offer_a_loop() {
+    use crate::mixer::{input_choices, output_choices, send_targets};
+    let mut app = app();
+    let a = new_track(&mut app, json!({"kind": "audio", "name": "A"}));
+    app.focus(a);
+    let fx1 = app.add_fx_channel().unwrap();
+    let fx2 = app.new_fx_channel(None, 0.0).unwrap();
+    let fx3 = app.new_fx_channel(None, 0.0).unwrap();
+    // A -> FX 1 -> FX 2 -> FX 3.
+    app.set_output(fx1, "FX 2").unwrap();
+    app.set_output(fx2, "FX 3").unwrap();
+    let s = app.engine.session_arc();
+    let labels = |v: Vec<(String, String)>| v.into_iter().map(|(l, _)| l).collect::<Vec<_>>();
+    let out3 = labels(output_choices(&s, s.track(fx3).unwrap()));
+    assert!(!out3.iter().any(|l| l == "FX 1" || l == "FX 2" || l == "FX 3"), "three hops back: {out3:?}");
+    let out2 = labels(output_choices(&s, s.track(fx2).unwrap()));
+    assert!(!out2.contains(&"FX 1".to_string()) && out2.contains(&"FX 3".to_string()), "{out2:?}");
+    let sends3 = labels(send_targets(&s, s.track(fx3).unwrap(), None));
+    assert!(sends3.is_empty(), "an FX 3 send could only loop: {sends3:?}");
+    let sends1 = labels(send_targets(&s, s.track(fx1).unwrap(), None));
+    assert_eq!(sends1, vec!["FX 2", "FX 3"], "a bus may feed another bus downstream");
+    let ins = labels(input_choices(&s, s.track(a).unwrap(), 2));
+    assert!(ins.iter().all(|l| !l.starts_with("Bus")), "A feeds all three busses: {ins:?}");
+    // The dropdown in the window agrees.
+    app.ui.show_mixer = true;
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    frames(&mut app, &ctx, 3, &mut time);
+    let at = mid(strip(&app, fx3).output);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 6, &mut time);
+    let menu: Vec<String> = app.mixer.layout.menu.iter().map(|m| m.label.clone()).collect();
+    assert!(menu.contains(&"Main".to_string()) && !menu.contains(&"FX 1".to_string()), "{menu:?}");
+}
+
+#[test]
+fn the_device_chain_lists_the_sends_with_pre_and_post() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    app.focus(t);
+    app.new_fx_channel(Some(t), -6.0).unwrap();
+    app.focus(t);
+    frames(&mut app, &ctx, 3, &mut time);
+    let row = app.mixer.devices.sends.first().cloned().expect("a sends section");
+    assert_eq!((row.target.as_str(), row.level_db, row.pre_fader), ("FX 1", -6.0, false));
+    assert_ne!(app.mixer.devices.add_send, [0.0; 4]);
+    click(&mut app, mid(row.pre));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert!(app.engine.session().track(t).unwrap().mixer.sends[0].as_ref().unwrap().pre_fader);
+    let at = mid(app.mixer.devices.sends[0].remove);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 6, &mut time);
+    assert!(app.engine.session().track(t).unwrap().mixer.sends.iter().all(Option::is_none));
+}
