@@ -183,6 +183,11 @@ struct AudioState {
     /// Auditioned notes held, and the frames left to render the last one's release.
     live_notes: usize,
     live_tail: usize,
+    /// The session holds a hosted plug-in: the engine runs while stopped so the mixer can suspend plug-ins by their own signals rather than starving them.
+    hosted: bool,
+    /// Blocks rendered (tests observe whether the engine ran even when nothing is audible).
+    #[cfg(test)]
+    renders: usize,
     /// Retired plugin instances go back to the UI thread to be dropped there.
     garbage: Sender<Vec<Box<dyn Plugin>>>,
     old_sessions: Option<SyncSender<Arc<Session>>>,
@@ -195,11 +200,22 @@ fn new_engine(sr: f32) -> MixEngine {
     m
 }
 
+/// Whether any track of `s` carries a hosted (third-party) plug-in. Allocation-free: runs on the audio thread.
+fn session_has_hosted(s: &Session) -> bool {
+    s.tracks.iter().any(|t| {
+        t.instrument.as_ref().is_some_and(|i| soundcraft_mix::is_third_party(&i.plugin))
+            || t.mixer.inserts.iter().flatten().any(|i| soundcraft_mix::is_third_party(&i.plugin))
+    })
+}
+
 impl AudioState {
     fn new(rx: Receiver<Cmd>, shared: Arc<Shared>, session: Arc<Session>, device_rate: f64, garbage: Sender<Vec<Box<dyn Plugin>>>) -> Self {
         let sr = session.sample_rate.as_f64() as f32;
         let nch = main_channels(&session);
         AudioState {
+            hosted: session_has_hosted(&session),
+            #[cfg(test)]
+            renders: 0,
             garbage,
             old_sessions: None,
             fold: fold_gains(&session),
@@ -266,6 +282,7 @@ impl AudioState {
                         self.read = 0.0;
                     }
                     self.fold = fold_gains(&s);
+                    self.hosted = session_has_hosted(&s);
                     let old = std::mem::replace(&mut self.session, s);
                     if let Some(tx) = &self.old_sessions {
                         let _ = tx.try_send(old);
@@ -323,6 +340,10 @@ impl AudioState {
 
     /// Render the next block at the session rate into `pending`.
     fn render_next(&mut self, quantum: usize) {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
         let mut n = quantum.clamp(1, BLOCK);
         if let Some(l) = self.looped
             && self.pos >= l.end
@@ -387,7 +408,10 @@ impl AudioState {
         // A hosted plug-in with its editor open keeps the engine running too: Guitar Rig 7 and
         // Helix Native initialise their GUIs and sync them with their DSP through `process`
         // calls, and sit frozen on an idle track until the transport runs.
+        // Any hosted plug-in keeps the engine running too: it expects `process` calls, and the mixer
+        // suspends plug-ins individually by their own signals, so the global gate must not starve them.
         let monitoring = self.live_notes > 0
+            || self.hosted
             || self.live_tail > 0
             || self.shared.editors_open.load(Ordering::Relaxed)
             || self.session.tracks.iter().any(|t| {
@@ -1418,26 +1442,31 @@ mod tests {
         }
     }
 
-    /// Gate (silent armed instrument, 2026-10-17): the stopped-transport audibility table. Each row is
-    /// a (track kind, armed, input monitor) cell and whether the engine must run for it while the
-    /// transport is stopped and no audio input stream is open. An armed or monitoring instrument runs,
-    /// so it can be played from its own keyboard; an idle one does not (no CPU for nothing); an armed
-    /// audio track without an input stream has nothing to monitor; any track whose hosted plug-in has
-    /// its editor open runs (the GUI needs `process` calls). A new cell is one more row.
+    /// Gate (silent armed instrument, 2026-10-17; hosted rule, ADR 0007): the stopped-transport
+    /// engine table. Each row is (track kind, armed, input monitor, hosted editor open, hosted
+    /// plug-in present) and whether the engine must run while the transport is stopped and no audio
+    /// input stream is open. Any hosted plug-in keeps it running (it expects `process` calls); without
+    /// one, an armed or monitoring instrument runs so it can be played from its own keyboard, an idle
+    /// track does not (no CPU for nothing), an armed audio track without an input stream has nothing to
+    /// monitor, and an open editor runs the engine. A new cell is one more row.
     #[test]
     fn stopped_transport_audibility_table() {
         use soundcraft_model::{ChannelFormat, Insert, TrackKind};
-        // (kind, armed, input monitor, a hosted editor open, must run)
+        // (kind, armed, input monitor, editor open, hosted plug-in present, engine must run)
         let cells = [
-            (TrackKind::Instrument, true, false, false, true),
-            (TrackKind::Instrument, false, true, false, true),
-            (TrackKind::Instrument, false, false, false, false),
-            (TrackKind::Instrument, false, false, true, true),
-            (TrackKind::Audio, true, false, false, false),
-            (TrackKind::Audio, false, true, false, false),
-            (TrackKind::Audio, false, false, true, true),
+            (TrackKind::Instrument, true, false, false, true, true),
+            (TrackKind::Instrument, false, true, false, true, true),
+            (TrackKind::Instrument, false, false, false, true, true),
+            (TrackKind::Instrument, false, false, true, true, true),
+            (TrackKind::Audio, true, false, false, true, true),
+            (TrackKind::Audio, false, true, false, true, true),
+            (TrackKind::Audio, false, false, true, true, true),
+            (TrackKind::Audio, false, false, false, false, false),
+            (TrackKind::Instrument, false, false, false, false, false),
+            (TrackKind::Instrument, true, false, false, false, true),
+            (TrackKind::Audio, true, false, false, false, false),
         ];
-        for (kind, armed, monitor, editor_open, expect_sound) in cells {
+        for (kind, armed, monitor, editor_open, hosted, expect_runs) in cells {
             let mut s = Session::default();
             let t = s.add_track(kind, ChannelFormat::Stereo, None);
             let slot = if kind == TrackKind::Instrument { soundcraft_mix::INSTRUMENT_SLOT } else { 0 };
@@ -1445,10 +1474,12 @@ mod tests {
                 let tr = s.track_mut(t).unwrap();
                 tr.mixer.record_arm = armed;
                 tr.mixer.input_monitor = monitor;
-                if slot == soundcraft_mix::INSTRUMENT_SLOT {
-                    tr.instrument = Some(Insert::new("clap:test.tone"));
-                } else {
-                    tr.mixer.inserts[0] = Some(Insert::new("clap:test.tone"));
+                if hosted {
+                    if slot == soundcraft_mix::INSTRUMENT_SLOT {
+                        tr.instrument = Some(Insert::new("clap:test.tone"));
+                    } else {
+                        tr.mixer.inserts[0] = Some(Insert::new("clap:test.tone"));
+                    }
                 }
             }
             let s = Arc::new(s);
@@ -1462,19 +1493,24 @@ mod tests {
             let (tx, rx) = channel();
             let (gtx, _grx) = channel();
             let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, gtx);
-            let plugin = Tone { inner: soundcraft_dsp::create("gain").unwrap() };
-            tx.send(Cmd::Session(
-                Arc::clone(&s),
-                vec![PreparedInstance { track: t, slot, id: "clap:test.tone".into(), ch: 2, plugin: Box::new(plugin) }],
-            ))
-            .unwrap();
+            let instances = if hosted {
+                let plugin = Tone { inner: soundcraft_dsp::create("gain").unwrap() };
+                vec![PreparedInstance { track: t, slot, id: "clap:test.tone".into(), ch: 2, plugin: Box::new(plugin) }]
+            } else {
+                Vec::new()
+            };
+            tx.send(Cmd::Session(Arc::clone(&s), instances)).unwrap();
             shared.editors_open.store(editor_open, Ordering::Relaxed);
             let mut out = vec![0.0f32; 2 * 2048];
             // Two callbacks: the first adopts the instance, the second is steady state.
             st.fill(&mut out, 2);
             st.fill(&mut out, 2);
             let peak = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-            assert_eq!(peak > 0.1, expect_sound, "kind={kind:?} armed={armed} monitor={monitor} editor_open={editor_open}: peak {peak}");
+            let cell = format!("kind={kind:?} armed={armed} monitor={monitor} editor_open={editor_open} hosted={hosted}");
+            assert_eq!(st.renders > 0, expect_runs, "engine ran: {cell}: renders {}", st.renders);
+            if hosted && expect_runs {
+                assert!(peak > 0.1, "hosted tone audible: {cell}: peak {peak}");
+            }
         }
     }
 
@@ -1617,6 +1653,18 @@ mod tests {
         drop(player);
         let here = std::thread::current().id();
         assert_eq!(*dropped_on.lock().unwrap(), Some(here), "after a fault, teardown must still run on the player's thread");
+    }
+
+    #[test]
+    fn session_has_hosted_sees_third_party_plugins_only() {
+        use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+        let mut s = Session::default();
+        assert!(!session_has_hosted(&s));
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("gain"));
+        assert!(!session_has_hosted(&s), "a built-in insert is not hosted");
+        s.track_mut(t).unwrap().mixer.inserts[1] = Some(Insert::new("clap:test.x"));
+        assert!(session_has_hosted(&s));
     }
 
     #[test]
