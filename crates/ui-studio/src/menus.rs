@@ -182,6 +182,10 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
     if ctx.egui_wants_keyboard_input() || app.dialog.is_some() {
         return;
     }
+    // Alt+C: clear every clip latch (`track.clear_clip_indicators`).
+    if pressed(ctx, Modifiers::ALT, Key::C) {
+        let _ = app.run("track.clear_clip_indicators", json!({}));
+    }
     let cmd = Modifiers::COMMAND;
     let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
     // egui turns the platform's copy/cut/paste keys into these events.

@@ -129,8 +129,11 @@ fn readout(ui: &mut Ui, text: &str, w: f32, color: Color32) {
     ui.painter().text(r.center(), Align2::CENTER_CENTER, text, crate::theme::mono(ui.ctx(), 13.0), color);
 }
 
-fn main_meter(app: &StudioApp, ui: &mut Ui) {
-    let (r, _) = ui.allocate_exact_size(vec2(120.0, 16.0), Sense::hover());
+fn main_meter(app: &mut StudioApp, ui: &mut Ui) {
+    let (r, resp) = ui.allocate_exact_size(vec2(120.0, 16.0), Sense::click());
+    if resp.on_hover_text("Click to clear the clip latch and the peak hold").clicked() {
+        (app.main_meter.peak, app.main_meter.clip) = (0.0, false);
+    }
     let p = ui.painter();
     p.rect_filled(r, 2.0, TOKENS.bg);
     for (i, lvl) in app.main_meter.level.iter().enumerate() {
@@ -139,6 +142,10 @@ fn main_meter(app: &StudioApp, ui: &mut Ui) {
         let db = if *lvl > 0.0 { 20.0 * lvl.log10() } else { -90.0 };
         let k = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
         let bar = Rect::from_min_size(pos2(r.min.x + 1.0, y), vec2((r.width() - 2.0) * k, h));
-        p.rect_filled(bar, 0.0, if app.main_meter.clip { TOKENS.record } else { TOKENS.monitor });
+        p.rect_filled(bar, 0.0, TOKENS.monitor);
+    }
+    // A clip latch is a small red cap at the right end of the bar, not a red bar.
+    if app.main_meter.clip {
+        p.rect_filled(Rect::from_min_max(pos2(r.max.x - crate::mixer::CLIP_CAP, r.min.y), r.max), 0.0, TOKENS.record);
     }
 }

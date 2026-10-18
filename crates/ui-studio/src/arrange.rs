@@ -40,6 +40,8 @@ pub struct TrackRow {
     pub id: u64,
     pub name: String,
     pub kind: TrackKind,
+    /// The line under the name (an instrument track: the instrument).
+    pub subtitle: String,
     pub header: R4,
     pub lane: R4,
     pub mute: R4,
@@ -195,6 +197,7 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
         TrackKind::Audio => format!("Audio · {}", t.format.label()),
         k => format!("{k:?}"),
     };
+    row.subtitle = kind.clone();
     p.text(pos2(r.min.x + 12.0, r.min.y + 30.0), Align2::LEFT_CENTER, kind, FontId::proportional(10.5), TOKENS.text_dim);
     // Toggles, right-aligned on the first line.
     let m = &t.mixer;

@@ -818,7 +818,30 @@ fn main_out(app: &mut StudioApp, ui: &mut Ui, r: Rect) -> (StripLayout, R4) {
     }
     let meter = Rect::from_min_max(pos2(r.center().x - 8.0, r.min.y + 76.0), pos2(r.center().x + 8.0, r.max.y - 26.0));
     draw_meter(p, meter, app.main_meter.level, app.main_meter.clip);
-    let sl = StripLayout { name: "Main".into(), rect: r4(r), meter: r4(meter), level: app.main_meter.level, ..StripLayout::default() };
+    let peak_r = Rect::from_min_max(pos2(r.min.x + 6.0, r.min.y + 63.0), pos2(r.max.x - 6.0, r.min.y + 75.0));
+    let (text, over) = peak_text(app.main_meter.peak);
+    let resp = ui.interact(peak_r, ui.id().with("main_peak"), Sense::click());
+    p.rect_filled(peak_r, 2.0, TOKENS.bg);
+    let color = if over || app.main_meter.clip { TOKENS.record } else { TOKENS.text_dim };
+    p.text(peak_r.center(), Align2::CENTER_CENTER, &text, FontId::proportional(10.0), color);
+    let on_meter = ui.interact(meter, ui.id().with("main_meter_click"), Sense::click());
+    if resp.clicked() || on_meter.clicked() {
+        let all = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+        if all {
+            app.reset_meters(None);
+        } else {
+            (app.main_meter.peak, app.main_meter.clip) = (0.0, false);
+        }
+    }
+    let sl = StripLayout {
+        peak_rect: r4(peak_r),
+        peak_text: text,
+        name: "Main".into(),
+        rect: r4(r),
+        meter: r4(meter),
+        level: app.main_meter.level,
+        ..StripLayout::default()
+    };
     (sl, r4(add))
 }
 
@@ -829,14 +852,40 @@ fn draw_meter(p: &egui::Painter, r: Rect, level: [f32; 2], clip: bool) {
         let x = r.min.x + 1.0 + c as f32 * (w + 1.0);
         let h = (r.height() - 2.0) * meter_k(*lvl);
         let bar = Rect::from_min_max(pos2(x, r.max.y - 1.0 - h), pos2(x + w, r.max.y - 1.0));
-        let col = if clip {
-            TOKENS.record
-        } else if *lvl > 0.9 {
-            TOKENS.solo
-        } else {
-            TOKENS.monitor
-        };
-        p.rect_filled(bar, 0.0, col);
+        p.rect_filled(bar, 0.0, if *lvl > 0.9 { TOKENS.solo } else { TOKENS.monitor });
+    }
+    // A clip latch is a small red cap at the top of the bar, not a red bar.
+    if clip {
+        p.rect_filled(Rect::from_min_size(r.min, vec2(r.width(), CLIP_CAP)), 0.0, TOKENS.record);
+    }
+}
+
+/// Height of the clip latch's cap at the top of a meter.
+pub const CLIP_CAP: f32 = 3.0;
+
+impl StudioApp {
+    /// Clear the clip latch and the peak hold of one strip, or of every strip and the main meter.
+    pub fn reset_meters(&mut self, only: Option<TrackId>) {
+        match only {
+            Some(id) => {
+                if let Some(d) = self.meters.get_mut(&id) {
+                    (d.peak, d.clip) = (0.0, false);
+                }
+            }
+            None => {
+                for d in self.meters.values_mut().chain(std::iter::once(&mut self.main_meter)) {
+                    (d.peak, d.clip) = (0.0, false);
+                }
+            }
+        }
+    }
+
+    /// `track.clear_clip_indicators` (Alt+C), and playback starting: every clip latch off. The
+    /// peak holds stay until clicked.
+    pub fn clear_clip_latches(&mut self) {
+        for d in self.meters.values_mut().chain(std::iter::once(&mut self.main_meter)) {
+            d.clip = false;
+        }
     }
 }
 
@@ -1411,6 +1460,7 @@ fn strip(
     let peak_r = Rect::from_min_max(pos2(r.center().x + 2.0, y + 1.0), pos2(r.max.x - 6.0, y + 14.0));
     let held = app.meters.get(&id).map_or(0.0, |d| d.peak);
     let (peak_text, over) = peak_text(held);
+    let over = over || app.meters.get(&id).is_some_and(|d| d.clip);
     let resp = ui.interact(peak_r.intersect(clip), ui.id().with(("peak", id.0)), Sense::click());
     p.rect_filled(peak_r, 2.0, TOKENS.bg);
     p.with_clip_rect(peak_r).text(
@@ -1427,13 +1477,8 @@ fn strip(
         },
     );
     if resp.on_hover_text("Peak hold. Click to reset, Ctrl-click to reset all").clicked() {
-        if ui.input(|i| i.modifiers.command || i.modifiers.ctrl) {
-            for d in app.meters.values_mut().chain(std::iter::once(&mut app.main_meter)) {
-                (d.peak, d.clip) = (0.0, false);
-            }
-        } else if let Some(d) = app.meters.get_mut(&id) {
-            (d.peak, d.clip) = (0.0, false);
-        }
+        let all = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+        app.reset_meters(if all { None } else { Some(id) });
     }
     sl.peak_rect = r4(peak_r);
     sl.peak_text = peak_text;
@@ -1446,6 +1491,11 @@ fn strip(
     sl.meter = r4(meter);
     let d = app.meters.get(&id).copied().unwrap_or_default();
     draw_meter(&p, meter, d.level, d.clip);
+    let resp = ui.interact(meter.intersect(clip), ui.id().with(("meter", id.0)), Sense::click());
+    if resp.on_hover_text("Click to clear the clip latch and the peak hold, Ctrl-click for every strip").clicked() {
+        let all = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+        app.reset_meters(if all { None } else { Some(id) });
+    }
     fader_widget(app, ui, &p, clip, id, m.volume_db, fader);
     let db = m.volume_db;
     let text = fine::db_text(db);

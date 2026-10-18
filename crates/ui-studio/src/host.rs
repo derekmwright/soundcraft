@@ -25,6 +25,7 @@ use soundcraft_time::{Range, Samples};
 
 impl StudioApp {
     pub(crate) fn start_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
+        self.clear_clip_latches();
         if let Some(p) = &self.player {
             p.update_session(self.engine.session_arc());
             p.play(from, end, looped);

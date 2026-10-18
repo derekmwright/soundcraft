@@ -270,6 +270,10 @@ impl StudioApp {
         if id == "ui.set" {
             return self.set_ui(&params);
         }
+        if id == "track.clear_clip_indicators" {
+            self.clear_clip_latches();
+            return Ok(json!({"cleared": true}));
+        }
         if id.starts_with("session.save") || id.starts_with("file.bounce") {
             // Third-party plugins keep state the session can't see: store it first.
             self.capture_plugin_states();
