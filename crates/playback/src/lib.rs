@@ -249,6 +249,9 @@ struct AudioState {
     /// Retired plugin instances go back to the UI thread to be dropped there.
     garbage: Sender<Vec<Box<dyn Plugin>>>,
     old_sessions: Option<SyncSender<Arc<Session>>>,
+    /// A stop, the end of playback or All Notes Off queued releases on the instruments; the next
+    /// `fill` gives them one processing pass (even when nothing else would run) so they are delivered.
+    release_flush_pending: bool,
 }
 
 fn new_engine(sr: f32) -> MixEngine {
@@ -276,6 +279,7 @@ impl AudioState {
             renders: 0,
             garbage,
             old_sessions: None,
+            release_flush_pending: false,
             fold: fold_gains(&session),
             rx,
             shared,
@@ -352,6 +356,7 @@ impl AudioState {
                     self.end = None;
                     self.looped = None;
                     self.mix.reset();
+                    self.release_flush_pending = true;
                 }
                 Cmd::Note { track, pitch, velocity } => {
                     self.mix.live_note(track, pitch, velocity);
@@ -369,7 +374,10 @@ impl AudioState {
                     self.read = 0.0;
                     self.mix.reset();
                 }
-                Cmd::AllNotesOff => self.mix.all_notes_off(),
+                Cmd::AllNotesOff => {
+                    self.mix.all_notes_off();
+                    self.release_flush_pending = true;
+                }
             }
         }
         if changed {
@@ -406,6 +414,7 @@ impl AudioState {
             if self.pos >= e {
                 // Reaching the end is a stop: release held notes (a note ending on the end sample is never otherwise released).
                 self.mix.reset();
+                self.release_flush_pending = true;
                 self.playing = false;
                 self.end = None;
                 self.shared.playing.store(false, Ordering::Relaxed);
@@ -452,9 +461,18 @@ impl AudioState {
         }
     }
 
+    /// Give the instruments their one processing pass if releases are queued (see
+    /// `release_flush_pending`), then clear the flag.
+    fn flush_releases_if_pending(&mut self) {
+        if std::mem::take(&mut self.release_flush_pending) {
+            self.mix.flush_releases(BLOCK);
+        }
+    }
+
     /// Fill an interleaved device buffer.
     fn fill(&mut self, out: &mut [f32], channels: usize) {
         self.drain();
+        self.flush_releases_if_pending();
         let channels = channels.max(1);
         // An armed or input-monitoring track keeps the engine running while stopped. An audio
         // track needs the input stream for that; an instrument track runs without one, so it
@@ -532,6 +550,8 @@ impl AudioState {
             }
             self.read += step;
         }
+        // The end of playback is detected while rendering; deliver its releases in this callback.
+        self.flush_releases_if_pending();
     }
 }
 
@@ -1344,6 +1364,7 @@ mod tests {
             self.inner.param(id)
         }
         fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            self.log.lock().unwrap().push("process");
             self.inner.process(io, frames);
         }
         fn note_on(&mut self, _offset: usize, _note: u8, _velocity: u8) {
@@ -1390,7 +1411,9 @@ mod tests {
         let log = log.lock().unwrap();
         let on = log.iter().position(|e| *e == "note_on");
         assert!(on.is_some(), "the note started: {log:?}");
-        assert!(log.iter().skip(on.unwrap_or(0)).any(|e| *e == "all_notes_off"), "held notes were released at the end: {log:?}");
+        let off = log.iter().rposition(|e| *e == "all_notes_off");
+        assert!(off.is_some_and(|o| o > on.unwrap_or(0)), "held notes were released at the end: {log:?}");
+        assert!(log.iter().skip(off.unwrap_or(0)).any(|e| *e == "process"), "a process pass followed the release: {log:?}");
         assert!(!shared.playing.load(Ordering::Relaxed));
     }
 
@@ -2044,6 +2067,7 @@ mod tests {
             self.inner.param(id)
         }
         fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            self.calls.lock().unwrap().push("process");
             self.inner.process(io, frames);
         }
         fn all_notes_off(&mut self) {
@@ -2075,8 +2099,12 @@ mod tests {
         calls.lock().unwrap().clear();
         tx.send(Cmd::AllNotesOff).unwrap();
         st.fill(&mut out, 2);
-        let seen = calls.lock().unwrap().clone();
-        assert_eq!(seen, vec!["all_notes_off"], "the instrument was told to release its notes, and not reset");
+        {
+            let calls = calls.lock().unwrap().clone();
+            assert_eq!(calls.first().copied(), Some("all_notes_off"), "told to release first: {calls:?}");
+            assert!(calls.contains(&"process"), "then processed so the release is delivered while stopped and unmonitored: {calls:?}");
+            assert!(!calls.contains(&"reset"), "and not reset: {calls:?}");
+        }
     }
 
     #[test]
