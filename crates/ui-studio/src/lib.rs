@@ -544,6 +544,7 @@ impl StudioApp {
             "focus_track": self.focus_track(),
             "mixer": self.mixer.layout,
             "devices": self.mixer.devices,
+            "plugin_scan": plugin_scan::inspect(),
         })
     }
 }

@@ -23,6 +23,8 @@ pub fn start(dirs: &PluginDirs, settings_dir: Option<&Path>, scanner: Option<Pat
     if let Some(dir) = settings_dir {
         soundcraft_vst3_host::set_cache_file(Some(dir.join("plugins-vst3.json")));
         soundcraft_clap_host::set_cache_file(Some(dir.join("plugins-clap.json")));
+        STARTED.store(true, std::sync::atomic::Ordering::Release);
+        STARTED.store(true, std::sync::atomic::Ordering::Release);
         soundcraft_vst3_host::scan_in_background();
         soundcraft_clap_host::scan_in_background();
     }
@@ -40,4 +42,42 @@ pub fn scan_child(args: &[String]) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Set once a scan has been started (at launch with a settings folder, or by [`rescan`]).
+static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Scans again on background threads, reusing what the cache remembers about unchanged files.
+/// A scan already running keeps running. Works without a settings folder (nothing is remembered).
+pub fn rescan() {
+    STARTED.store(true, std::sync::atomic::Ordering::Release);
+    soundcraft_vst3_host::rescan_in_background(false);
+    soundcraft_clap_host::rescan_in_background(false);
+}
+
+/// Where the scan is: `"idle"` (none started), `"running"`, `"done"`, or `"failed: <why>"`
+/// (a scan thread ended without a result).
+pub fn state() -> String {
+    use std::sync::atomic::Ordering;
+    if soundcraft_vst3_host::scanning() || soundcraft_clap_host::scanning() {
+        "running".to_string()
+    } else if !STARTED.load(Ordering::Acquire) {
+        "idle".to_string()
+    } else if soundcraft_vst3_host::cached().is_none() {
+        "failed: the VST3 scan ended without a result".to_string()
+    } else if soundcraft_clap_host::cached().is_none() {
+        "failed: the CLAP scan ended without a result".to_string()
+    } else {
+        "done".to_string()
+    }
+}
+
+/// `plugin_scan` for `ui.inspect`: the [`state`] and the counts found so far.
+pub fn inspect() -> serde_json::Value {
+    let count = |n: Option<usize>| n.map_or(serde_json::Value::Null, Into::into);
+    serde_json::json!({
+        "state": state(),
+        "vst3": count(soundcraft_vst3_host::cached().map(|l| l.len())),
+        "clap": count(soundcraft_clap_host::cached().map(|l| l.len())),
+    })
 }

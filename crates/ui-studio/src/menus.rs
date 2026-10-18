@@ -142,6 +142,10 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         app.reconnect_audio();
                         ui.close();
                     }
+                    if ui.button("Scan Plug-ins").clicked() {
+                        crate::plugin_scan::rescan();
+                        ui.close();
+                    }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let s = app.engine.session();

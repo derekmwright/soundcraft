@@ -154,7 +154,12 @@ pub fn chain(app: &mut StudioApp, ui: &mut Ui) {
                 ui.separator();
                 ui.menu_button(format, |ui| match list {
                     None => {
-                        ui.weak("Not scanned yet (the scan runs at launch)");
+                        if crate::plugin_scan::state() == "running" {
+                            ui.weak("Scanning…");
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                        } else {
+                            ui.weak("Not scanned yet (Audio › Scan Plug-ins)");
+                        }
                     }
                     Some(l) if l.is_empty() => {
                         ui.weak(format!("No {format} effects found"));

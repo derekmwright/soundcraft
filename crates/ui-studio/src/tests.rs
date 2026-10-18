@@ -131,6 +131,14 @@ fn ui_set_lists_editors_without_a_player() {
     assert!(app.run("ui.set", json!({"plugin_dirs": {"vst3": ["x"]}})).is_err());
 }
 
+#[test]
+fn inspect_reports_the_plugin_scan_without_starting_one() {
+    // Tests never scan: nothing starts one, so the state is "idle" with no counts.
+    let scan = crate::plugin_scan::inspect();
+    assert_eq!(scan["state"], json!("idle"));
+    assert!(scan["vst3"].is_null() && scan["clap"].is_null());
+}
+
 /// Run frames of the real UI, feeding `app.synthetic` like the control channel does.
 fn frames(app: &mut StudioApp, ctx: &egui::Context, n: usize, t0: &mut f64) {
     for _ in 0..n {
