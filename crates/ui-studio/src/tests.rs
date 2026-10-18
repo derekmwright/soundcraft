@@ -1343,3 +1343,38 @@ fn clicking_anywhere_on_a_strip_focuses_it_and_the_highlight_follows() {
         assert!(strip(&app, t).focused && !strip(&app, other).focused, "highlight follows focus");
     }
 }
+
+#[test]
+fn the_peak_readout_holds_the_loudest_peak_until_clicked() {
+    let (mut app, ctx, mut time, a) = mixer_app();
+    let r = app.run("track.new", json!({"kind": "audio", "format": "stereo", "name": "Vox"})).unwrap();
+    let b = TrackId(r["tracks"][0].as_u64().unwrap());
+    frames(&mut app, &ctx, 3, &mut time);
+    assert_eq!(strip(&app, a).peak_text, "-inf");
+    // A known peak (0.7 is -3.1 dBFS), then silence: the readout holds it.
+    for (t, peak) in [(a, 0.7f32), (b, 1.2f32)] {
+        let d = app.meters.entry(t).or_default();
+        crate::host::feed_meter(d, [peak, 0.1], 0.0, 0.016);
+        crate::host::feed_meter(d, [0.0, 0.0], 0.0, 0.016);
+    }
+    frames(&mut app, &ctx, 3, &mut time);
+    assert_eq!(strip(&app, a).peak_text, "-3.1");
+    assert_eq!(strip(&app, b).peak_text, "+1.6", "over 0 dBFS reads with a plus sign");
+    let d = app.meters.get_mut(&a).unwrap();
+    crate::host::feed_meter(d, [0.5, 0.0], 0.0, 0.016);
+    frames(&mut app, &ctx, 3, &mut time);
+    assert_eq!(strip(&app, a).peak_text, "-3.1", "a quieter peak does not lower the hold");
+    // Click resets that strip only.
+    let at = mid(strip(&app, a).peak_rect);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 4, &mut time);
+    assert_eq!(strip(&app, a).peak_text, "-inf");
+    assert_eq!(strip(&app, b).peak_text, "+1.6");
+    // Ctrl-click resets all.
+    let at = mid(strip(&app, b).peak_rect);
+    click_with(&mut app, at, json!({"ctrl": true}));
+    frames(&mut app, &ctx, 4, &mut time);
+    assert_eq!(strip(&app, b).peak_text, "-inf");
+    assert_eq!(crate::mixer::peak_text(1.0), ("0.0".to_string(), true));
+    assert_eq!(crate::mixer::peak_text(0.5), ("-6.0".to_string(), false));
+}

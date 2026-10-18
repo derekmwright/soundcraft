@@ -575,6 +575,7 @@ pub fn feed_meter(d: &mut MeterDisplay, peak: [f32; 2], gr: f32, dt: f32) {
         if v >= 1.0 {
             d.clip = true;
         }
+        d.peak = d.peak.max(v);
     }
     d.hold_age += dt;
     if d.hold_age > 2.0 {

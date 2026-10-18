@@ -111,6 +111,9 @@ pub struct StripLayout {
     /// The dB readout under the fader (double-click types a level) and its text.
     pub readout_rect: R4,
     pub volume_text: String,
+    /// The held peak above the meter ("-3.2", "+1.4"; click resets, Ctrl-click resets all).
+    pub peak_rect: R4,
+    pub peak_text: String,
     /// The pan readout under the knob and its text ("C", "L20", "R35").
     pub pan_readout_rect: R4,
     pub pan_text: String,
@@ -904,7 +907,7 @@ fn choice_menu(resp: &egui::Response, current: &str, choices: &[(String, String)
 pub const SEND_ROW_H: f32 = 17.0;
 /// The send level bar along a row's bottom edge.
 const BAR_H: f32 = 5.0;
-const STRIP_FIXED_H: f32 = 195.0;
+const STRIP_FIXED_H: f32 = 207.0;
 /// Height of an insert row, and the most rows a strip has for them: three inserts and "+", or
 /// two and "n more…" in a short pane.
 const INSERT_ROW_H: f32 = 15.0;
@@ -1404,6 +1407,37 @@ fn strip(
         }
     }
     y += 42.0;
+    // The held peak above the meter.
+    let peak_r = Rect::from_min_max(pos2(r.center().x + 2.0, y + 1.0), pos2(r.max.x - 6.0, y + 14.0));
+    let held = app.meters.get(&id).map_or(0.0, |d| d.peak);
+    let (peak_text, over) = peak_text(held);
+    let resp = ui.interact(peak_r.intersect(clip), ui.id().with(("peak", id.0)), Sense::click());
+    p.rect_filled(peak_r, 2.0, TOKENS.bg);
+    p.with_clip_rect(peak_r).text(
+        peak_r.center(),
+        Align2::CENTER_CENTER,
+        &peak_text,
+        FontId::proportional(10.0),
+        if over {
+            TOKENS.record
+        } else if resp.hovered() {
+            TOKENS.accent
+        } else {
+            TOKENS.text_dim
+        },
+    );
+    if resp.on_hover_text("Peak hold. Click to reset, Ctrl-click to reset all").clicked() {
+        if ui.input(|i| i.modifiers.command || i.modifiers.ctrl) {
+            for d in app.meters.values_mut().chain(std::iter::once(&mut app.main_meter)) {
+                (d.peak, d.clip) = (0.0, false);
+            }
+        } else if let Some(d) = app.meters.get_mut(&id) {
+            (d.peak, d.clip) = (0.0, false);
+        }
+    }
+    sl.peak_rect = r4(peak_r);
+    sl.peak_text = peak_text;
+    y += 12.0;
     // Fader and meter.
     let bottom = r.max.y - 22.0;
     let fader = Rect::from_min_max(pos2(x0 + 4.0, y + 6.0), pos2(r.center().x + 4.0, bottom - 6.0));
@@ -1440,6 +1474,26 @@ fn strip(
     sl.readout_rect = r4(ro);
     sl.volume_text = text;
     sl
+}
+
+/// A held peak (linear) as the readout shows it: "-3.2", "0.0", "+1.4" (red from 0 dBFS), "-inf".
+pub fn peak_text(lin: f32) -> (String, bool) {
+    if lin <= 0.0 {
+        return ("-inf".into(), false);
+    }
+    let db = 20.0 * lin.log10();
+    let t = format!("{db:.1}");
+    let over = db >= -0.05;
+    (
+        if db > 0.05 {
+            format!("+{t}")
+        } else if t == "-0.0" {
+            "0.0".into()
+        } else {
+            t
+        },
+        over,
+    )
 }
 
 fn draw_knob(p: &egui::Painter, r: Rect, b: f32, hot: bool) {

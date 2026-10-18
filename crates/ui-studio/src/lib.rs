@@ -105,6 +105,9 @@ pub struct MeterDisplay {
     pub hold: [f32; 2],
     pub hold_age: f32,
     pub clip: bool,
+    /// The loudest sample since the last reset (linear), held until the strip's peak readout is
+    /// clicked. Fed from the same peaks as `level`.
+    pub peak: f32,
     pub gr: f32,
     pub plugin_failures: u32,
 }
