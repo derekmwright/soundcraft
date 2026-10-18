@@ -81,6 +81,8 @@ enum Cmd {
         pitch: u8,
         velocity: u8,
     },
+    /// Release every held note on every instrument, without stopping the transport.
+    AllNotesOff,
 }
 
 struct Shared {
@@ -320,6 +322,7 @@ impl AudioState {
                     self.read = 0.0;
                     self.mix.reset();
                 }
+                Cmd::AllNotesOff => self.mix.all_notes_off(),
             }
         }
         if changed {
@@ -877,6 +880,11 @@ impl Player {
     pub fn stop(&self) {
         self.shared.playing.store(false, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Stop);
+    }
+
+    /// Release every held note on every instrument (a panic button); playback carries on.
+    pub fn all_notes_off(&self) {
+        let _ = self.tx.send(Cmd::AllNotesOff);
     }
 
     pub fn locate(&self, at: Samples) {
@@ -1730,6 +1738,64 @@ mod tests {
         assert!(!session_has_hosted(&s), "a built-in insert is not hosted");
         s.track_mut(t).unwrap().mixer.inserts[1] = Some(Insert::new("clap:test.x"));
         assert!(session_has_hosted(&s));
+    }
+
+    struct Spy {
+        inner: Box<dyn Plugin>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Plugin for Spy {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.inner.info()
+        }
+        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+            self.inner.prepare(sr, mb, ch);
+        }
+        fn reset(&mut self) {
+            self.calls.lock().unwrap().push("reset");
+            self.inner.reset();
+        }
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.inner.set_param(id, v)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.inner.param(id)
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            self.inner.process(io, frames);
+        }
+        fn all_notes_off(&mut self) {
+            self.calls.lock().unwrap().push("all_notes_off");
+        }
+    }
+
+    #[test]
+    fn all_notes_off_reaches_the_instrument() {
+        use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+        let mut s = soundcraft_model::Session::default();
+        let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.spy"));
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
+        });
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(soundcraft_model::Session::default()), 48_000.0, channel().0);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let spy = Spy { inner: soundcraft_dsp::create("gain").unwrap(), calls: Arc::clone(&calls) };
+        let inst = PreparedInstance { track: t, slot: soundcraft_mix::INSTRUMENT_SLOT, id: "clap:test.spy".into(), ch: 2, plugin: Box::new(spy) };
+        tx.send(Cmd::Session(Arc::new(s), vec![inst])).unwrap();
+        let mut out = vec![0.0f32; 256];
+        st.fill(&mut out, 2);
+        calls.lock().unwrap().clear();
+        tx.send(Cmd::AllNotesOff).unwrap();
+        st.fill(&mut out, 2);
+        let seen = calls.lock().unwrap().clone();
+        assert_eq!(seen, vec!["all_notes_off"], "the instrument was told to release its notes, and not reset");
     }
 
     #[test]
