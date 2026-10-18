@@ -752,9 +752,13 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
             app.ui.show_devices = which == 2;
         }
     }
-    let track_name = app.engine.session().track(cv.track).map(|t| t.name.clone()).unwrap_or_default();
+    // The clip: a separator, a swatch in the track color, then its name (not a tab).
+    let (track_name, color) = app.engine.session().track(cv.track).map(|t| (t.name.clone(), t.color)).unwrap_or_default();
     let title = if cv.name.is_empty() || cv.name == track_name { track_name } else { format!("{track_name} · {}", cv.name) };
-    ui.painter().text(pos2(x + 14.0, r.center().y), Align2::LEFT_CENTER, title, FontId::proportional(11.5), TOKENS.text_dim);
+    let p = ui.painter();
+    p.line_segment([pos2(x + 8.0, r.min.y + 7.0), pos2(x + 8.0, r.max.y - 7.0)], Stroke::new(1.0, TOKENS.line));
+    p.rect_filled(Rect::from_center_size(pos2(x + 22.0, r.center().y), vec2(8.0, 8.0)), 2.0, theme::rgb(color));
+    p.text(pos2(x + 32.0, r.center().y), Align2::LEFT_CENTER, title, FontId::proportional(11.5), TOKENS.text_dim);
 
     // Right side, right to left: Audition, Quantize, Grid.
     let mut rx = r.max.x - 8.0;
