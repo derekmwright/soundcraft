@@ -664,8 +664,22 @@ impl InputRing {
         }
     }
 
+    /// Empty the ring: the monitor starts from the next input block. Called from the UI thread
+    /// (the input held since startup on ASIO has filled the ring to its cap before anything
+    /// reads it). It waits for the lock, which the audio callbacks only ever `try_lock` and hold
+    /// for one block, so it cannot block them.
+    pub fn clear_monitor(&self) {
+        let mut s = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.data.clear();
+        s.phase = 0.0;
+    }
+
     /// Fill `out` (planar, at `session_rate`) with up to `frames` frames, converting from the
     /// input rate. Missing frames are silence.
+    ///
+    /// The backlog is bounded: when more than two blocks of input are queued (the reader stalled,
+    /// or never ran), the oldest are dropped down to one block before reading, so a stall can
+    /// never leave the monitor permanently late.
     pub fn pop_into(&self, out: &mut [Vec<f32>], frames: usize, session_rate: u32) {
         let ch = self.channels.load(Ordering::Relaxed).max(1);
         for c in out.iter_mut() {
@@ -674,6 +688,12 @@ impl InputRing {
         let Ok(mut s) = self.state.try_lock() else { return };
         // Input frames consumed per output frame.
         let step = if self.rate == 0 || session_rate == 0 { 1.0 } else { f64::from(self.rate) / f64::from(session_rate) };
+        // One block of input (plus the interpolation frame), in input frames.
+        let block = (frames as f64 * step).ceil() as usize + 1;
+        let queued = s.data.len() / ch;
+        if queued > block.saturating_mul(2) {
+            s.data.drain(..(queued - block) * ch);
+        }
         for f in 0..frames {
             // Drop input frames we have moved past; keep the one at `phase` and the next one.
             while s.phase >= 1.0 && s.data.len() >= 2 * ch {
@@ -705,11 +725,13 @@ mod ring_tests {
     fn monitor_converts_input_rate_to_session_rate() {
         let ring = InputRing::new(1, 16_000);
         let input: Vec<f32> = (0..4_000).map(|i| (2.0 * std::f64::consts::PI * 1_000.0 * f64::from(i) / 16_000.0).sin() as f32).collect();
-        ring.push(&input);
+        // Fed a block at a time, as the device does (a backlog beyond two blocks is trimmed).
+        ring.push(&input[..32]);
         let mut out = vec![vec![0.0f32; 48]];
         let mut k = 0usize;
-        for _ in 0..10 {
+        for i in 0..10 {
             ring.pop_into(&mut out, 48, 48_000);
+            ring.push(&input[32 + 16 * i..48 + 16 * i]);
             for v in &out[0] {
                 let want = (2.0 * std::f64::consts::PI * 1_000.0 * k as f64 / 48_000.0).sin() as f32;
                 assert!((v - want).abs() < 0.05, "sample {k}: got {v}, want {want}");
@@ -722,7 +744,7 @@ mod ring_tests {
     #[test]
     fn monitor_decimates_when_input_is_faster() {
         let ring = InputRing::new(1, 96_000);
-        let input: Vec<f32> = (0..1_000).map(|i| i as f32).collect();
+        let input: Vec<f32> = (0..400).map(|i| i as f32).collect();
         ring.push(&input);
         let mut out = vec![vec![0.0f32; 100]];
         ring.pop_into(&mut out, 100, 48_000);
@@ -742,6 +764,37 @@ mod ring_tests {
         assert_eq!(out[0][0], 0.0);
         assert_eq!(out[1][0], 1.0);
         assert_eq!(out[0][49], 98.0);
+    }
+
+    /// A ring filled before anything read it (the ASIO input runs from startup) is emptied at
+    /// hand-over: the monitor starts from the next block.
+    #[test]
+    fn clear_monitor_empties_the_ring() {
+        let ring = InputRing::new(1, 48_000);
+        ring.push(&vec![0.5; 48_000]);
+        ring.clear_monitor();
+        let mut out = vec![vec![1.0f32; 64]];
+        ring.pop_into(&mut out, 64, 48_000);
+        assert!(out[0].iter().all(|v| *v == 0.0), "nothing left to hear");
+        assert_eq!(ring.state.lock().unwrap().data.len(), 0);
+    }
+
+    /// A stalled reader leaves no permanent latency: more than two blocks queued is trimmed to one.
+    #[test]
+    fn pop_trims_a_backlog_to_one_block() {
+        let ring = InputRing::new(1, 48_000);
+        let input: Vec<f32> = (0..4 * 256).map(|i| i as f32).collect();
+        ring.push(&input);
+        let mut out = vec![vec![0.0f32; 256]];
+        ring.pop_into(&mut out, 256, 48_000);
+        let left = ring.state.lock().unwrap().data.len();
+        assert!(left <= 257, "at most one block (plus the interpolation frame) left, got {left}");
+        assert!(out[0][0] >= 3.0 * 256.0 - 2.0, "the oldest blocks were dropped, not played: {}", out[0][0]);
+        // Within two blocks nothing is dropped.
+        let ring = InputRing::new(1, 48_000);
+        ring.push(&input[..2 * 256]);
+        ring.pop_into(&mut out, 256, 48_000);
+        assert_eq!(out[0][0], 0.0);
     }
 
     /// Nothing buffered: silence, not stale data.
