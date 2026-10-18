@@ -48,9 +48,14 @@ impl StudioApp {
         self.mixer.builtin.clone().unwrap_or_default()
     }
 
-    /// A plug-in's display name: built-in names, hosted names from the scan caches, else the id.
-    pub fn plugin_name(&mut self, id: &str) -> String {
-        if let Some(n) = self.builtin_plugins().iter().find(|p| p.id == id).map(|p| p.name.clone()) {
+    /// A plug-in's display name: built-in names, hosted names from the scan caches, and for a
+    /// hosted plug-in the cache does not know, "Scanning…" while a scan runs or a generic label
+    /// ([`hosted_label`]). Reads the caches only; never scans or loads anything.
+    pub fn plugin_name(&mut self, id: &str, instrument: bool) -> String {
+        if self.mixer.builtin.is_none() {
+            self.builtin_plugins();
+        }
+        if let Some(n) = self.mixer.builtin.iter().flatten().find(|p| p.id == id).map(|p| p.name.clone()) {
             return n;
         }
         if let Some(n) = self.mixer.names.get(id).cloned() {
@@ -64,13 +69,30 @@ impl StudioApp {
                 .chain(soundcraft_clap_host::cached().into_iter().flatten().map(|d| (d.id, d.name)))
                 .find(|(i, _)| i == id)
                 .map(|(_, n)| n);
-            if let Some(n) = found {
+            if let Some(n) = &found {
                 self.mixer.names.insert(id.to_string(), n.clone());
-                return n;
             }
+            return hosted_label(id, instrument, found.as_deref(), crate::plugin_scan::state() == "running");
         }
         id.rsplit(':').next().unwrap_or(id).to_string()
     }
+}
+
+/// What a hosted plug-in reads as: its cached name, else "Scanning…" while a scan runs, else
+/// "VST3 instrument" / "CLAP effect" and so on (never the raw class id).
+pub fn hosted_label(id: &str, instrument: bool, cached_name: Option<&str>, scanning: bool) -> String {
+    if let Some(n) = cached_name {
+        return n.to_string();
+    }
+    if scanning {
+        return "Scanning…".to_string();
+    }
+    let format = match id.split(':').next() {
+        Some("vst3") => "VST3",
+        Some("clap") => "CLAP",
+        _ => "Audio Unit",
+    };
+    format!("{format} {}", if instrument { "instrument" } else { "effect" })
 }
 
 /// The "+" menu's hosted effects: `(id, label)`, from the background scan's results only (listing
@@ -213,7 +235,7 @@ fn card(
     let title = Rect::from_min_size(r.min, vec2(r.width(), 22.0));
     pc.rect_filled(title, egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 }, if on { TOKENS.button } else { TOKENS.bg });
     let plugin = ins.map(|i| i.plugin.clone()).unwrap_or_default();
-    let name = if plugin.is_empty() { "No instrument".to_string() } else { app.plugin_name(&plugin) };
+    let name = if plugin.is_empty() { "No instrument".to_string() } else { app.plugin_name(&plugin, slot.is_none()) };
     let mut c =
         DeviceCard { slot, plugin: plugin.clone(), name: name.clone(), bypass: ins.is_some_and(|i| i.bypass), rect: r4(r), ..DeviceCard::default() };
     let salt = slot.map_or(u64::MAX, |s| s as u64);

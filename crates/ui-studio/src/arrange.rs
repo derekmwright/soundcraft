@@ -191,7 +191,7 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     let name_rect = Rect::from_min_max(pos2(r.min.x + 12.0, r.min.y + 4.0), pos2(r.max.x - 92.0, r.min.y + 20.0));
     p.with_clip_rect(name_rect.intersect(list)).text(name_rect.left_center(), Align2::LEFT_CENTER, &t.name, FontId::proportional(13.0), TOKENS.text);
     let kind = match t.kind {
-        TrackKind::Instrument => t.instrument.as_ref().map_or("Instrument".to_string(), |i| short_plugin(&i.plugin)),
+        TrackKind::Instrument => t.instrument.as_ref().map_or("Instrument".to_string(), |i| short_plugin(&app.plugin_name(&i.plugin, true))),
         TrackKind::Audio => format!("Audio · {}", t.format.label()),
         k => format!("{k:?}"),
     };

@@ -788,3 +788,21 @@ fn a_send_target_click_retargets_and_a_right_click_has_pre_post_and_remove() {
         assert_eq!(send(&app).pre_fader, pre0);
     }
 }
+
+// ---- Mixer follow-up ----
+
+#[test]
+fn hosted_plugins_read_as_names_never_as_class_ids() {
+    use crate::devices::hosted_label;
+    let id = "vst3:75747241564153494A5550382D303030";
+    assert_eq!(hosted_label(id, true, Some("Jup-8000 V"), false), "Jup-8000 V", "the cache's name wins");
+    assert_eq!(hosted_label(id, true, None, true), "Scanning…", "while the scan runs");
+    assert_eq!(hosted_label(id, true, None, false), "VST3 instrument", "unknown after the scan");
+    assert_eq!(hosted_label("clap:com.x.y", true, None, false), "CLAP instrument");
+    assert_eq!(hosted_label("clap:com.x.y", false, None, false), "CLAP effect");
+    // Built-ins keep their names, and an unknown id that is not hosted keeps its tail.
+    let mut app = app();
+    assert_eq!(app.plugin_name(id, true), "VST3 instrument", "no scan in tests, so no cache entry");
+    let builtin = app.builtin_plugins().into_iter().find(|p| p.instrument).expect("a built-in instrument");
+    assert_eq!(app.plugin_name(&builtin.id, true), builtin.name);
+}
