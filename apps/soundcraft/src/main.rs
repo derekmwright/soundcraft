@@ -100,6 +100,8 @@ impl eframe::App for App {
         }
         // The system Quit (⌘Q) ends the process from inside the event loop, so `run_native` never
         // returns: release the player's plugin instances and shut plugin hosting down here.
+        // Finish any take (final WAV header, empty takes removed): on macOS the system Quit ends the process from inside the event loop and the recorder would otherwise never be dropped.
+        self.0.close_input();
         self.0.player = None;
         soundcraft_engine::shutdown_plugin_hosts();
     }

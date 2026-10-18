@@ -692,7 +692,12 @@ impl Player {
     pub fn open_input(&self, audio: &AudioConfig) -> Result<record::Recorder, String> {
         match &mut *self.input.lock().unwrap_or_else(PoisonError::into_inner) {
             HeldInput::No => record::Recorder::open_with(audio),
-            HeldInput::Held(r) => r.take().ok_or_else(|| "the audio input is already open".to_string()),
+            HeldInput::Held(r) => {
+                let r = r.take().ok_or_else(|| "the audio input is already open".to_string())?;
+                // It has run since startup with nothing reading the monitor: start from now.
+                r.monitor.clear_monitor();
+                Ok(r)
+            }
             HeldInput::Failed(e) => Err(e.clone()),
         }
     }
@@ -741,7 +746,7 @@ impl Player {
             Ok((device, config, format, name, system)) => {
                 let duplex = input_with_output(system, || {
                     use cpal::traits::DeviceTrait;
-                    device.default_input_config().is_ok()
+                    device.default_input_config().is_ok_and(|c| record::input_usable(&c))
                 });
                 if duplex && cfg.input.as_ref().is_some_and(|i| *i != name) {
                     log::warn!("audio input `{}`: on ASIO the input is the output's device, `{name}`", cfg.input.as_deref().unwrap_or_default());
@@ -2279,7 +2284,9 @@ mod tests {
         let mut out = vec![0.0f32; 4096];
         st.fill(&mut out, 2);
         assert!(!shared.playing.load(Ordering::Relaxed));
-        ring.push(&[0.5; 4096]);
+        // Two blocks of input for the two blocks asked (a longer backlog is trimmed to one).
+        ring.push(&[0.5; 1024]);
+        out.truncate(2048);
         st.fill(&mut out, 2);
         assert!(out.iter().any(|x| x.abs() > 0.1), "the input is heard");
         assert!(shared.meters.lock().unwrap().tracks.get(&t).is_some_and(|m| m.peak[0] > 0.1), "and metered");
