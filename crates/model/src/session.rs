@@ -502,6 +502,36 @@ impl Session {
         id
     }
 
+    /// Tracks that use a bus: `(listeners, feeders, senders)` = input is the bus, output is the
+    /// bus, and has a send to the bus. Each list is in track order without duplicates.
+    pub fn bus_usage(&self, id: BusId) -> (Vec<TrackId>, Vec<TrackId>, Vec<TrackId>) {
+        let r = crate::Route::Bus(id);
+        let pick = |f: &dyn Fn(&Track) -> bool| self.tracks.iter().filter(|t| f(t)).map(|t| t.id).collect::<Vec<_>>();
+        (pick(&|t| t.mixer.input == r), pick(&|t| t.mixer.output == r), pick(&|t| t.mixer.sends.iter().flatten().any(|x| x.target == r)))
+    }
+
+    /// Remove a bus and clear every route that used it: outputs go to Main, inputs to None, and
+    /// sends are emptied. Returns false when the bus does not exist.
+    pub fn remove_bus(&mut self, id: BusId) -> bool {
+        let Some(pos) = self.busses.iter().position(|b| b.id == id) else { return false };
+        self.busses.remove(pos);
+        let r = crate::Route::Bus(id);
+        for t in &mut self.tracks {
+            if t.mixer.input == r {
+                t.mixer.input = crate::Route::None;
+            }
+            if t.mixer.output == r {
+                t.mixer.output = crate::Route::Main;
+            }
+            for slot in &mut t.mixer.sends {
+                if slot.as_ref().is_some_and(|x| x.target == r) {
+                    *slot = None;
+                }
+            }
+        }
+        true
+    }
+
     /// Add a memory location; returns its id.
     pub fn add_marker(&mut self, name: &str, kind: MarkerKind, start: Samples, end: Samples) -> MarkerId {
         let id = MarkerId(self.alloc());

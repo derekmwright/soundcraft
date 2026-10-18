@@ -131,6 +131,15 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(json!({"bus": id}))
         }),
         cmd!(
+            "mix.remove_bus",
+            "Remove Bus",
+            [],
+            None,
+            "{bus: id|name, force?: false} (errors naming the tracks that still use the bus; force clears outputs to Main, inputs to None and removes sends first)",
+            always,
+            remove_bus
+        ),
+        cmd!(
             "automation.set_point",
             "Add Automation Breakpoint",
             [],
@@ -179,6 +188,32 @@ pub fn specs() -> Vec<CommandSpec> {
             copy_to_send
         ),
     ]
+}
+
+fn remove_bus(e: &mut Engine, p: &Value) -> Result<Value> {
+    const ID: &str = "mix.remove_bus";
+    let s = e.session();
+    let bus = match p.get("bus") {
+        Some(v) if v.is_u64() => s.bus(soundcraft_model::BusId(v.as_u64().unwrap_or(0))),
+        Some(v) if v.is_string() => s.bus_by_name(v.as_str().unwrap_or("")),
+        _ => return Err(bad(ID, "`bus` required (id or name)")),
+    };
+    let bus = bus.ok_or_else(|| bad(ID, "no such bus"))?;
+    let (id, name) = (bus.id, bus.name.clone());
+    let (listeners, feeders, senders) = s.bus_usage(id);
+    let names = |v: &[TrackId]| v.iter().filter_map(|t| s.track(*t).map(|t| t.name.clone())).collect::<Vec<_>>();
+    let (l, f, n) = (names(&listeners), names(&feeders), names(&senders));
+    if !bool_or(p, "force", false) && !(l.is_empty() && f.is_empty() && n.is_empty()) {
+        let mut parts = Vec::new();
+        for (what, v) in [("listened to by", &l), ("fed by", &f), ("sent to by", &n)] {
+            if !v.is_empty() {
+                parts.push(format!("{what} {}", v.join(", ")));
+            }
+        }
+        return Err(bad(ID, format!("bus `{name}` is in use: {} (pass force to clear the routes)", parts.join("; "))));
+    }
+    e.session_mut().remove_bus(id);
+    Ok(json!({"removed": id, "name": name, "cleared": {"listeners": l, "feeders": f, "senders": n}}))
 }
 
 /// Apply a change to `t` and its active mix-group siblings.
@@ -883,5 +918,112 @@ mod tests {
         let delay = e.session().busses.iter().find(|b| b.name == "Delay").unwrap().id;
         assert_eq!(sl.target, soundcraft_model::Route::Bus(delay));
         assert_eq!((sl.level_db, sl.pan, sl.mute, sl.pre_fader), (-9.0, 0.5, true, true));
+    }
+
+    fn bus_session() -> Engine {
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({"count": 1, "name": "Gtr", "format": "mono"})).unwrap();
+        e.execute("track.new", &json!({"kind": "aux", "name": "FX 1"})).unwrap();
+        e.execute("mix.send", &json!({"track": "Gtr", "slot": 0, "bus": "FX 1"})).unwrap();
+        e.execute("track.input", &json!({"tracks": ["FX 1"], "input": "FX 1"})).unwrap();
+        e
+    }
+
+    fn bus_id(e: &Engine, name: &str) -> soundcraft_model::BusId {
+        e.session().bus_by_name(name).unwrap().id
+    }
+
+    #[test]
+    fn remove_bus_removes_an_unused_bus() {
+        let mut e = Engine::default();
+        e.execute("mix.new_bus", &json!({"name": "Spare"})).unwrap();
+        assert_eq!(e.session().busses.len(), 1);
+        e.execute("mix.remove_bus", &json!({"bus": "spare"})).unwrap();
+        assert!(e.session().busses.is_empty());
+        assert!(e.execute("mix.remove_bus", &json!({"bus": "Spare"})).is_err());
+        assert!(e.execute("mix.remove_bus", &json!({})).is_err());
+    }
+
+    #[test]
+    fn remove_bus_refuses_a_used_bus_and_names_the_tracks() {
+        let mut e = bus_session();
+        let err = e.execute("mix.remove_bus", &json!({"bus": "FX 1"})).unwrap_err().to_string();
+        assert!(err.contains("Gtr") && err.contains("FX 1"), "{err}");
+        assert!(e.session().bus_by_name("FX 1").is_some());
+    }
+
+    #[test]
+    fn remove_bus_force_clears_routes_and_undo_restores_them() {
+        let mut e = bus_session();
+        let id = bus_id(&e, "FX 1");
+        e.execute("track.output", &json!({"tracks": ["Gtr"], "output": "FX 1"})).unwrap();
+        let undo_before = e.undo.len();
+        e.execute("mix.remove_bus", &json!({"bus": id.0, "force": true})).unwrap();
+        assert_eq!(e.undo.len(), undo_before + 1, "one undo entry");
+        assert!(e.session().busses.is_empty());
+        let gtr = e.session().track_by_name("Gtr").unwrap();
+        assert!(gtr.mixer.sends[0].is_none());
+        assert_eq!(gtr.mixer.output, soundcraft_model::Route::Main);
+        assert_eq!(e.session().track_by_name("FX 1").unwrap().mixer.input, soundcraft_model::Route::None);
+
+        assert!(e.undo());
+        let r = soundcraft_model::Route::Bus(id);
+        let gtr = e.session().track_by_name("Gtr").unwrap();
+        assert_eq!(gtr.mixer.sends[0].as_ref().unwrap().target, r);
+        assert_eq!(gtr.mixer.output, r);
+        assert_eq!(e.session().track_by_name("FX 1").unwrap().mixer.input, r);
+        assert!(e.session().bus(id).is_some());
+    }
+
+    #[test]
+    fn inspect_lists_bus_users() {
+        let mut e = bus_session();
+        e.execute("track.output", &json!({"tracks": ["Gtr"], "output": "FX 1"})).unwrap();
+        let v = e.execute("session.inspect", &json!({})).unwrap();
+        let b = &v["busses"][0];
+        let gtr = e.session().track_by_name("Gtr").unwrap().id;
+        let fx = e.session().track_by_name("FX 1").unwrap().id;
+        assert_eq!(b["listeners"], json!([fx]));
+        assert_eq!(b["feeders"], json!([gtr]));
+        assert_eq!(b["senders"], json!([gtr]));
+    }
+
+    #[test]
+    fn delete_fx_channel_composite_is_one_undo_step() {
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({"kind": "aux", "name": "FX 1"})).unwrap();
+        e.execute("mix.new_bus", &json!({"name": "FX 1"})).unwrap();
+        e.execute("track.input", &json!({"tracks": ["FX 1"], "input": "FX 1"})).unwrap();
+        let id = bus_id(&e, "FX 1");
+        let fx = e.session().track_by_name("FX 1").unwrap().id;
+        e.execute("track.delete", &json!({"tracks": [fx.0]})).unwrap();
+        e.execute("mix.remove_bus", &json!({"bus": id.0, "force": false})).unwrap();
+        assert!(e.session().busses.is_empty());
+
+        // Same variant through execute_merged, as the UI will issue it: one undo step.
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({"kind": "aux", "name": "FX 1"})).unwrap();
+        e.execute("mix.new_bus", &json!({"name": "FX 1"})).unwrap();
+        e.execute("track.input", &json!({"tracks": ["FX 1"], "input": "FX 1"})).unwrap();
+        let id = bus_id(&e, "FX 1");
+        let fx = e.session().track_by_name("FX 1").unwrap().id;
+        e.end_merge();
+        e.execute_merged("track.delete", &json!({"tracks": [fx.0]}), "delete-fx").unwrap();
+        e.execute_merged("mix.remove_bus", &json!({"bus": id.0}), "delete-fx").unwrap();
+        e.end_merge();
+        assert!(e.session().track(fx).is_none() && e.session().busses.is_empty());
+        assert!(e.undo());
+        assert!(e.session().bus(id).is_some());
+        assert_eq!(e.session().track(fx).unwrap().mixer.input, soundcraft_model::Route::Bus(id));
+    }
+
+    #[test]
+    fn saved_session_round_trips_without_the_removed_bus() {
+        let mut e = bus_session();
+        e.execute("mix.remove_bus", &json!({"bus": "FX 1", "force": true})).unwrap();
+        let back = Session::from_json(&e.session().to_json().unwrap()).unwrap();
+        assert!(back.busses.is_empty());
+        assert!(back.tracks.iter().all(|t| t.mixer.sends.iter().flatten().all(|x| matches!(x.target, soundcraft_model::Route::None))));
+        assert_eq!(back.track_by_name("FX 1").unwrap().mixer.input, soundcraft_model::Route::None);
     }
 }

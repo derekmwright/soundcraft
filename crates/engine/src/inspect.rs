@@ -77,7 +77,10 @@ pub fn session(e: &Engine, full: bool) -> Value {
         "frame_rate": s.frame_rate.label(), "tempo": s.tempo.tempos(), "meter": s.tempo.meters(), "main_format": s.main_format().label(),
         "length_samples": s.content_end(),
         "tracks": s.tracks.iter().map(|t| track_json(e, t, full)).collect::<Vec<_>>(),
-        "busses": s.busses.iter().map(|b| json!({"id": b.id, "name": b.name, "format": b.format.label()})).collect::<Vec<_>>(),
+        "busses": s.busses.iter().map(|b| {
+            let (listeners, feeders, senders) = s.bus_usage(b.id);
+            json!({"id": b.id, "name": b.name, "format": b.format.label(), "listeners": listeners, "feeders": feeders, "senders": senders})
+        }).collect::<Vec<_>>(),
         "markers": s.markers.iter().map(|m| json!({"id": m.id, "number": m.number, "name": m.name, "kind": m.kind, "start": m.start, "end": m.end})).collect::<Vec<_>>(),
         "groups": s.groups.iter().map(|g| json!({"id": g.id, "name": g.name, "letter": g.letter, "members": g.members, "active": g.active})).collect::<Vec<_>>(),
         "sources": s.sources.iter().map(|x| json!({
