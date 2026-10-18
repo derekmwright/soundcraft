@@ -797,7 +797,7 @@ impl SoundApp {
             p.close_editors();
         }
         // The input reopens on the next record or monitor with the new choice.
-        self.recorder = None;
+        self.close_input();
         self.recorder_failed = false;
         // Close the old device before opening the new one: an ASIO driver is process-wide, and
         // dropping the old stream after the new one opened unloaded the driver from under it.
@@ -808,12 +808,29 @@ impl SoundApp {
         Ok(())
     }
 
+    /// Close the input device, if open, with the output stream paused: creating or destroying an
+    /// input stream while the output's callbacks run deadlocks cpal's ASIO host
+    /// (`Player::with_output_paused`).
+    fn close_input(&mut self) {
+        let Some(r) = self.recorder.take() else { return };
+        match &self.player {
+            Some(p) => p.with_output_paused(|| drop(r)),
+            None => drop(r),
+        }
+    }
+
     /// Open the input device once (for recording and input monitoring) and feed the player.
     fn ensure_input(&mut self) {
         if self.recorder.is_some() || self.recorder_failed || self.player.is_none() {
             return;
         }
-        match soundcraft_playback::record::Recorder::open_with(&self.ui.audio) {
+        // With the output paused: see `close_input`.
+        let audio = &self.ui.audio;
+        let opened = match &self.player {
+            Some(p) => p.with_output_paused(|| soundcraft_playback::record::Recorder::open_with(audio)),
+            None => soundcraft_playback::record::Recorder::open_with(audio),
+        };
+        match opened {
             Ok(r) => {
                 if let Some(p) = &self.player {
                     p.set_input(std::sync::Arc::clone(&r.monitor));
@@ -873,7 +890,7 @@ impl SoundApp {
         }
         let (what, then) = match trouble {
             Trouble::Device(what) => {
-                self.recorder = None;
+                self.close_input();
                 self.recorder_failed = true;
                 (what, "Reconnect it, then use Reconnect audio device in Setup ▸ Playback Engine.")
             }
@@ -895,7 +912,7 @@ impl SoundApp {
             // Its plugin editors go with it; closed here, on the main thread (see `apply_audio_config`).
             p.close_editors();
         }
-        self.recorder = None;
+        self.close_input();
         self.recorder_failed = false;
         // The old device closes first (see `apply_audio_config`: an ASIO driver is process-wide).
         self.player = None;
@@ -1014,7 +1031,7 @@ impl SoundApp {
                     }
                     self.sim = None;
                     // The old capture belongs to the replaced document, never to the new one.
-                    self.recorder = None;
+                    self.close_input();
                     self.recorder_failed = false;
                     self.punch = None;
                     self.gesture = None;
