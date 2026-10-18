@@ -191,11 +191,13 @@ fn channel_of_bus(s: &Session, bus: soundcraft_model::BusId) -> Option<&Track> {
     s.tracks.iter().find(|t| t.kind == TrackKind::Aux && t.mixer.input == Route::Bus(bus))
 }
 
-/// How a route reads in a dropdown: busses by the channel they feed (L5).
+/// How a route reads in a dropdown: busses by the channel they feed (L5). An audio track whose
+/// input is `None` or `Main` records and monitors from input 1 (`engine::io::plan_takes`, the mix
+/// engine's monitoring), so it reads as that input, not "No input".
 pub fn route_label(s: &Session, r: &Route, input: bool, format_channels: usize) -> String {
     match r {
+        Route::None | Route::Main if input && format_channels > 0 => if format_channels >= 2 { "In 1-2" } else { "In 1" }.into(),
         Route::None => if input { "No input" } else { "No output" }.into(),
-        Route::Main if input => if format_channels >= 2 { "In 1-2" } else { "In 1" }.into(),
         Route::Main => "Main".into(),
         Route::Bus(b) => match channel_of_bus(s, *b) {
             Some(t) if !input => t.name.clone(),
@@ -241,7 +243,11 @@ pub fn input_choices(s: &Session, t: &Track, device_inputs: usize) -> Vec<(Strin
         }
         v.push((format!("Bus: {}", b.name), b.name.clone()));
     }
-    v.push(("No input".into(), "none".into()));
+    // An audio track with no input still records from input 1 (see `route_label`), so only an
+    // FX or group channel is offered "No input".
+    if t.kind == TrackKind::Aux {
+        v.push(("No input".into(), "none".into()));
+    }
     v
 }
 
@@ -502,7 +508,12 @@ fn dropdown(ui: &mut Ui, clip: Rect, r: Rect, id: egui::Id, current: &str, choic
     p.rect_filled(r, 2.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.bg });
     let text_r = r.shrink2(vec2(4.0, 0.0));
     p.with_clip_rect(text_r.intersect(clip)).text(text_r.left_center(), Align2::LEFT_CENTER, current, FontId::proportional(10.5), TOKENS.text);
-    p.text(pos2(r.max.x - 6.0, r.center().y), Align2::CENTER_CENTER, "▾", FontId::proportional(9.0), TOKENS.text_dim);
+    let c = pos2(r.max.x - 7.0, r.center().y);
+    p.add(egui::Shape::convex_polygon(
+        vec![pos2(c.x - 3.0, c.y - 1.5), pos2(c.x + 3.0, c.y - 1.5), pos2(c.x, c.y + 2.0)],
+        TOKENS.text_dim,
+        Stroke::NONE,
+    ));
     let mut picked = None;
     egui::Popup::menu(&resp).width(150.0).show(|ui| {
         for (label, value) in choices {
@@ -557,7 +568,7 @@ fn strip(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, r: Rect, clip
     // Input (audio and aux tracks; instrument input is MIDI and there is no MIDI device layer).
     let in_r = Rect::from_min_size(pos2(x0, y), vec2(w, 16.0));
     if matches!(t.kind, TrackKind::Audio | TrackKind::Aux) {
-        let cur = route_label(s, &m.input, true, t.channels());
+        let cur = route_label(s, &m.input, true, if t.kind == TrackKind::Audio { t.channels() } else { 0 });
         let choices = input_choices(s, t, app.device_inputs());
         if let Some(v) = dropdown(ui, clip, in_r, ui.id().with(("input", id.0)), &cur, &choices, menu) {
             let _ = app.set_input(id, &v);
