@@ -224,6 +224,9 @@ struct PluginSlot {
     /// The block the plugin last processed came out silent (true before the first). A plugin
     /// whose output still rings is not suspended.
     output_silent: bool,
+    /// A parameter was sent to the plugin since it last processed a block. Its next block is
+    /// processed even while suspended, so the queued change reaches it.
+    woken: bool,
 }
 
 struct Strip {
@@ -426,7 +429,18 @@ impl SlotCtx<'_> {
             create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch).map(|n| n.plugin)
         }?;
         let suspendable = third && idx != INSTRUMENT_SLOT;
-        Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new(), failed: false, fresh: third, suspendable, quiet: 0, output_silent: true })
+        Some(PluginSlot {
+            id: ins.plugin.clone(),
+            ch,
+            plugin,
+            applied: Vec::new(),
+            failed: false,
+            fresh: third,
+            suspendable,
+            quiet: 0,
+            output_silent: true,
+            woken: false,
+        })
     }
 }
 
@@ -1158,13 +1172,15 @@ fn is_silent(buf: &[Vec<f32>], frames: usize) -> bool {
 /// input is silent and its [`ProcessStatus`] allows that (`Sleep` while silent;
 /// `ContinueIfNotQuiet` once its last output was silent too; `Tail` once `tail_samples()` of
 /// silence have gone through and its last output was silent). The buffers are then left as they
-/// are: silent in, silent out. Any non-silent block resumes it. `no_suspend` runs every insert.
-/// True when the plugin processed the block.
+/// are: silent in, silent out. Any non-silent block resumes it, and a parameter change wakes it
+/// for one block (without restarting its tail count). `no_suspend` runs every insert. True when
+/// the plugin processed the block.
 fn run_insert(slot: &mut PluginSlot, buf: &mut [Vec<f32>], frames: usize, transport: &Transport, no_suspend: bool) -> bool {
     if slot.suspendable {
         let silent = is_silent(buf, frames);
         if silent {
             let skip = !no_suspend
+                && !slot.woken
                 && match slot.plugin.process_status() {
                     ProcessStatus::Continue => false,
                     ProcessStatus::ContinueIfNotQuiet => slot.output_silent,
@@ -1180,6 +1196,7 @@ fn run_insert(slot: &mut PluginSlot, buf: &mut [Vec<f32>], frames: usize, transp
         }
         slot.plugin.set_input_silent(silent);
     }
+    slot.woken = false;
     slot.plugin.set_transport(transport);
     slot.plugin.process(buf, frames);
     if slot.suspendable {
@@ -1772,7 +1789,8 @@ fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track
     });
 }
 
-/// Sends each stored param (as mapped by `value`) to the plugin when it changed since last time.
+/// Sends each stored param (as mapped by `value`) to the plugin when it changed since last time,
+/// and then marks the slot [`woken`](PluginSlot::woken).
 fn apply_values(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, value: impl Fn(&str, f32) -> f32) {
     if slot.applied.len() != ins.params.len() {
         slot.applied = vec![f32::NAN; ins.params.len()];
@@ -1790,6 +1808,7 @@ fn apply_values(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, value: im
                 slot.plugin.set_param(k, val);
             }
             *last = val;
+            slot.woken = true;
         }
     }
 }
@@ -2963,6 +2982,8 @@ mod tests {
         decay: usize,
         /// Ringing blocks left.
         left: usize,
+        /// `set_param` calls.
+        sets: Arc<std::sync::atomic::AtomicUsize>,
         calls: Arc<std::sync::atomic::AtomicUsize>,
         told: Arc<std::sync::Mutex<Vec<bool>>>,
     }
@@ -2978,6 +2999,7 @@ mod tests {
             self.inner.reset();
         }
         fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.sets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.set_param(id, v)
         }
         fn param(&self, id: &str) -> Option<f32> {
@@ -3016,6 +3038,8 @@ mod tests {
             tail: usize,
             /// Blocks the fake rings on (outputs 0.5) after its input goes silent.
             decay: usize,
+            /// Before this block, the session changes one of the insert's parameters.
+            param_at: Option<usize>,
             no_suspend: bool,
             instrument: bool,
             /// Block positions rendered, in order.
@@ -3026,35 +3050,68 @@ mod tests {
             told: &'static [bool],
         }
         let rows = [
-            Row { status: Continue, tail: 0, decay: 0, no_suspend: false, instrument: false, blocks: &[QUIET[0]], calls: &[1], told: &[true] },
+            Row {
+                status: Continue,
+                tail: 0,
+                decay: 0,
+                param_at: None,
+                no_suspend: false,
+                instrument: false,
+                blocks: &[QUIET[0]],
+                calls: &[1],
+                told: &[true],
+            },
             Row {
                 status: ContinueIfNotQuiet,
                 tail: 0,
                 decay: 0,
+                param_at: None,
                 no_suspend: false,
                 instrument: false,
                 blocks: &[QUIET[0], LOUD],
                 calls: &[0, 1],
                 told: &[false],
             },
-            Row { status: Sleep, tail: 0, decay: 0, no_suspend: false, instrument: false, blocks: &[QUIET[0], LOUD], calls: &[0, 1], told: &[false] },
+            Row {
+                status: Sleep,
+                tail: 0,
+                decay: 0,
+                param_at: None,
+                no_suspend: false,
+                instrument: false,
+                blocks: &[QUIET[0], LOUD],
+                calls: &[0, 1],
+                told: &[false],
+            },
             Row {
                 status: Tail,
                 tail: 1024,
                 decay: 0,
+                param_at: None,
                 no_suspend: false,
                 instrument: false,
                 blocks: &[QUIET[0], QUIET[1], QUIET[2], LOUD],
                 calls: &[1, 2, 2, 3],
                 told: &[true, true, false],
             },
-            Row { status: Sleep, tail: 0, decay: 0, no_suspend: true, instrument: false, blocks: &[QUIET[0]], calls: &[1], told: &[true] },
+            Row {
+                status: Sleep,
+                tail: 0,
+                decay: 0,
+                param_at: None,
+                no_suspend: true,
+                instrument: false,
+                blocks: &[QUIET[0]],
+                calls: &[1],
+                told: &[true],
+            },
             // Output, not input: a decaying ContinueIfNotQuiet effect is processed while its output
             // rings after the input went silent, and suspended once it came out silent.
             Row {
                 status: ContinueIfNotQuiet,
                 tail: 0,
                 decay: 2,
+                param_at: None,
                 no_suspend: false,
                 instrument: false,
                 blocks: &[LOUD, QUIET[0], QUIET[1], QUIET[2], QUIET[3]],
@@ -3066,13 +3123,36 @@ mod tests {
                 status: Tail,
                 tail: 0,
                 decay: 1,
+                param_at: None,
                 no_suspend: false,
                 instrument: false,
                 blocks: &[LOUD, QUIET[0], QUIET[1], QUIET[2]],
                 calls: &[1, 2, 3, 3],
                 told: &[false, true, true],
             },
-            Row { status: Sleep, tail: 0, decay: 0, no_suspend: false, instrument: true, blocks: &[QUIET[0], QUIET[1]], calls: &[1, 2], told: &[] },
+            // A parameter change wakes a sleeping effect for that block only, so the change reaches it.
+            Row {
+                status: Sleep,
+                tail: 0,
+                decay: 0,
+                param_at: Some(1),
+                no_suspend: false,
+                instrument: false,
+                blocks: &[QUIET[0], QUIET[1], QUIET[2]],
+                calls: &[0, 1, 1],
+                told: &[true],
+            },
+            Row {
+                status: Sleep,
+                tail: 0,
+                decay: 0,
+                param_at: None,
+                no_suspend: false,
+                instrument: true,
+                blocks: &[QUIET[0], QUIET[1]],
+                calls: &[1, 2],
+                told: &[],
+            },
         ];
         for (n, row) in rows.iter().enumerate() {
             let (mut s, mut t) = session_with_dc(0.5, 1024);
@@ -3087,12 +3167,14 @@ mod tests {
             };
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let fake = Sleepy {
                 inner: soundcraft_dsp::create("gain").unwrap(),
                 status: row.status,
                 tail: row.tail,
                 decay: row.decay,
                 left: 0,
+                sets: Arc::clone(&sets),
                 calls: Arc::clone(&calls),
                 told: Arc::clone(&told),
             };
@@ -3102,6 +3184,11 @@ mod tests {
             let ch = if row.instrument { 2 } else { 1 };
             eng.adopt(vec![PreparedInstance { track: t, slot, id: id.into(), ch, plugin: Box::new(fake) }]);
             for (b, (&pos, &want)) in row.blocks.iter().zip(row.calls).enumerate() {
+                if row.param_at == Some(b)
+                    && let Some(Some(ins)) = s.track_mut(t).unwrap().mixer.inserts.get_mut(0)
+                {
+                    ins.params.insert("gain".into(), -6.0);
+                }
                 let out = render_block(&mut eng, &s, pos);
                 assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), want, "row {n} ({:?}), block {b} at {pos}", row.status);
                 if pos != LOUD && row.decay == 0 {
@@ -3109,6 +3196,8 @@ mod tests {
                 }
             }
             assert_eq!(*told.lock().unwrap(), row.told, "row {n} ({:?}): set_input_silent", row.status);
+            let want_sets = usize::from(row.param_at.is_some());
+            assert_eq!(sets.load(std::sync::atomic::Ordering::Relaxed), want_sets, "row {n} ({:?}): set_param", row.status);
         }
     }
 
