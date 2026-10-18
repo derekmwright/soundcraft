@@ -1090,10 +1090,12 @@ fn parsing_what_a_readout_takes() {
         ("99", 12.0),
         ("-500", -144.0),
         ("-inf", -144.0),
+        ("\u{2212}6", -6.0),
+        ("\u{2212}6.5 dB", -6.5),
     ] {
         assert_eq!(parse_db(text), Some(want), "{text:?}");
     }
-    for bad in ["", "dB", "abc", "1,5", "--3", "nan"] {
+    for bad in ["", "dB", "abc", "1,5", "--3", "nan", "inf", "+inf", "infinity"] {
         assert_eq!(parse_db(bad), None, "{bad:?}");
     }
     for (text, want) in
@@ -1307,7 +1309,7 @@ fn a_strip_plus_adds_an_insert_to_that_track_whatever_is_focused() {
 }
 
 #[test]
-fn insert_rows_cap_at_three_and_keep_every_fader_aligned() {
+fn insert_rows_cap_and_keep_every_fader_aligned() {
     let (mut app, ctx, mut time, a) = mixer_app();
     let r = app.run("track.new", json!({"kind": "audio", "format": "stereo", "name": "Vox"})).unwrap();
     let b = TrackId(r["tracks"][0].as_u64().unwrap());
@@ -1316,15 +1318,58 @@ fn insert_rows_cap_at_three_and_keep_every_fader_aligned() {
     }
     frames(&mut app, &ctx, 3, &mut time);
     let (sa, sb) = (strip(&app, a), strip(&app, b));
-    assert_eq!(sa.inserts.len(), 3, "three rows and an n-more row");
-    assert_eq!(sa.add_insert, [0.0; 4], "no + while the list overflows");
+    assert_eq!(sa.inserts.len(), 2, "two rows, an n-more row and the +");
+    assert!(sa.add_insert[3] > sa.add_insert[1], "the + stays while the list overflows");
+    assert!(sa.add_insert[1] > sa.inserts[1].rect[3], "the + is below the n-more row");
     assert_eq!((sa.fader[1], sa.fader[3]), (sb.fader[1], sb.fader[3]), "the faders line up with and without inserts");
-    app.focus(a);
+    app.focus(b);
     frames(&mut app, &ctx, 3, &mut time);
-    let more = [sa.rect[0] + 10.0, sa.inserts[2].rect[3] + 8.0];
+    let more = [sa.rect[0] + 10.0, sa.inserts[1].rect[3] + 8.0];
     click(&mut app, (more[0], more[1]));
     frames(&mut app, &ctx, 4, &mut time);
     assert!(app.ui.show_devices, "n more… points at the device chain");
+    assert_eq!(app.focus_track(), Some(a), "and focuses that strip");
+}
+
+#[test]
+fn the_insert_plus_is_always_there_and_opens_its_menu() {
+    for height in [260.0, 420.0] {
+        // 10 is every slot: nothing left to add to, so no +.
+        for n in [0usize, 1, 4, 9, 10] {
+            let (mut app, ctx, mut time, a) = mixer_app();
+            app.ui.mixer_height = height;
+            for _ in 0..n {
+                app.add_device(a, "gain").unwrap();
+            }
+            frames(&mut app, &ctx, 4, &mut time);
+            let s = strip(&app, a);
+            if n == 10 {
+                assert_eq!(s.add_insert, [0.0; 4], "a full strip has no +");
+                continue;
+            }
+            assert!(s.add_insert[2] > s.add_insert[0] && s.add_insert[3] > s.add_insert[1], "height {height}, {n} inserts: a + is drawn");
+            click(&mut app, mid(s.add_insert));
+            frames(&mut app, &ctx, 6, &mut time);
+            assert!(app.mixer.layout.menu.iter().any(|m| m.value == "gain"), "height {height}, {n} inserts: the + opens the menu");
+        }
+    }
+}
+
+#[test]
+fn adding_through_a_strip_plus_focuses_that_strip() {
+    let (mut app, ctx, mut time, a) = mixer_app();
+    let r = app.run("track.new", json!({"kind": "audio", "format": "stereo", "name": "Vox"})).unwrap();
+    let b = TrackId(r["tracks"][0].as_u64().unwrap());
+    app.focus(a);
+    frames(&mut app, &ctx, 3, &mut time);
+    assert!(!strip(&app, b).focused);
+    let plus = mid(strip(&app, b).add_insert);
+    click(&mut app, plus);
+    frames(&mut app, &ctx, 6, &mut time);
+    let item = app.mixer.layout.menu.iter().find(|m| m.value == "gain").cloned().unwrap();
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert!(strip(&app, b).focused && !strip(&app, a).focused, "the device chain follows the strip that got the insert");
 }
 
 #[test]
@@ -1443,4 +1488,57 @@ fn the_main_out_strip_has_a_peak_readout_and_clears_on_click() {
     click(&mut app, at);
     frames(&mut app, &ctx, 4, &mut time);
     assert!(!app.main_meter.clip && app.main_meter.peak == 0.0);
+}
+
+#[test]
+fn shift_drag_does_not_snap_to_a_mark() {
+    use crate::mixer::db_to_k;
+    let (mut app, ctx, mut time, t) = send_app();
+    let f = strip(&app, t).fader;
+    let (x, h) = ((f[0] + f[2]) / 2.0, f[3] - f[1]);
+    app.run("mix.volume", json!({"tracks": [t.0], "db": -0.5})).unwrap();
+    frames(&mut app, &ctx, 3, &mut time);
+    let from = f[3] - db_to_k(-0.5) * h;
+    // Shift moves a tenth as far, so ten times the travel for +0.6 dB; slowly, so a plain drag would snap to 0.
+    let travel = (db_to_k(0.1) - db_to_k(-0.5)) * h * 10.0;
+    drag(&mut app, (x, from), (x, from - travel), json!({"shift": true, "steps": 150}));
+    frames(&mut app, &ctx, 200, &mut time);
+    let db = volume(&app, t);
+    assert!(db != 0.0 && (db - 0.1).abs() < 0.05, "shift-drag lands off the 0 dB mark: {db}");
+}
+
+#[test]
+fn backspace_over_a_control_resets_it_like_delete_and_keeps_the_clip() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    let (ct, clip, _bar) = track_with_clip(&mut app);
+    app.click_clip(clip, false);
+    app.run("mix.volume", json!({"tracks": [t.0], "db": 0.2})).unwrap();
+    frames(&mut app, &ctx, 3, &mut time);
+    let at = mid(strip(&app, t).fader);
+    move_to(&mut app, at);
+    frames(&mut app, &ctx, 3, &mut time);
+    key(&mut app, "Backspace");
+    frames(&mut app, &ctx, 6, &mut time);
+    assert_eq!(volume(&app, t), 0.0, "Backspace over the fader resets it");
+    assert_eq!(clips_on(&app, ct).len(), 1, "and the selected clip stays");
+}
+
+#[test]
+fn clearing_the_main_meter_clears_the_master_tracks_meter_and_back() {
+    let (mut app, _ctx, _time, _a) = mixer_app();
+    app.run("track.new", json!({"kind": "master"})).unwrap();
+    let master = app.engine.session().tracks.iter().find(|t| t.kind == soundcraft_model::TrackKind::Master).map(|t| t.id).expect("a Master track");
+    let hot = |app: &mut StudioApp| {
+        crate::host::feed_meter(&mut app.main_meter, [1.2, 1.2], 0.0, 0.016);
+        crate::host::feed_meter(app.meters.entry(master).or_default(), [1.2, 1.2], 0.0, 0.016);
+    };
+    hot(&mut app);
+    app.reset_main_meter();
+    assert!(!app.main_meter.clip && !app.meters[&master].clip && app.main_meter.peak == 0.0, "the transport meter clears both");
+    hot(&mut app);
+    app.reset_meters(Some(master));
+    assert!(!app.main_meter.clip && !app.meters[&master].clip, "the master strip clears both");
+    hot(&mut app);
+    app.reset_meters(None);
+    assert!(!app.main_meter.clip && !app.meters[&master].clip, "Ctrl-click clears everything");
 }

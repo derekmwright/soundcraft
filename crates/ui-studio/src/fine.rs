@@ -91,9 +91,10 @@ pub fn snap_pan(b: f32) -> f32 {
 /// Parses a level typed into a readout: "-6", "-6.0", "-6 dB", "+1.5", "-inf". Clamped to the
 /// engine's range. `None` when it is not a number.
 pub fn parse_db(text: &str) -> Option<f32> {
-    let lower = text.trim().to_ascii_lowercase();
+    // Windows IMEs and pasted text produce U+2212 for the minus sign.
+    let lower = text.trim().replace('\u{2212}', "-").to_ascii_lowercase();
     let t = lower.strip_suffix("db").unwrap_or(&lower).trim();
-    if t.eq_ignore_ascii_case("-inf") || t.eq_ignore_ascii_case("inf") || t.eq_ignore_ascii_case("-infinity") {
+    if t == "-inf" || t == "-infinity" {
         return Some(DB_MIN);
     }
     let v: f32 = t.parse().ok()?;

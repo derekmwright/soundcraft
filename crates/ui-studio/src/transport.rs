@@ -131,8 +131,12 @@ fn readout(ui: &mut Ui, text: &str, w: f32, color: Color32) {
 
 fn main_meter(app: &mut StudioApp, ui: &mut Ui) {
     let (r, resp) = ui.allocate_exact_size(vec2(120.0, 16.0), Sense::click());
-    if resp.on_hover_text("Click to clear the clip latch and the peak hold").clicked() {
-        (app.main_meter.peak, app.main_meter.clip) = (0.0, false);
+    if resp.on_hover_text("Click to clear the clip latch and the peak hold, Ctrl-click for every meter").clicked() {
+        if ui.input(|i| i.modifiers.command || i.modifiers.ctrl) {
+            app.reset_meters(None);
+        } else {
+            app.reset_main_meter();
+        }
     }
     let p = ui.painter();
     p.rect_filled(r, 2.0, TOKENS.bg);

@@ -830,7 +830,7 @@ fn main_out(app: &mut StudioApp, ui: &mut Ui, r: Rect) -> (StripLayout, R4) {
         if all {
             app.reset_meters(None);
         } else {
-            (app.main_meter.peak, app.main_meter.clip) = (0.0, false);
+            app.reset_main_meter();
         }
     }
     let sl = StripLayout {
@@ -871,12 +871,25 @@ impl StudioApp {
                 if let Some(d) = self.meters.get_mut(&id) {
                     (d.peak, d.clip) = (0.0, false);
                 }
+                if self.engine.session().track(id).is_some_and(|t| t.kind == TrackKind::Master) {
+                    (self.main_meter.peak, self.main_meter.clip) = (0.0, false);
+                }
             }
             None => {
                 for d in self.meters.values_mut().chain(std::iter::once(&mut self.main_meter)) {
                     (d.peak, d.clip) = (0.0, false);
                 }
             }
+        }
+    }
+
+    /// Clear the main meter and, when there is one, the Master track's own meter: the master
+    /// strip shows `meters[master]` and the transport shows `main_meter`.
+    pub fn reset_main_meter(&mut self) {
+        (self.main_meter.peak, self.main_meter.clip) = (0.0, false);
+        let master = self.engine.session().tracks.iter().find(|t| t.kind == TrackKind::Master).map(|t| t.id);
+        if let Some(d) = master.and_then(|id| self.meters.get_mut(&id)) {
+            (d.peak, d.clip) = (0.0, false);
         }
     }
 
@@ -958,7 +971,7 @@ pub const SEND_ROW_H: f32 = 17.0;
 const BAR_H: f32 = 5.0;
 const STRIP_FIXED_H: f32 = 207.0;
 /// Height of an insert row, and the most rows a strip has for them: three inserts and "+", or
-/// two and "n more…" in a short pane.
+/// two, "n more…" and "+" in a short pane (one row: only "+").
 const INSERT_ROW_H: f32 = 15.0;
 const INSERT_ROWS: usize = 4;
 const MIN_FADER: f32 = 80.0;
@@ -1214,8 +1227,11 @@ fn inserts_block(
     let list: Vec<(usize, soundcraft_model::Insert)> = t.mixer.inserts.iter().enumerate().filter_map(|(i, x)| x.clone().map(|x| (i, x))).collect();
     let free = list.len() < t.mixer.inserts.len();
     let row_r = |i: usize| Rect::from_min_size(pos2(x0, y + i as f32 * INSERT_ROW_H), vec2(w, INSERT_ROW_H - 2.0));
-    let fits = list.len() + usize::from(free) <= rows;
-    let shown = if fits { list.len() } else { rows.saturating_sub(1) };
+    // The last row is always "+" (while a slot is free); a list that does not fit above it gives
+    // up its last visible row to "n more…". With a single row, only "+".
+    let room = rows.saturating_sub(usize::from(free));
+    let fits = list.len() <= room;
+    let shown = if fits { list.len() } else { room.saturating_sub(1) };
     let p = ui.painter().with_clip_rect(clip);
     let id = t.id;
     for (i, (slot, ins)) in list.iter().take(shown).enumerate() {
@@ -1259,19 +1275,7 @@ fn inserts_block(
     if rows == 0 {
         return;
     }
-    if fits {
-        if free {
-            let rr = row_r(shown);
-            let resp = ui.interact(rr.intersect(clip), ui.id().with(("add_insert", id.0)), Sense::click());
-            if resp.hovered() {
-                p.rect_filled(rr, 2.0, TOKENS.button_hover);
-            }
-            p.text(pos2(rr.min.x + 4.0, rr.center().y), Align2::LEFT_CENTER, "+", FontId::proportional(11.0), TOKENS.text_dim);
-            let resp = resp.on_hover_text("Add an effect to this track");
-            crate::devices::add_device_menu(app, &resp, id, menu);
-            sl.add_insert = r4(rr);
-        }
-    } else {
+    if !fits {
         let rr = row_r(shown);
         let resp = ui.interact(rr.intersect(clip), ui.id().with(("more_inserts", id.0)), Sense::click());
         p.text(
@@ -1285,6 +1289,21 @@ fn inserts_block(
             app.focus(id);
             app.ui.show_devices = true;
         }
+    }
+    if free {
+        let rr = row_r(rows - 1);
+        let resp = ui.interact(rr.intersect(clip), ui.id().with(("add_insert", id.0)), Sense::click());
+        if resp.hovered() {
+            p.rect_filled(rr, 2.0, TOKENS.button_hover);
+        }
+        p.text(pos2(rr.min.x + 4.0, rr.center().y), Align2::LEFT_CENTER, "+", FontId::proportional(11.0), TOKENS.text_dim);
+        let resp = resp.on_hover_text("Add an effect to this track");
+        let before = list.len();
+        crate::devices::add_device_menu(app, &resp, id, menu);
+        if app.engine.session().track(id).is_some_and(|x| x.mixer.inserts.iter().flatten().count() > before) {
+            app.focus(id);
+        }
+        sl.add_insert = r4(rr);
     }
 }
 
@@ -1714,7 +1733,7 @@ fn control(app: &mut StudioApp, ui: &Ui, resp: &egui::Response, t: Target, heigh
             let (lo, hi) = if matches!(t, Target::Pan(_)) { (-1.0, 1.0) } else { (0.0, 1.0) };
             g.raw = (g.raw + per_px * ratio).clamp(lo, hi);
             app.mixer.gesture = Some(g);
-            let slow = now_delta < fine::SLOW_PT;
+            let slow = now_delta < fine::SLOW_PT && !mods.shift;
             let v = match t {
                 Target::Pan(_) if slow => fine::snap_pan(g.raw),
                 Target::Pan(_) => g.raw,

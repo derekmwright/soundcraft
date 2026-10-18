@@ -240,13 +240,13 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
         let _ = app.run("options.loop_playback", json!({"value": !on}));
     }
     // Delete over a fader, knob or send level resets it (Ableton); anywhere else it deletes.
-    if pressed(ctx, Modifiers::NONE, Key::Delete) {
+    // Backspace does the same. (A readout being edited has the keyboard, so both edit text.)
+    let del = pressed(ctx, Modifiers::NONE, Key::Delete);
+    if pressed(ctx, Modifiers::NONE, Key::Backspace) || del {
         match app.mixer.hover {
             Some(t) => app.reset_control(t),
             None => drop(app.delete_selected()),
         }
-    } else if pressed(ctx, Modifiers::NONE, Key::Backspace) {
-        let _ = app.delete_selected();
     }
     // Views (Ableton where it has a key: Ctrl+Alt+M mixer, Ctrl+Alt+L detail view; Cubase's F3
     // MixConsole for the full mixer, which Ableton has no key for).
