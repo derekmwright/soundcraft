@@ -105,3 +105,19 @@ pub fn lighten(c: Color32, k: f32) -> Color32 {
 pub fn rgb(c: [u8; 3]) -> Color32 {
     Color32::from_rgb(c[0], c[1], c[2])
 }
+
+/// The family apps/transit installs for numbers (JetBrains Mono Medium).
+const MONO_MEDIUM: &str = "mono-medium";
+
+/// Notes, once a frame, whether the `mono-medium` family exists (an egui font id naming a family
+/// that was not installed panics, and tests and `--no-fonts` runs have only the defaults).
+pub fn probe_fonts(ctx: &egui::Context) {
+    let has = ctx.fonts(|f| f.families().contains(&egui::FontFamily::Name(MONO_MEDIUM.into())));
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("transit-mono-medium"), has));
+}
+
+/// Digits for clocks and readouts: `mono-medium` where the app installed it, else Monospace.
+pub fn mono(ctx: &egui::Context, size: f32) -> egui::FontId {
+    let has = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("transit-mono-medium"))).unwrap_or(false);
+    if has { egui::FontId::new(size, egui::FontFamily::Name(MONO_MEDIUM.into())) } else { egui::FontId::monospace(size) }
+}

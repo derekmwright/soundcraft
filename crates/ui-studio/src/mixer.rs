@@ -23,6 +23,7 @@
 
 use crate::StudioApp;
 use crate::arrange::R4;
+use crate::fine::{self, Target};
 use crate::theme::{self, TOKENS};
 use egui::{Align2, Color32, CursorIcon, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::{Value, json};
@@ -34,12 +35,15 @@ const GAP: f32 = 2.0;
 /// The fader's top, in dB.
 pub const FADER_MAX_DB: f32 = 12.0;
 
-/// A drag in progress on a strip.
+/// A drag in progress on a fader, knob or send level. `raw` is where the pointer has taken the
+/// control (fader position 0..1 for a fader or send, balance -1..1 for a knob), before snapping,
+/// so the snap is a detent the drag leaves again rather than a place it sticks.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MixGesture {
-    Fader { track: TrackId, start_k: f32, height: f32 },
-    Knob { track: TrackId, start: f32 },
-    Send { track: TrackId, slot: usize, start_k: f32 },
+pub struct MixGesture {
+    pub target: Target,
+    pub raw: f32,
+    /// The fader's height in points (pointer travel to fader travel).
+    pub height: f32,
 }
 
 /// The value a "+ Send" menu entry carries for "New FX Channel…".
@@ -56,8 +60,13 @@ pub struct SendRow {
     pub rect: R4,
     /// Click: a menu to send somewhere else.
     pub target_rect: R4,
-    /// Drag: the level (one undo step); double-click: 0 dB.
+    /// The thin level bar along the row's bottom: drag changes the level (one undo step),
+    /// double-click resets it to 0 dB.
     pub level_rect: R4,
+    /// The level as text: wheel nudges it, double-click types a value, drag changes it.
+    pub readout_rect: R4,
+    /// What the readout shows.
+    pub level_text: String,
     pub remove: R4,
     /// The pre/post toggle (device chain only; strips have it in the row's right-click menu).
     pub pre: R4,
@@ -99,6 +108,12 @@ pub struct StripLayout {
     pub monitor: R4,
     pub fader: R4,
     pub meter: R4,
+    /// The dB readout under the fader (double-click types a level) and its text.
+    pub readout_rect: R4,
+    pub volume_text: String,
+    /// The pan readout under the knob and its text ("C", "L20", "R35").
+    pub pan_readout_rect: R4,
+    pub pan_text: String,
     pub volume_db: f32,
     /// The knob's value, -1 (left) .. 1 (right), read back from the track's panners.
     pub balance: f32,
@@ -185,6 +200,16 @@ pub struct MixerState {
     pub filter_rect: R4,
     /// Gestures started, to give each composite its own merge key.
     serial: u64,
+    /// A readout being edited in place.
+    pub edit: Option<fine::ReadoutEdit>,
+    /// Where the editing field was last drawn (for `ui.inspect`).
+    pub edit_rect: R4,
+    /// The wheel gesture in progress (its nudges are one undo step).
+    pub wheel: Option<fine::WheelMerge>,
+    /// The control under the pointer as last drawn (Delete resets it).
+    pub hover: Option<Target>,
+    /// A control took the wheel this frame, so the strips don't scroll.
+    wheel_taken: bool,
 }
 
 /// Fader position 0..1 for a gain in dB: the fourth root of the amplitude, scaled so +12 dB is
@@ -400,13 +425,94 @@ impl StudioApp {
 
     /// Balance knob (L10): both panners of a stereo track, one undo step per gesture.
     pub fn set_balance(&mut self, t: TrackId, b: f32) -> Result<Value, String> {
+        self.set_balance_keyed(t, b, &format!("pan:{}", t.0))
+    }
+
+    fn set_balance_keyed(&mut self, t: TrackId, b: f32, key: &str) -> Result<Value, String> {
         let n = self.engine.session().track(t).map_or(0, |tr| tr.mixer.pan.len());
-        let key = format!("pan:{}", t.0);
+        let key = key.to_string();
         let mut last = json!({});
         for (i, p) in pans_for(b, n).into_iter().enumerate() {
             last = self.engine.execute_merged("mix.pan", &json!({"tracks": [t.0], "pan": p, "index": i}), &key).map_err(|e| e.to_string())?;
         }
         Ok(last)
+    }
+
+    /// What a control holds now: dB for a fader or send, balance for a knob.
+    pub fn value_of(&self, t: Target) -> Option<f32> {
+        let s = self.engine.session();
+        match t {
+            Target::Fader(id) => s.track(id).map(|tr| tr.mixer.volume_db),
+            Target::Pan(id) => s.track(id).map(|tr| balance_of(&tr.mixer.pan)),
+            Target::Send(id, slot) => s.track(id)?.mixer.sends.get(slot)?.as_ref().map(|x| x.level_db),
+        }
+    }
+
+    /// Set a control (dB, or balance for a knob) as part of a merged gesture: `key` is the
+    /// gesture's merge key, by default the control's own drag key.
+    pub fn set_value_merged(&mut self, t: Target, v: f32, key: Option<&str>) -> Result<Value, String> {
+        match t {
+            Target::Fader(id) => {
+                let key = key.map_or_else(|| format!("fader:{}", id.0), str::to_string);
+                self.engine.execute_merged("mix.volume", &json!({"tracks": [id.0], "db": v}), &key).map_err(|e| e.to_string())
+            }
+            Target::Send(id, slot) => {
+                let key = key.map_or_else(|| format!("send:{}:{slot}", id.0), str::to_string);
+                self.engine.execute_merged("mix.send_level", &json!({"track": id.0, "slot": slot, "db": v}), &key).map_err(|e| e.to_string())
+            }
+            Target::Pan(id) => {
+                let key = key.map_or_else(|| format!("pan:{}", id.0), str::to_string);
+                self.set_balance_keyed(id, v, &key)
+            }
+        }
+    }
+
+    /// Set a control to `v` as one undo step of its own (a reset, or a typed value).
+    pub fn set_value(&mut self, t: Target, v: f32) -> Result<Value, String> {
+        self.engine.end_merge();
+        self.mixer.wheel = None;
+        self.mixer.serial += 1;
+        let r = self.set_value_merged(t, v, Some(&format!("set:{}", self.mixer.serial)));
+        self.engine.end_merge();
+        r
+    }
+
+    /// Reset a control to its default: 0.0 dB, or center.
+    pub fn reset_control(&mut self, t: Target) {
+        let _ = self.set_value(t, 0.0);
+    }
+
+    /// A wheel notch or several on a control: 0.1 dB each (Shift: 0.01; a knob 1 %, Shift 0.1 %).
+    /// The nudges of one wheel gesture are one undo step.
+    fn wheel_nudge(&mut self, t: Target, notches: f32, shift: bool, rect: Rect, now: f64) {
+        let Some(cur) = self.value_of(t) else { return };
+        let step = match (t, shift) {
+            (Target::Pan(_), false) => fine::WHEEL_PAN,
+            (Target::Pan(_), true) => fine::WHEEL_PAN_FINE,
+            (_, false) => fine::WHEEL_DB,
+            (_, true) => fine::WHEEL_DB_FINE,
+        };
+        let (lo, hi) = if matches!(t, Target::Pan(_)) { (-1.0, 1.0) } else { (fine::DB_MIN, fine::DB_MAX) };
+        let v = fine::nudge(cur, notches, step).clamp(lo, hi);
+        if self.mixer.wheel.map(|w| w.target) != Some(t) {
+            self.engine.end_merge();
+        }
+        self.mixer.wheel = Some(fine::WheelMerge { target: t, rect, last: now });
+        let _ = self.set_value_merged(t, v, Some(&t.wheel_key()));
+    }
+
+    /// Ends a wheel gesture when the pointer has left the control or 500 ms have passed since
+    /// its last notch. Returns whether one is still going (its merge must not be ended yet).
+    pub(crate) fn drive_wheel(&mut self, ctx: &egui::Context, now: f64) -> bool {
+        let Some(w) = self.mixer.wheel else { return false };
+        let inside = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| w.rect.contains(p));
+        if inside && now - w.last <= fine::WHEEL_MERGE_S {
+            ctx.request_repaint_after_secs((fine::WHEEL_MERGE_S - (now - w.last)).max(0.0) as f32 + 0.02);
+            return true;
+        }
+        self.mixer.wheel = None;
+        self.engine.end_merge();
+        false
     }
 
     /// Route a track's output (`track.output`), by the value an output choice carries. Picking
@@ -584,6 +690,11 @@ impl StudioApp {
 pub fn panes(app: &mut StudioApp, ui: &mut Ui) {
     app.mixer.layout.menu.clear();
     app.mixer.devices.menu.clear();
+    app.mixer.hover = None;
+    app.mixer.wheel_taken = false;
+    if app.mixer.edit.is_none() {
+        app.mixer.edit_rect = [0.0; 4];
+    }
     app.mixer.devices.visible = app.ui.show_devices;
     if app.ui.show_devices {
         egui::Panel::bottom("devices")
@@ -661,6 +772,7 @@ fn strips(app: &mut StudioApp, ui: &mut Ui) {
     if let Some(pos) = ui.input(|i| i.pointer.hover_pos())
         && lane.contains(pos)
         && app.mixer.gesture.is_none()
+        && !app.mixer.wheel_taken
     {
         let d = ui.input(|i| i.smooth_scroll_delta);
         let d = if d.x.abs() > d.y.abs() { d.x } else { d.y };
@@ -772,6 +884,8 @@ fn choice_menu(resp: &egui::Response, current: &str, choices: &[(String, String)
 
 /// Height of one send row, and of the strip without its sends block and fader.
 pub const SEND_ROW_H: f32 = 17.0;
+/// The send level bar along a row's bottom edge.
+const BAR_H: f32 = 5.0;
 const STRIP_FIXED_H: f32 = 195.0;
 const MIN_FADER: f32 = 80.0;
 
@@ -828,6 +942,8 @@ pub(crate) fn send_row(
     );
     let xb = Rect::from_min_max(pos2(r.max.x - 14.0, r.min.y), r.max);
     let lr = Rect::from_min_max(pos2(xb.min.x - if wide { 50.0 } else { 24.0 }, r.min.y), pos2(xb.min.x, r.max.y));
+    // The bar along the bottom is its own control; the text hit rects stop above it.
+    let above = |q: Rect| Rect::from_min_max(q.min, pos2(q.max.x, q.max.y - BAR_H));
     let pr = Rect::from_min_max(
         pos2(lr.min.x - if wide { 34.0 } else { 0.0 }, r.min.y + 2.0),
         pos2(lr.min.x - if wide { 4.0 } else { 0.0 }, r.max.y - 3.0),
@@ -838,13 +954,14 @@ pub(crate) fn send_row(
         tr.min.x += 12.0;
     }
     // Target: another bus, or right-click for pre/post and remove.
-    let resp = ui.interact(tr.intersect(clip), ui.id().with(("send_target", salt)), Sense::click());
+    let th = above(tr);
+    let resp = ui.interact(th.intersect(clip), ui.id().with(("send_target", salt)), Sense::click());
     if resp.hovered() {
-        p.rect_filled(tr, 2.0, TOKENS.button_hover);
+        p.rect_filled(th, 2.0, TOKENS.button_hover);
     }
     let text_r = tr.shrink2(vec2(4.0, 0.0));
     p.with_clip_rect(text_r.intersect(clip)).text(text_r.left_center(), Align2::LEFT_CENTER, &target, FontId::proportional(10.5), TOKENS.text);
-    row.target_rect = r4(tr);
+    row.target_rect = r4(th);
     let mut choices = send_targets(s, t, Some(slot));
     if !choices.iter().any(|(l, _)| *l == target) {
         choices.insert(0, (target.clone(), String::new()));
@@ -888,44 +1005,47 @@ pub(crate) fn send_row(
         }
         row.pre = r4(pr);
     }
-    // Level: drag up or right to raise it, like the fader (fourth-root law).
-    let resp = ui.interact(lr.intersect(clip), ui.id().with(("send_level", salt)), Sense::click_and_drag());
-    let hot = resp.hovered() || matches!(app.mixer.gesture, Some(MixGesture::Send { track, slot: sl, .. }) if track == id && sl == slot);
-    p.text(
-        pos2(lr.max.x - 2.0, lr.center().y - 1.0),
-        Align2::RIGHT_CENTER,
-        level_text(snd.level_db, wide),
-        FontId::monospace(10.0),
-        if hot { TOKENS.accent } else { TOKENS.text },
-    );
+    // Level. The thin bar along the bottom is the control: drag up or right to raise it, like the
+    // fader (fourth-root law); double-click, Alt-click, Ctrl-click and Delete reset it to 0 dB;
+    // a mark shows 0 dB. The number is a readout: double-click types a level; drag and wheel work
+    // on it too.
+    let me = Target::Send(id, slot);
+    let bar = Rect::from_min_max(pos2(r.min.x, r.max.y - BAR_H), r.max);
+    let resp = ui.interact(bar.intersect(clip), ui.id().with(("send_level", salt)), Sense::click_and_drag());
+    let zero_x = r.min.x + r.width() * db_to_k(0.0);
+    p.line_segment([pos2(zero_x, bar.min.y), pos2(zero_x, r.max.y)], Stroke::new(1.0, TOKENS.text_dim));
     if resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
     }
-    if resp.drag_started() {
-        app.mixer.gesture = Some(MixGesture::Send { track: id, slot, start_k: k });
-    }
-    if resp.dragged()
-        && let Some(MixGesture::Send { track, slot: sl, start_k }) = app.mixer.gesture
-        && track == id
-        && sl == slot
-    {
-        let d = ui.input(|i| i.pointer.press_origin().zip(i.pointer.latest_pos()).map_or(0.0, |(a, b)| (b.x - a.x) - (b.y - a.y)));
-        let fine = ui.input(|i| i.modifiers.shift);
-        let nk = (start_k + d / 150.0 * if fine { 0.2 } else { 1.0 }).clamp(0.0, 1.0);
-        let _ = app.set_send_level_merged(id, slot, k_to_db(nk));
-    }
-    if resp.drag_stopped() {
-        app.mixer.gesture = None;
-    }
-    if resp.double_clicked() {
-        let _ = app.run("mix.send_level", json!({"track": id.0, "slot": slot, "db": 0.0}));
-    }
+    control(app, ui, &resp, me, 1.0, true, true);
     let _ = resp.on_hover_text(format!(
-        "{target}: {} ({}). Drag to change, double-click for 0 dB",
+        "{target}: {} ({}). Drag to change, double-click for 0 dB, wheel for 0.1 dB",
         level_text(snd.level_db, true),
         if snd.pre_fader { "pre-fader" } else { "post-fader" }
     ));
-    row.level_rect = r4(lr);
+    row.level_rect = r4(bar);
+    let text = level_text(snd.level_db, wide);
+    let hot = app.mixer.gesture.is_some_and(|g| g.target == me);
+    readout(
+        app,
+        ui,
+        &p,
+        clip,
+        Readout {
+            target: me,
+            salt: wide.into(),
+            draw: lr,
+            hit: above(lr),
+            text: text.clone(),
+            edit_text: fine::edit_text_db(snd.level_db),
+            font: theme::mono(ui.ctx(), 10.0),
+            color: if hot { TOKENS.accent } else { TOKENS.text },
+            align: Align2::RIGHT_CENTER,
+            drag: true,
+        },
+    );
+    row.readout_rect = r4(lr);
+    row.level_text = text;
     // Remove.
     let resp = ui.interact(xb.intersect(clip), ui.id().with(("send_remove", salt)), Sense::click());
     p.text(xb.center(), Align2::CENTER_CENTER, "×", FontId::proportional(12.0), if resp.hovered() { TOKENS.record } else { TOKENS.text_dim });
@@ -1090,35 +1210,42 @@ fn strip(
     sl.knob = r4(knob);
     let b = balance_of(&m.pan);
     let has_pan = !m.pan.is_empty();
+    let pan = Target::Pan(id);
     let resp = ui.interact(knob.intersect(clip), ui.id().with(("knob", id.0)), Sense::click_and_drag());
-    draw_knob(&p, knob, b, resp.hovered() || matches!(app.mixer.gesture, Some(MixGesture::Knob { track, .. }) if track == id));
+    let hot = resp.hovered() || app.mixer.gesture.is_some_and(|g| g.target == pan);
+    draw_knob(&p, knob, b, hot);
     if has_pan {
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
         }
-        if resp.drag_started() {
-            app.mixer.gesture = Some(MixGesture::Knob { track: id, start: b });
-        }
-        if resp.dragged()
-            && let Some(MixGesture::Knob { track, start }) = app.mixer.gesture
-            && track == id
-        {
-            let dy = ui.input(|i| i.pointer.press_origin().zip(i.pointer.latest_pos()).map_or(0.0, |(a, b)| b.y - a.y));
-            let fine = ui.input(|i| i.modifiers.shift);
-            let nb = (start - dy / if fine { 500.0 } else { 100.0 }).clamp(-1.0, 1.0);
-            let nb = if nb.abs() < 0.005 { 0.0 } else { nb };
-            let _ = app.set_balance(id, nb);
-        }
-        if resp.drag_stopped() {
-            app.mixer.gesture = None;
-        }
-        if resp.double_clicked() {
-            let _ = app.set_balance(id, 0.0);
-            app.engine.end_merge();
-        }
+        control(app, ui, &resp, pan, 1.0, true, true);
     }
-    let pan_text = if b.abs() < 0.005 { "C".to_string() } else { format!("{}{:.0}", if b < 0.0 { "L" } else { "R" }, b.abs() * 100.0) };
-    p.text(pos2(r.center().x, knob.max.y + 7.0), Align2::CENTER_CENTER, pan_text, FontId::proportional(9.5), TOKENS.text_dim);
+    let pan_r = Rect::from_center_size(pos2(r.center().x, knob.max.y + 7.0), vec2(34.0, 12.0));
+    let pan_text = fine::pan_text(b);
+    if has_pan {
+        readout(
+            app,
+            ui,
+            &p,
+            clip,
+            Readout {
+                target: pan,
+                salt: 0,
+                draw: pan_r,
+                hit: pan_r,
+                text: pan_text.clone(),
+                edit_text: pan_text.clone(),
+                font: theme::mono(ui.ctx(), 9.5),
+                color: TOKENS.text_dim,
+                align: Align2::CENTER_CENTER,
+                drag: false,
+            },
+        );
+    } else {
+        p.text(pan_r.center(), Align2::CENTER_CENTER, &pan_text, theme::mono(ui.ctx(), 9.5), TOKENS.text_dim);
+    }
+    sl.pan_readout_rect = r4(pan_r);
+    sl.pan_text = pan_text;
     y = knob.max.y + 16.0;
     // M S / R I.
     let bw = (w - 3.0) / 2.0;
@@ -1161,10 +1288,31 @@ fn strip(
     draw_meter(&p, meter, d.level, d.clip);
     fader_widget(app, ui, &p, clip, id, m.volume_db, fader);
     let db = m.volume_db;
-    let text = if db <= -144.0 { "-inf".to_string() } else { format!("{db:+.1}") };
+    let text = fine::db_text(db);
     let ro = Rect::from_min_max(pos2(x0, bottom), pos2(r.max.x - 4.0, r.max.y - 4.0));
     p.rect_filled(ro, 2.0, TOKENS.bg);
-    p.text(ro.center(), Align2::CENTER_CENTER, text, FontId::monospace(10.5), TOKENS.text);
+    let fader_id = Target::Fader(id);
+    let hot = app.mixer.gesture.is_some_and(|g| g.target == fader_id);
+    readout(
+        app,
+        ui,
+        &p,
+        clip,
+        Readout {
+            target: fader_id,
+            salt: 0,
+            draw: ro,
+            hit: ro,
+            text: text.clone(),
+            edit_text: fine::edit_text_db(db),
+            font: theme::mono(ui.ctx(), 10.5),
+            color: if hot { TOKENS.accent } else { TOKENS.text },
+            align: Align2::CENTER_CENTER,
+            drag: false,
+        },
+    );
+    sl.readout_rect = r4(ro);
+    sl.volume_text = text;
     sl
 }
 
@@ -1178,47 +1326,201 @@ fn draw_knob(p: &egui::Painter, r: Rect, b: f32, hot: bool) {
         (0..=n).map(|i| from + (to - from) * i as f32 / n as f32).map(|v| c + vec2(ang(v).cos(), ang(v).sin()) * rad).collect()
     };
     p.add(egui::Shape::line(arc(-1.0, 1.0), Stroke::new(3.0, TOKENS.button)));
+    // The center notch: a short line across the ring at the top.
+    p.line_segment([c + vec2(0.0, -(rad - 3.5)), c + vec2(0.0, -(rad + 3.5))], Stroke::new(1.0, TOKENS.text_dim));
     p.add(egui::Shape::line(arc(0.0, b), Stroke::new(3.0, if hot { theme::lighten(TOKENS.accent, 0.15) } else { TOKENS.accent })));
     p.circle_filled(c + vec2(ang(b).cos(), ang(b).sin()) * rad, 2.5, TOKENS.text);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn fader_widget(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, clip: Rect, id: TrackId, db: f32, r: Rect) {
+    let me = Target::Fader(id);
     let resp = ui.interact(r.expand2(vec2(4.0, 6.0)).intersect(clip), ui.id().with(("fader", id.0)), Sense::click_and_drag());
-    // Track and 0 dB tick.
+    // Track and marks: a line across the track at 0 dB, fainter ticks at -6, -12 and -24.
     let groove = Rect::from_center_size(r.center(), vec2(4.0, r.height()));
     p.rect_filled(groove, 2.0, TOKENS.bg);
     let y_of = |k: f32| r.max.y - k * r.height();
-    for mark in [12.0, 6.0, 0.0, -6.0, -12.0, -24.0, -48.0] {
+    for mark in fine::DB_MARKS {
         let yy = y_of(db_to_k(mark));
-        p.line_segment(
-            [pos2(r.min.x, yy), pos2(r.min.x + 5.0, yy)],
-            Stroke::new(1.0, TOKENS.text_dim.gamma_multiply(if mark == 0.0 { 1.0 } else { 0.5 })),
-        );
+        if mark == 0.0 {
+            p.line_segment([pos2(r.min.x, yy), pos2(r.max.x, yy)], Stroke::new(1.0, TOKENS.text_dim));
+        } else {
+            p.line_segment([pos2(r.center().x - 8.0, yy), pos2(r.center().x + 8.0, yy)], Stroke::new(1.0, TOKENS.text_dim.gamma_multiply(0.5)));
+        }
     }
     let k = db_to_k(db);
     let cap = Rect::from_center_size(pos2(r.center().x, y_of(k)), vec2(r.width().min(26.0), 12.0));
-    let hot = resp.hovered() || matches!(app.mixer.gesture, Some(MixGesture::Fader { track, .. }) if track == id);
+    let hot = resp.hovered() || app.mixer.gesture.is_some_and(|g| g.target == me);
     p.rect_filled(cap, 2.0, if hot { TOKENS.accent } else { TOKENS.text_dim });
     if resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
     }
-    if resp.drag_started() {
-        app.mixer.gesture = Some(MixGesture::Fader { track: id, start_k: k, height: r.height().max(1.0) });
+    control(app, ui, &resp, me, r.height().max(1.0), true, true);
+}
+
+/// A number under a control that is also a way in: double-click types a value in its place,
+/// the wheel nudges it, Alt-click and Ctrl-click reset it.
+struct Readout {
+    target: Target,
+    /// Tells apart two readouts of one control (a strip's and the device chain's).
+    salt: u64,
+    /// Where the text is laid out, and where the pointer hits it.
+    draw: Rect,
+    hit: Rect,
+    text: String,
+    /// What the field starts as when editing opens.
+    edit_text: String,
+    font: FontId,
+    color: Color32,
+    align: Align2,
+    /// Also drag it like the control (a send's number).
+    drag: bool,
+}
+
+fn readout(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, clip: Rect, ro: Readout) {
+    let id = ui.id().with(("readout", ro.target.salt(), ro.salt));
+    if app.mixer.edit.as_ref().is_some_and(|e| e.target == ro.target && e.salt == ro.salt) {
+        edit_field(app, ui, ro.draw, id.with("edit"), ro.font);
+        return;
     }
-    if resp.dragged()
-        && let Some(MixGesture::Fader { track, start_k, height }) = app.mixer.gesture
-        && track == id
-    {
-        let dy = ui.input(|i| i.pointer.press_origin().zip(i.pointer.latest_pos()).map_or(0.0, |(a, b)| b.y - a.y));
-        let fine = ui.input(|i| i.modifiers.shift);
-        let nk = (start_k - dy / height * if fine { 0.2 } else { 1.0 }).clamp(0.0, 1.0);
-        let _ = app.set_volume_merged(id, k_to_db(nk));
-    }
-    if resp.drag_stopped() {
-        app.mixer.gesture = None;
-    }
+    let sense = if ro.drag { Sense::click_and_drag() } else { Sense::click() };
+    let resp = ui.interact(ro.hit.intersect(clip), id, sense);
+    let color = if resp.hovered() { TOKENS.accent } else { ro.color };
+    let at = ro.align.pos_in_rect(&ro.draw.shrink2(vec2(2.0, 0.0)));
+    p.with_clip_rect(ro.draw.intersect(clip)).text(
+        at + if ro.align == Align2::RIGHT_CENTER { vec2(0.0, -1.0) } else { vec2(0.0, 0.0) },
+        ro.align,
+        &ro.text,
+        ro.font,
+        color,
+    );
+    control(app, ui, &resp, ro.target, 1.0, ro.drag, false);
     if resp.double_clicked() {
-        let _ = app.run("mix.volume", json!({"tracks": [id.0], "db": 0.0}));
+        app.mixer.edit = Some(fine::ReadoutEdit { target: ro.target, salt: ro.salt, text: ro.edit_text, fresh: true });
+    }
+}
+
+/// The in-place text field of a readout being edited: Enter applies, Escape and losing focus
+/// cancel.
+fn edit_field(app: &mut StudioApp, ui: &mut Ui, draw: Rect, id: egui::Id, font: FontId) {
+    let Some(mut e) = app.mixer.edit.take() else { return };
+    let rect = Rect::from_center_size(draw.center(), vec2(draw.width().max(46.0), draw.height().max(16.0)));
+    app.mixer.edit_rect = r4(rect);
+    let (esc, enter) = ui.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Enter)));
+    if e.fresh {
+        e.fresh = false;
+        // Focused with the whole text selected, so typing replaces it.
+        let n = e.text.chars().count();
+        let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(n))));
+        st.store(ui.ctx(), id);
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+    let field = egui::TextEdit::singleline(&mut e.text)
+        .id(id)
+        .font(font)
+        .margin(vec2(3.0, 1.0))
+        .horizontal_align(egui::Align::Center)
+        .desired_width(rect.width());
+    let resp = ui.put(rect, field);
+    if esc {
+        return;
+    }
+    if resp.lost_focus() {
+        if enter {
+            let v = if matches!(e.target, Target::Pan(_)) { fine::parse_pan(&e.text) } else { fine::parse_db(&e.text) };
+            match v {
+                Some(v) => {
+                    let _ = app.set_value(e.target, v);
+                }
+                None => {
+                    app.status =
+                        format!("\"{}\" is not a {}", e.text.trim(), if matches!(e.target, Target::Pan(_)) { "pan position" } else { "level" })
+                }
+            }
+        }
+        return;
+    }
+    app.mixer.edit = Some(e);
+}
+
+/// What a fader, knob or send level does with the pointer, the wheel and the keyboard:
+/// - drag moves it (Shift: ten times finer); a slow drag snaps to a mark;
+/// - double-click (`dbl_reset`), Alt-click, Ctrl-click and Delete reset it (0 dB, or center);
+/// - the wheel nudges it, and the nudges of one gesture are one undo step.
+fn control(app: &mut StudioApp, ui: &Ui, resp: &egui::Response, t: Target, height: f32, drag: bool, dbl_reset: bool) {
+    let (mods, now) = ui.input(|i| (i.modifiers, i.time));
+    if resp.hovered() || resp.dragged() {
+        app.mixer.hover = Some(t);
+        app.mixer.wheel_taken = true;
+    }
+    if (resp.clicked() && (mods.alt || mods.ctrl || mods.command)) || (dbl_reset && resp.double_clicked()) {
+        app.reset_control(t);
+        return;
+    }
+    if drag {
+        if resp.drag_started() {
+            app.engine.end_merge();
+            app.mixer.wheel = None;
+            let raw = app.value_of(t).map_or(0.0, |v| if matches!(t, Target::Pan(_)) { v } else { db_to_k(v) });
+            app.mixer.gesture = Some(MixGesture { target: t, raw, height });
+        }
+        if resp.dragged()
+            && let Some(mut g) = app.mixer.gesture.filter(|g| g.target == t)
+        {
+            let (step, now_delta) = ui.input(|i| {
+                let d = if resp.drag_started() {
+                    i.pointer.press_origin().zip(i.pointer.latest_pos()).map_or(vec2(0.0, 0.0), |(a, b)| b - a)
+                } else {
+                    i.pointer.delta()
+                };
+                (d, i.pointer.delta().length())
+            });
+            let ratio = if mods.shift { fine::FINE } else { 1.0 };
+            let per_px = match t {
+                Target::Fader(_) => -step.y / g.height,
+                Target::Send(..) => (step.x - step.y) / 150.0,
+                Target::Pan(_) => -step.y / 100.0,
+            };
+            let (lo, hi) = if matches!(t, Target::Pan(_)) { (-1.0, 1.0) } else { (0.0, 1.0) };
+            g.raw = (g.raw + per_px * ratio).clamp(lo, hi);
+            app.mixer.gesture = Some(g);
+            let slow = now_delta < fine::SLOW_PT;
+            let v = match t {
+                Target::Pan(_) if slow => fine::snap_pan(g.raw),
+                Target::Pan(_) => g.raw,
+                Target::Fader(_) => {
+                    let db = k_to_db(g.raw);
+                    if slow { fine::snap_db(db, &fine::DB_MARKS) } else { db }
+                }
+                Target::Send(..) => {
+                    let db = k_to_db(g.raw);
+                    if slow { fine::snap_db(db, &fine::SEND_MARKS) } else { db }
+                }
+            };
+            let _ = app.set_value_merged(t, v, None);
+        }
+        if resp.drag_stopped() && app.mixer.gesture.is_some_and(|g| g.target == t) {
+            app.mixer.gesture = None;
+        }
+    }
+    if resp.hovered() && app.mixer.gesture.is_none() {
+        let (notches, shift) = ui.input(|i| {
+            let mut n = 0.0;
+            let mut shift = false;
+            for e in &i.events {
+                if let egui::Event::MouseWheel { unit, delta, modifiers, .. } = e {
+                    let d = if delta.x.abs() > delta.y.abs() { delta.x } else { delta.y };
+                    n += match unit {
+                        egui::MouseWheelUnit::Point => d / 50.0,
+                        _ => d,
+                    };
+                    shift |= modifiers.shift;
+                }
+            }
+            (n, shift)
+        });
+        if notches != 0.0 {
+            app.wheel_nudge(t, notches, shift, resp.rect, now);
+        }
     }
 }

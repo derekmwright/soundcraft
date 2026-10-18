@@ -3,7 +3,7 @@
 
 use crate::StudioApp;
 use crate::theme::{TOKENS, TRANSPORT_H};
-use egui::{Align2, Color32, FontId, Rect, Sense, Shape, Stroke, Ui, pos2, vec2};
+use egui::{Align2, Color32, Rect, Sense, Shape, Stroke, Ui, pos2, vec2};
 use serde_json::json;
 use soundcraft_time::Samples;
 
@@ -126,7 +126,7 @@ pub fn bar(app: &mut StudioApp, ui: &mut Ui) {
 fn readout(ui: &mut Ui, text: &str, w: f32, color: Color32) {
     let (r, _) = ui.allocate_exact_size(vec2(w, 26.0), Sense::hover());
     ui.painter().rect_filled(r, 3.0, TOKENS.bg);
-    ui.painter().text(r.center(), Align2::CENTER_CENTER, text, FontId::monospace(13.0), color);
+    ui.painter().text(r.center(), Align2::CENTER_CENTER, text, crate::theme::mono(ui.ctx(), 13.0), color);
 }
 
 fn main_meter(app: &StudioApp, ui: &mut Ui) {

@@ -236,7 +236,7 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     p.rect_filled(vol, 2.0, TOKENS.bg);
     let db = m.volume_db;
     let text = if db <= -144.0 { "-inf dB".to_string() } else { format!("{db:+.1} dB") };
-    p.text(vol.center(), Align2::CENTER_CENTER, text, FontId::monospace(10.5), if resp.hovered() { TOKENS.accent } else { TOKENS.text });
+    p.text(vol.center(), Align2::CENTER_CENTER, text, crate::theme::mono(ui.ctx(), 10.5), if resp.hovered() { TOKENS.accent } else { TOKENS.text });
     if resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
     }

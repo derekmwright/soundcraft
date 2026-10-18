@@ -10,6 +10,7 @@ pub mod actions;
 pub mod arrange;
 pub mod control;
 pub mod devices;
+pub mod fine;
 pub mod host;
 pub mod menus;
 pub mod mixer;
@@ -408,7 +409,9 @@ impl StudioApp {
         // E7: plug-in editors only work while `Player::idle` runs every frame.
         self.apply_editor_edits();
         self.drive_editors();
-        if !ctx.input(|i| i.pointer.any_down()) && !ctx.egui_wants_keyboard_input() {
+        theme::probe_fonts(ctx);
+        let wheeling = self.drive_wheel(ctx, now);
+        if !wheeling && !ctx.input(|i| i.pointer.any_down()) && !ctx.egui_wants_keyboard_input() {
             self.engine.end_merge();
         }
         self.watch_output();
@@ -546,6 +549,12 @@ impl StudioApp {
             "devices": self.mixer.devices,
             "track_menu": self.arrange.menu,
             "menu_state": {"filter_rect": self.mixer.filter_rect},
+            "readout_edit": self.mixer.edit.as_ref().map(|e| json!({
+                "control": format!("{:?}", e.target),
+                "text": e.text,
+                "rect": self.mixer.edit_rect,
+            })),
+            "wheel_merge": self.mixer.wheel.is_some(),
             "plugin_scan": plugin_scan::inspect(),
         })
     }
