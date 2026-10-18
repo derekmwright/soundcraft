@@ -89,6 +89,9 @@ struct Shared {
     /// Speed × 1000.
     speed: AtomicU32,
     meters: Mutex<MeterSnapshot>,
+    /// A hosted plug-in's editor is open (set by the UI thread each frame): the engine keeps
+    /// running while stopped, because such GUIs initialise and sync through `process` calls.
+    editors_open: AtomicBool,
 }
 
 /// What stopped the audio output.
@@ -365,8 +368,12 @@ impl AudioState {
         // An armed or input-monitoring track keeps the engine running while stopped. An audio
         // track needs the input stream for that; an instrument track runs without one, so it
         // can be played live from its own keyboard or a MIDI device.
+        // A hosted plug-in with its editor open keeps the engine running too: Guitar Rig 7 and
+        // Helix Native initialise their GUIs and sync them with their DSP through `process`
+        // calls, and sit frozen on an idle track until the transport runs.
         let monitoring = self.live_notes > 0
             || self.live_tail > 0
+            || self.shared.editors_open.load(Ordering::Relaxed)
             || self.session.tracks.iter().any(|t| {
                 (t.mixer.input_monitor || t.mixer.record_arm) && (self.input.is_some() || matches!(t.kind, TrackKind::Instrument | TrackKind::Midi))
             });
@@ -575,6 +582,7 @@ impl Player {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
         });
         let want = session.sample_rate.hz();
         let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
@@ -752,6 +760,7 @@ impl Player {
                 out.push((t, slot, id, v));
             }
         }
+        self.shared.editors_open.store(side.editors.values().any(|e| e.is_open()), Ordering::Relaxed);
         out
     }
 
@@ -762,7 +771,11 @@ impl Player {
 
     /// Opens the plugin's own editor window. Main thread only.
     pub fn open_editor(&self, track: TrackId, slot: usize) -> Result<(), String> {
-        self.side().open_editor((track, slot))
+        let r = self.side().open_editor((track, slot));
+        if r.is_ok() {
+            self.shared.editors_open.store(true, Ordering::Relaxed);
+        }
+        r
     }
 
     pub fn close_editor(&self, track: TrackId, slot: usize) {
@@ -1063,6 +1076,7 @@ mod tests {
             playing: AtomicBool::new(true),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
         };
         let fault = Fault::default();
         let mut out = [0.5f32; 8];
@@ -1104,6 +1118,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1122,6 +1137,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1147,6 +1163,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, channel().0);
@@ -1180,6 +1197,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -1380,18 +1398,22 @@ mod tests {
     /// a (track kind, armed, input monitor) cell and whether the engine must run for it while the
     /// transport is stopped and no audio input stream is open. An armed or monitoring instrument runs,
     /// so it can be played from its own keyboard; an idle one does not (no CPU for nothing); an armed
-    /// audio track without an input stream has nothing to monitor. A new cell is one more row.
+    /// audio track without an input stream has nothing to monitor; any track whose hosted plug-in has
+    /// its editor open runs (the GUI needs `process` calls). A new cell is one more row.
     #[test]
     fn stopped_transport_audibility_table() {
         use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+        // (kind, armed, input monitor, a hosted editor open, must run)
         let cells = [
-            (TrackKind::Instrument, true, false, true),
-            (TrackKind::Instrument, false, true, true),
-            (TrackKind::Instrument, false, false, false),
-            (TrackKind::Audio, true, false, false),
-            (TrackKind::Audio, false, true, false),
+            (TrackKind::Instrument, true, false, false, true),
+            (TrackKind::Instrument, false, true, false, true),
+            (TrackKind::Instrument, false, false, false, false),
+            (TrackKind::Instrument, false, false, true, true),
+            (TrackKind::Audio, true, false, false, false),
+            (TrackKind::Audio, false, true, false, false),
+            (TrackKind::Audio, false, false, true, true),
         ];
-        for (kind, armed, monitor, expect_sound) in cells {
+        for (kind, armed, monitor, editor_open, expect_sound) in cells {
             let mut s = Session::default();
             let t = s.add_track(kind, ChannelFormat::Stereo, None);
             let slot = if kind == TrackKind::Instrument { soundcraft_mix::INSTRUMENT_SLOT } else { 0 };
@@ -1411,6 +1433,7 @@ mod tests {
                 playing: AtomicBool::new(false),
                 speed: AtomicU32::new(1000),
                 meters: Mutex::new(MeterSnapshot::default()),
+                editors_open: AtomicBool::new(false),
             });
             let (tx, rx) = channel();
             let (gtx, _grx) = channel();
@@ -1421,12 +1444,13 @@ mod tests {
                 vec![PreparedInstance { track: t, slot, id: "clap:test.tone".into(), ch: 2, plugin: Box::new(plugin) }],
             ))
             .unwrap();
+            shared.editors_open.store(editor_open, Ordering::Relaxed);
             let mut out = vec![0.0f32; 2 * 2048];
             // Two callbacks: the first adopts the instance, the second is steady state.
             st.fill(&mut out, 2);
             st.fill(&mut out, 2);
             let peak = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-            assert_eq!(peak > 0.1, expect_sound, "kind={kind:?} armed={armed} monitor={monitor}: peak {peak}");
+            assert_eq!(peak > 0.1, expect_sound, "kind={kind:?} armed={armed} monitor={monitor} editor_open={editor_open}: peak {peak}");
         }
     }
 
@@ -1495,6 +1519,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -1524,6 +1549,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1559,6 +1585,7 @@ mod tests {
                 playing: AtomicBool::new(false),
                 speed: AtomicU32::new(1000),
                 meters: Mutex::new(MeterSnapshot::default()),
+                editors_open: AtomicBool::new(false),
             });
             let (tx, rx) = channel();
             let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -1589,6 +1616,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
