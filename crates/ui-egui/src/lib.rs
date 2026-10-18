@@ -808,33 +808,26 @@ impl SoundApp {
         Ok(())
     }
 
-    /// Close the input device, if open, with the output stream paused: creating or destroying an
-    /// input stream while the output's callbacks run deadlocks cpal's ASIO host
-    /// (`Player::with_output_paused`).
-    pub fn close_input(&mut self) {
+    /// Done with the input, if open: it goes back to the player (`Player::close_input`), which
+    /// keeps an input it opened with the output (ASIO) and closes any other.
+    fn close_input(&mut self) {
         let Some(r) = self.recorder.take() else { return };
         match &self.player {
-            Some(p) => p.with_output_paused(|| drop(r)),
+            Some(p) => p.close_input(r),
             None => drop(r),
         }
     }
 
-    /// Open the input device once (for recording and input monitoring) and feed the player.
+    /// Take the input once (for recording and input monitoring) from the player and feed the
+    /// player: on ASIO the one it opened with the output, elsewhere a newly opened device.
     fn ensure_input(&mut self) {
-        if self.recorder.is_some() || self.recorder_failed || self.player.is_none() {
+        if self.recorder.is_some() || self.recorder_failed {
             return;
         }
-        // With the output paused: see `close_input`.
-        let audio = &self.ui.audio;
-        let opened = match &self.player {
-            Some(p) => p.with_output_paused(|| soundcraft_playback::record::Recorder::open_with(audio)),
-            None => soundcraft_playback::record::Recorder::open_with(audio),
-        };
-        match opened {
+        let Some(p) = &self.player else { return };
+        match p.open_input(&self.ui.audio) {
             Ok(r) => {
-                if let Some(p) = &self.player {
-                    p.set_input(std::sync::Arc::clone(&r.monitor));
-                }
+                p.set_input(std::sync::Arc::clone(&r.monitor));
                 self.recorder = Some(r);
             }
             Err(e) => {

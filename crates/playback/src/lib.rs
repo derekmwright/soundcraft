@@ -133,13 +133,27 @@ impl Fault {
     }
 }
 
-/// How long to wait after pausing the output for a callback in flight to return: two device
-/// buffer periods (512 frames when the buffer is the device default), clamped to 5..=50 ms.
-#[cfg(not(target_arch = "wasm32"))]
-fn reconfigure_settle(buffer: Option<u32>, rate: u32) -> std::time::Duration {
-    let frames = f64::from(buffer.unwrap_or(512));
-    let ms = 2.0 * frames * 1000.0 / f64::from(rate.max(1));
-    std::time::Duration::from_secs_f64(ms.clamp(5.0, 50.0) / 1000.0)
+/// Whether the player opens the input together with the output, before either runs: on ASIO
+/// when the device has inputs. An ASIO driver has one set of buffers for both directions, and
+/// cpal 0.16 recreates them (stopping the driver) whenever a direction is added; doing that while
+/// the output's callbacks run races cpal's own stream lock and can hang. Opened first, the input
+/// is in place when the output's build creates both directions' buffers at once, and arming
+/// never touches the streams. The input is the output's own driver (one ASIO driver per process),
+/// whatever input the configuration names. Other audio systems open the input on demand, as its
+/// own device. `has_input` is asked only on ASIO.
+fn input_with_output(system: &str, has_input: impl FnOnce() -> bool) -> bool {
+    system == devices::ASIO_SYSTEM && has_input()
+}
+
+/// The input a player opened with its output ([`input_with_output`]).
+enum HeldInput {
+    /// None: the input opens on demand ([`record::Recorder::open_with`]).
+    No,
+    /// The input, while the player holds it (`None` while the UI has it).
+    Held(Option<record::Recorder>),
+    /// It could not open with the output (or the ASIO device has no inputs), and must not open
+    /// later while the output runs.
+    Failed(String),
 }
 
 /// How long a playing output may go without a block before it counts as stalled.
@@ -579,6 +593,8 @@ pub struct Player {
     pub device_buffer: Option<u32>,
     /// True when no audio device could be opened (silent clock).
     pub silent: bool,
+    /// The input opened with the output, on ASIO ([`Player::open_input`]).
+    input: Mutex<HeldInput>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -598,10 +614,6 @@ impl Drop for Player {
             if let Err(e) = stream.pause() {
                 log::debug!("audio stream did not pause at close: {e}");
             }
-            // Two buffer periods (`reconfigure_settle`) for a callback already under way to
-            // finish. Not needed for correctness (the lock below waits for at most one block); it
-            // keeps the take from contending with a running device.
-            std::thread::sleep(reconfigure_settle(self.device_buffer, self.device_rate));
         }
         // Blocking is fine here: the callback holds the lock for one block at most.
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner).take();
@@ -631,33 +643,26 @@ impl Player {
         p
     }
 
-    /// Runs `f` with the output stream paused, for opening or closing the input stream.
-    ///
-    /// cpal's ASIO host (0.16) deadlocks otherwise: building or dropping an input stream
-    /// recreates the driver's buffers under the device's stream mutex (`Device::
-    /// get_or_create_input_stream`), which stops a running driver, and `ASIOStop` waits for the
-    /// callback in flight, which waits for that same mutex. A paused stream's callbacks return
-    /// before taking the mutex, so the output is paused, given two device buffer periods
-    /// (`reconfigure_settle`) for the callback in flight to return, and resumed after `f`.
-    /// Done for every audio system, not only ASIO: elsewhere the pause is a 5–50 ms gap at a
-    /// moment the engine is being reconfigured anyway, and the code needs no backend check.
-    /// Without a stream (silent clock) `f` just runs. `f`'s result is returned even when the
-    /// output does not resume (logged).
-    pub fn with_output_paused<R>(&self, f: impl FnOnce() -> R) -> R {
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(stream) = &self._stream {
-            use cpal::traits::StreamTrait;
-            if let Err(e) = stream.pause() {
-                log::warn!("audio stream failed to pause: {e}");
-            }
-            std::thread::sleep(reconfigure_settle(self.device_buffer, self.device_rate));
-            let out = f();
-            if let Err(e) = stream.play() {
-                log::warn!("audio stream failed to resume: {e}");
-            }
-            return out;
+    /// The audio input, for recording and input monitoring. On ASIO it is the one opened with the
+    /// output ([`input_with_output`]), or the reason it could not open; it never opens while the
+    /// output runs. Elsewhere it opens the input `audio` chooses as its own device.
+    pub fn open_input(&self, audio: &AudioConfig) -> Result<record::Recorder, String> {
+        match &mut *self.input.lock().unwrap_or_else(PoisonError::into_inner) {
+            HeldInput::No => record::Recorder::open_with(audio),
+            HeldInput::Held(r) => r.take().ok_or_else(|| "the audio input is already open".to_string()),
+            HeldInput::Failed(e) => Err(e.clone()),
         }
-        f()
+    }
+
+    /// Done with the input from [`Player::open_input`]: its takes are finished. One opened with
+    /// the output stays open (closing it while the output runs is what must not happen) for the
+    /// next `open_input`; any other closes.
+    pub fn close_input(&self, mut r: record::Recorder) {
+        let mut held = self.input.lock().unwrap_or_else(PoisonError::into_inner);
+        if let HeldInput::Held(slot @ None) = &mut *held {
+            r.finish();
+            *slot = Some(r);
+        }
     }
 
     /// What stopped the audio output, once: a bug in the engine, or the device went away or
@@ -690,7 +695,15 @@ impl Player {
         let side_rate = session.sample_rate.as_f64() as f32;
         let new_side = |garbage: Receiver<Vec<Box<dyn Plugin>>>| Mutex::new(Side::new(side_rate, garbage));
         match open_device(want, want_ch, cfg) {
-            Ok((device, config, format, name)) => {
+            Ok((device, config, format, name, system)) => {
+                let duplex = input_with_output(system, || {
+                    use cpal::traits::DeviceTrait;
+                    device.default_input_config().is_ok()
+                });
+                if duplex && cfg.input.as_ref().is_some_and(|i| *i != name) {
+                    log::warn!("audio input `{}`: on ASIO the input is the output's device, `{name}`", cfg.input.as_deref().unwrap_or_default());
+                }
+                let mut input_error = "no audio input device".to_string();
                 // The chosen buffer size first; if the device refuses it, its default.
                 let mut attempts = vec![config.clone()];
                 if config.buffer_size != cpal::BufferSize::Default {
@@ -705,6 +718,24 @@ impl Player {
                         Arc::new(Mutex::new(Some(AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), f64::from(rate), gtx))));
                     let fault = Arc::new(Fault::default());
                     use cpal::traits::StreamTrait;
+                    // On ASIO the input first, on the output's own device and not started, so the
+                    // output's build creates both directions' buffers with the driver stopped (cpal
+                    // 0.16 `get_or_create_output_stream` takes the input's buffer list along). A
+                    // stream that is not playing returns from its callback before cpal's stream
+                    // lock, so the input's callback cannot meet that rebuild. Same rate and buffer
+                    // as the output: the rebuild sizes both directions at the output's buffer.
+                    let input = if duplex {
+                        match record::Recorder::build_on(&device, rate, config.buffer_size) {
+                            Ok(r) => Some(r),
+                            Err(e) => {
+                                log::warn!("cannot open the audio input with the output: {e}");
+                                input_error = format!("the audio input did not open with the output ({e})");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let built = match format {
                         cpal::SampleFormat::I32 => build_output::<i32>(&device, &config, &state, channels, &fault, &shared),
                         cpal::SampleFormat::I16 => build_output::<i16>(&device, &config, &state, channels, &fault, &shared),
@@ -712,6 +743,19 @@ impl Player {
                     };
                     match built {
                         Ok(stream) => {
+                            let input = match input {
+                                Some(r) => match r.start() {
+                                    Ok(()) => HeldInput::Held(Some(r)),
+                                    Err(e) => {
+                                        log::warn!("audio input failed to start: {e}");
+                                        HeldInput::Failed(format!("the audio input did not start ({e})"))
+                                    }
+                                },
+                                // Never opened later on ASIO: that would recreate the buffers
+                                // under the running output.
+                                None if system == devices::ASIO_SYSTEM => HeldInput::Failed(input_error.clone()),
+                                None => HeldInput::No,
+                            };
                             if let Err(e) = stream.play() {
                                 log::warn!("audio stream failed to start: {e}");
                             }
@@ -737,6 +781,7 @@ impl Player {
                                 device_channels: config.channels,
                                 device_buffer: buffer,
                                 silent: false,
+                                input: Mutex::new(input),
                             };
                         }
                         Err(e) => log::warn!("cannot open audio stream ({:?}): {e}", config.buffer_size),
@@ -824,6 +869,7 @@ impl Player {
             device_channels: 0,
             device_buffer: None,
             silent: true,
+            input: Mutex::new(HeldInput::No),
         }
     }
 
@@ -848,6 +894,7 @@ impl Player {
             device_channels: 0,
             device_buffer: None,
             silent: true,
+            input: Mutex::new(HeldInput::No),
         }
     }
 
@@ -1052,6 +1099,9 @@ impl Side {
     }
 }
 
+/// What [`open_device`] opens: the device, its config and format, its name and the audio system's.
+type OpenedDevice = (cpal::Device, cpal::StreamConfig, cpal::SampleFormat, String, &'static str);
+
 /// ITU stereo fold-down gains for each main channel of a session.
 fn fold_gains(s: &Session) -> [(f32, f32); MAX_CHANNELS] {
     let mut g = [(0.0, 0.0); MAX_CHANNELS];
@@ -1115,7 +1165,8 @@ where
 /// rate) if possible, in the best sample format it offers (f32, else 32- or 16-bit integers),
 /// with as many channels as it offers up to `want_ch` (at least stereo when available), and the
 /// chosen buffer size when the device allows it.
-fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<(cpal::Device, cpal::StreamConfig, cpal::SampleFormat, String), String> {
+/// Also returns the audio system's name.
+fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<OpenedDevice, String> {
     use cpal::traits::DeviceTrait;
     let host = devices::host(cfg).ok_or_else(|| "no audio system".to_string())?;
     let device = devices::device(host, cfg.output.as_deref(), true).ok_or_else(|| "no output device".to_string())?;
@@ -1166,7 +1217,7 @@ fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<(cpal:
             (c, format)
         }
     };
-    Ok((device, config, format, name))
+    Ok((device, config, format, name, host.id().name()))
 }
 
 #[cfg(test)]
@@ -2066,7 +2117,22 @@ mod tests {
     }
 
     #[test]
-    fn with_output_paused_runs_once_and_returns_on_the_silent_clock() {
+    fn only_asio_opens_the_input_with_the_output() {
+        assert!(input_with_output("ASIO", || true), "ASIO with an input device: duplex up front");
+        assert!(!input_with_output("ASIO", || false), "ASIO without inputs: output only");
+        let asked = std::cell::Cell::new(false);
+        let has_input = || {
+            asked.set(true);
+            true
+        };
+        assert!(!input_with_output("WASAPI", has_input), "WASAPI opens the input on demand");
+        assert!(!asked.get(), "the device is not asked off ASIO");
+        for other in ["CoreAudio", "ALSA", "JACK", "asio", ""] {
+            assert!(!input_with_output(other, || true), "{other}");
+        }
+    }
+
+    fn silent_player() -> Player {
         let shared = Arc::new(Shared {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
@@ -2076,24 +2142,37 @@ mod tests {
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
-        let player = Player::silent_clock(shared, tx, rx, 48_000, Mutex::new(Side::new(48_000.0, grx)), gtx);
-        assert!(player._stream.is_none());
-        let mut runs = 0;
-        let out = player.with_output_paused(|| {
-            runs += 1;
-            42
-        });
-        assert_eq!((runs, out), (1, 42));
+        Player::silent_clock(shared, tx, rx, 48_000, Mutex::new(Side::new(48_000.0, grx)), gtx)
     }
 
     #[test]
-    fn reconfigure_settle_is_two_buffers_clamped() {
-        let ms = |b, r| reconfigure_settle(b, r).as_secs_f64() * 1000.0;
-        assert!((ms(Some(128), 48_000) - 5.33).abs() < 0.01, "5.3 ms, at the 5 ms floor: {}", ms(Some(128), 48_000));
-        assert!((ms(Some(32), 48_000) - 5.0).abs() < 0.01, "1.3 ms, clamped up to 5: {}", ms(Some(32), 48_000));
-        assert!((ms(Some(1024), 44_100) - 46.44).abs() < 0.1, "{}", ms(Some(1024), 44_100));
-        assert!((ms(None, 48_000) - 21.33).abs() < 0.1, "512-frame default: {}", ms(None, 48_000));
-        assert!((ms(Some(8192), 48_000) - 50.0).abs() < 0.01, "clamped to 50: {}", ms(Some(8192), 48_000));
-        assert!((ms(Some(128), 0) - 50.0).abs() < 0.01, "a zero rate is not a division by zero");
+    fn an_input_opened_with_the_output_is_reused_and_never_closed() {
+        let player = silent_player();
+        *player.input.lock().unwrap() = HeldInput::Held(Some(record::Recorder::detached("Duplex In")));
+        let r = player.open_input(&AudioConfig::default()).unwrap();
+        assert_eq!(r.device_name, "Duplex In", "the held input, not a new device");
+        assert!(player.open_input(&AudioConfig::default()).is_err(), "it is out once");
+        player.close_input(r);
+        assert!(matches!(&*player.input.lock().unwrap(), HeldInput::Held(Some(_))), "closing gives it back, open");
+        let again = player.open_input(&AudioConfig::default()).unwrap();
+        assert_eq!(again.device_name, "Duplex In");
+    }
+
+    #[test]
+    fn an_input_that_failed_with_the_output_reports_and_does_not_open() {
+        let player = silent_player();
+        *player.input.lock().unwrap() = HeldInput::Failed("no audio input device".into());
+        assert_eq!(player.open_input(&AudioConfig::default()).err().as_deref(), Some("no audio input device"));
+        // A recorder from elsewhere is closed, not kept.
+        player.close_input(record::Recorder::detached("Other"));
+        assert!(matches!(&*player.input.lock().unwrap(), HeldInput::Failed(_)));
+    }
+
+    #[test]
+    fn without_a_duplex_input_closing_drops_the_recorder() {
+        let player = silent_player();
+        assert!(matches!(&*player.input.lock().unwrap(), HeldInput::No), "the silent clock opens inputs on demand");
+        player.close_input(record::Recorder::detached("Mic"));
+        assert!(matches!(&*player.input.lock().unwrap(), HeldInput::No));
     }
 }
