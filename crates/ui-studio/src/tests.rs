@@ -242,3 +242,218 @@ fn alt_drag_onto_its_own_range_is_refused() {
     assert_eq!(clips_on(&app, t), before, "the original is not truncated");
     assert!(app.status.contains("Copy would land"));
 }
+
+// ---- Slice 2: mixer and device chain ----
+
+fn undo_len(app: &mut StudioApp) -> usize {
+    app.engine.execute("engine.history", &json!({})).unwrap()["undo"].as_array().unwrap().len()
+}
+
+fn click(app: &mut StudioApp, at: (f32, f32)) {
+    let (req, _rx) = crate::ControlRequest::new("ui.click", json!({"x": at.0, "y": at.1}));
+    let ctx = egui::Context::default();
+    let _ = crate::control::handle_for_test(app, &ctx, &req);
+}
+
+fn mid(r: [f32; 4]) -> (f32, f32) {
+    ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0)
+}
+
+/// An app with the mixer pane open and a stereo audio track; returns (app, ctx, time, track).
+fn mixer_app() -> (StudioApp, egui::Context, f64, TrackId) {
+    let mut app = app();
+    let r = app.run("track.new", json!({"kind": "audio", "format": "stereo", "name": "Gtr"})).unwrap();
+    let t = TrackId(r["tracks"][0].as_u64().unwrap());
+    app.ui.show_mixer = true;
+    app.ui.show_devices = true;
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    frames(&mut app, &ctx, 3, &mut time);
+    (app, ctx, time, t)
+}
+
+fn strip(app: &StudioApp, t: TrackId) -> crate::mixer::StripLayout {
+    app.mixer.layout.strips.iter().find(|s| s.track == t.0).cloned().unwrap()
+}
+
+#[test]
+fn fader_and_balance_laws_round_trip() {
+    use crate::mixer::{balance_of, db_to_k, k_to_db, pans_for};
+    for db in [-60.0f32, -24.0, -6.0, 0.0, 6.0, 12.0] {
+        assert!((k_to_db(db_to_k(db)) - db).abs() < 0.01, "{db}");
+    }
+    assert_eq!(db_to_k(-144.0), 0.0);
+    assert_eq!(k_to_db(0.0), -144.0);
+    assert!((db_to_k(12.0) - 1.0).abs() < 1e-6);
+    assert_eq!(pans_for(0.0, 2), vec![-1.0, 1.0], "center keeps the stereo image");
+    assert_eq!(pans_for(-1.0, 2), vec![-1.0, -1.0]);
+    assert_eq!(pans_for(1.0, 2), vec![1.0, 1.0]);
+    assert_eq!(pans_for(0.5, 1), vec![0.5]);
+    for b in [-1.0f32, -0.3, 0.0, 0.4, 1.0] {
+        assert!((balance_of(&pans_for(b, 2)) - b).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn a_fader_drag_is_one_undo_step() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    let f = strip(&app, t).fader;
+    let k0 = crate::mixer::db_to_k(0.0);
+    let cap_y = f[3] - k0 * (f[3] - f[1]);
+    let x = (f[0] + f[2]) / 2.0;
+    let before = undo_len(&mut app);
+    drag(&mut app, (x, cap_y), (x, cap_y + 40.0), json!({}));
+    frames(&mut app, &ctx, 30, &mut time);
+    let db = app.engine.session().track(t).unwrap().mixer.volume_db;
+    assert!(db < -3.0, "the fader went down: {db}");
+    assert_eq!(undo_len(&mut app), before + 1, "one gesture, one undo step");
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(app.engine.session().track(t).unwrap().mixer.volume_db, 0.0);
+}
+
+#[test]
+fn the_pan_knob_is_a_balance_control() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    let k = mid(strip(&app, t).knob);
+    let before = undo_len(&mut app);
+    // 50 points up: half way to the right.
+    drag(&mut app, k, (k.0, k.1 - 50.0), json!({}));
+    frames(&mut app, &ctx, 30, &mut time);
+    let s = strip(&app, t);
+    assert!((s.balance - 0.5).abs() < 0.03, "{}", s.balance);
+    let pan = app.engine.session().track(t).unwrap().mixer.pan.clone();
+    let want = crate::mixer::pans_for(s.balance, 2);
+    assert!((pan[0] - want[0]).abs() < 1e-5 && (pan[1] - want[1]).abs() < 1e-5, "{pan:?} vs {want:?}");
+    assert_eq!(undo_len(&mut app), before + 1, "both panners, one undo step");
+}
+
+#[test]
+fn plus_inserts_a_built_in_device_and_bypass_and_remove_round_trip() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    app.focus(t);
+    frames(&mut app, &ctx, 3, &mut time);
+    assert_eq!(app.mixer.devices.track, Some(t.0));
+    assert!(app.mixer.devices.cards.is_empty());
+    let at = mid(app.mixer.devices.add);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 6, &mut time);
+    let item = app.mixer.devices.menu.iter().find(|m| m.value == "gain").cloned().expect("the + menu lists the built-in Gain");
+    assert!(app.mixer.devices.menu.iter().all(|m| !m.value.contains(':')), "no hosted plug-ins in a hermetic test");
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    let ins = app.engine.session().track(t).unwrap().mixer.inserts.clone();
+    assert_eq!(ins.iter().flatten().map(|i| i.plugin.as_str()).collect::<Vec<_>>(), vec!["gain"]);
+    let card = app.mixer.devices.cards.first().cloned().expect("a device card");
+    assert_eq!((card.slot, card.plugin.as_str()), (Some(0), "gain"));
+    assert!(!card.editor_enabled, "no editor without a player");
+    click(&mut app, mid(card.bypass_button));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert!(app.engine.session().track(t).unwrap().mixer.inserts[0].as_ref().unwrap().bypass);
+    assert!(app.mixer.devices.cards[0].bypass);
+    click(&mut app, mid(card.bypass_button));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert!(!app.engine.session().track(t).unwrap().mixer.inserts[0].as_ref().unwrap().bypass);
+    click(&mut app, mid(card.remove_button));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert!(app.engine.session().track(t).unwrap().mixer.inserts.iter().all(Option::is_none));
+    assert!(app.mixer.devices.cards.is_empty());
+}
+
+#[test]
+fn the_instrument_is_the_first_device() {
+    let mut app = app();
+    let r = app.run("track.new", json!({"kind": "instrument"})).unwrap();
+    let t = TrackId(r["tracks"][0].as_u64().unwrap());
+    app.add_device(t, "gain").unwrap();
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    frames(&mut app, &ctx, 3, &mut time);
+    let cards = &app.mixer.devices.cards;
+    assert_eq!(cards.iter().map(|c| c.slot).collect::<Vec<_>>(), vec![None, Some(0)]);
+    assert_eq!(cards[0].plugin, "subtractive_synth");
+}
+
+#[test]
+fn the_output_dropdown_runs_track_output() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    let r = app.run("track.new", json!({"kind": "audio", "name": "Vox"})).unwrap();
+    let t2 = TrackId(r["tracks"][0].as_u64().unwrap());
+    let fx = app.add_fx_channel().unwrap();
+    frames(&mut app, &ctx, 3, &mut time);
+    let at = mid(strip(&app, t).output);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 6, &mut time);
+    let item = app.mixer.layout.menu.iter().find(|m| m.label == "FX 1").cloned().expect("the FX channel is offered by name");
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    app.run("track.output", json!({"tracks": [t2.0], "output": item.value})).unwrap();
+    let s = app.engine.session();
+    let (a, b) = (s.track(t).unwrap().mixer.output.clone(), s.track(t2).unwrap().mixer.output.clone());
+    assert_eq!(a, b, "the dropdown and the command agree");
+    assert_eq!(s.track(fx).unwrap().mixer.input, a, "the FX channel listens to that bus");
+    assert_eq!(strip(&app, t).output_label, "FX 1");
+}
+
+#[test]
+fn add_fx_channel_is_one_undo_step() {
+    let mut app = app();
+    let r = app.run("track.new", json!({"kind": "audio", "name": "Gtr"})).unwrap();
+    let t = TrackId(r["tracks"][0].as_u64().unwrap());
+    app.focus(t);
+    let before = undo_len(&mut app);
+    let tracks = app.engine.session().tracks.len();
+    let fx = app.add_fx_channel().unwrap();
+    let s = app.engine.session();
+    let aux = s.track(fx).unwrap();
+    assert_eq!(aux.kind, soundcraft_model::TrackKind::Aux);
+    let bus = s.bus_by_name("FX 1").unwrap().id;
+    assert_eq!(aux.mixer.input, soundcraft_model::Route::Bus(bus));
+    let send = s.track(t).unwrap().mixer.sends.iter().flatten().next().unwrap();
+    assert_eq!(send.target, soundcraft_model::Route::Bus(bus));
+    assert_eq!(undo_len(&mut app), before + 1);
+    app.run("edit.undo", json!({})).unwrap();
+    let s = app.engine.session();
+    assert_eq!(s.tracks.len(), tracks);
+    assert!(s.bus_by_name("FX 1").is_none() && s.track(t).unwrap().mixer.sends.iter().all(Option::is_none));
+    // A second one gets the next name and its own undo step.
+    app.run("edit.redo", json!({})).unwrap();
+    app.add_fx_channel().unwrap();
+    assert!(app.engine.session().bus_by_name("FX 2").is_some());
+    assert_eq!(undo_len(&mut app), before + 2);
+}
+
+#[test]
+fn focus_follows_both_views_and_views_never_dirty_the_document() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    let r = app.run("track.new", json!({"kind": "instrument", "name": "Keys"})).unwrap();
+    let t2 = TrackId(r["tracks"][0].as_u64().unwrap());
+    let path = std::env::temp_dir().join(format!("transit-mixer-{}.sc", std::process::id()));
+    app.run("session.save_as", json!({"path": path.to_string_lossy(), "replace": true})).unwrap();
+    frames(&mut app, &ctx, 3, &mut time);
+    // Mixer to arrangement: click the first strip's name.
+    let at = mid(strip(&app, t).name_rect);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 6, &mut time);
+    assert_eq!(app.focus_track(), Some(t));
+    assert_eq!(app.engine.session().edit.selected_tracks, vec![t], "the arrangement's selected track");
+    assert_eq!(app.mixer.devices.track, Some(t.0));
+    // Arrangement to mixer: click the second track's header.
+    let hdr = app.arrange.layout.tracks.iter().find(|r| r.id == t2.0).unwrap().header;
+    click(&mut app, (hdr[0] + 30.0, (hdr[1] + hdr[3]) / 2.0));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert_eq!(app.focus_track(), Some(t2));
+    assert_eq!(app.mixer.devices.track, Some(t2.0));
+    // View toggles: F3 twice, Ctrl+Alt+M and Ctrl+Alt+L are view state only.
+    for (key, mods) in [("F3", json!({})), ("F3", json!({})), ("M", json!({"cmd": true, "alt": true})), ("L", json!({"cmd": true, "alt": true}))] {
+        let mut p = json!({"key": key});
+        if let (Some(o), Some(m)) = (p.as_object_mut(), mods.as_object()) {
+            o.extend(m.clone());
+        }
+        let (req, _rx) = crate::ControlRequest::new("ui.key", p);
+        let _ = crate::control::handle_for_test(&mut app, &ctx, &req);
+        frames(&mut app, &ctx, 4, &mut time);
+    }
+    assert!(!app.ui.show_mixer && !app.ui.show_devices && !app.ui.mixer_full, "{:?}", (app.ui.show_mixer, app.ui.show_devices, app.ui.mixer_full));
+    assert!(!app.engine.is_dirty(), "focus and panes are view state");
+    let _ = std::fs::remove_file(&path);
+}
