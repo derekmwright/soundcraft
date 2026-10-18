@@ -703,7 +703,7 @@ impl Player {
             Ok((device, config, format, name, system)) => {
                 let duplex = input_with_output(system, || {
                     use cpal::traits::DeviceTrait;
-                    device.default_input_config().is_ok()
+                    device.default_input_config().is_ok_and(|c| record::input_usable(&c))
                 });
                 if duplex && cfg.input.as_ref().is_some_and(|i| *i != name) {
                     log::warn!("audio input `{}`: on ASIO the input is the output's device, `{name}`", cfg.input.as_deref().unwrap_or_default());

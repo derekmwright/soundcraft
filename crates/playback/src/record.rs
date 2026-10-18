@@ -188,6 +188,12 @@ where
     )
 }
 
+/// Whether an input config can be opened: some drivers report a default input with no channels,
+/// and building a stream with 0 channels reaches `unreachable!` in asio-sys.
+pub(crate) fn input_usable(config: &cpal::SupportedStreamConfig) -> bool {
+    config.channels() > 0
+}
+
 /// The input config at `rate` when the device offers it (so input and output run together: the
 /// best format first, then the most channels), else the device default, in a format we read.
 #[cfg(not(target_os = "freebsd"))]
@@ -197,7 +203,12 @@ fn input_config(device: &cpal::Device, rate: Option<u32>) -> Result<cpal::Suppor
         device
             .supported_input_configs()
             .ok()?
-            .filter(|c| crate::devices::format_rank(c.sample_format()).is_some() && c.min_sample_rate().0 <= r && c.max_sample_rate().0 >= r)
+            .filter(|c| {
+                c.channels() > 0
+                    && crate::devices::format_rank(c.sample_format()).is_some()
+                    && c.min_sample_rate().0 <= r
+                    && c.max_sample_rate().0 >= r
+            })
             .min_by_key(|c| (crate::devices::format_rank(c.sample_format()), std::cmp::Reverse(c.channels())))
             .map(|c| c.with_sample_rate(cpal::SampleRate(r)))
     });
@@ -205,6 +216,9 @@ fn input_config(device: &cpal::Device, rate: Option<u32>) -> Result<cpal::Suppor
         Some(c) => c,
         None => device.default_input_config().map_err(|e| e.to_string())?,
     };
+    if !input_usable(&cfg) {
+        return Err("the audio input has no channels".to_string());
+    }
     let format = cfg.sample_format();
     if crate::devices::format_rank(format).is_none() {
         return Err(format!("unsupported input sample format {format:?}"));
@@ -795,6 +809,14 @@ mod ring_tests {
         ring.push(&input[..2 * 256]);
         ring.pop_into(&mut out, 256, 48_000);
         assert_eq!(out[0][0], 0.0);
+    }
+
+    /// A device whose input reports no channels is not an input (asio-sys would hit `unreachable!`).
+    #[test]
+    fn an_input_with_no_channels_is_unusable() {
+        let cfg = |ch| cpal::SupportedStreamConfig::new(ch, cpal::SampleRate(48_000), cpal::SupportedBufferSize::Unknown, cpal::SampleFormat::F32);
+        assert!(!super::input_usable(&cfg(0)));
+        assert!(super::input_usable(&cfg(2)));
     }
 
     /// Nothing buffered: silence, not stale data.
