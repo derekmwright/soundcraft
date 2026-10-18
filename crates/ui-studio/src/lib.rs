@@ -495,6 +495,7 @@ impl StudioApp {
             "window_size": [size.x, size.y],
             "playing": self.is_playing(),
             "recording": self.engine.transport.recording,
+            "input_open": self.recorder.is_some(),
             "position": self.position(),
             "cursor": self.cursor(),
             "cursor_track": self.cursor_track(),
