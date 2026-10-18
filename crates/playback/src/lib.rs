@@ -1238,6 +1238,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -1331,6 +1332,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
