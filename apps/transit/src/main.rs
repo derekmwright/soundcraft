@@ -50,10 +50,16 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.0.run_or_ask("app.quit", serde_json::json!({}));
         }
-        let (inner, maximized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().maximized.unwrap_or(false)));
-        self.0.ui.window_maximized = maximized;
-        if let Some(r) = inner.filter(|_| !maximized) {
-            self.0.ui.window_size = (r.size() * ctx.zoom_factor()).round().into();
+        // Maximize after the window exists: `with_maximized` on Windows only sets the WS_MAXIMIZE
+        // style at creation, so the window reports maximized yet keeps its normal size.
+        if START_MAXIMIZED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        } else {
+            let (inner, maximized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().maximized.unwrap_or(false)));
+            self.0.ui.window_maximized = maximized;
+            if let Some(r) = inner.filter(|_| !maximized) {
+                self.0.ui.window_size = (r.size() * ctx.zoom_factor()).round().into();
+            }
         }
         let dirty = if self.0.engine.is_dirty() { " *" } else { "" };
         set_title(ctx, format!("{}{dirty} — transitDAW", self.0.engine.session().name));
@@ -98,6 +104,9 @@ fn open_path(app: &mut StudioApp, p: &str) {
         log::warn!("{p}: {e}");
     }
 }
+
+/// Set in `main` when the window should start maximized (first launch, or it was when last closed).
+static START_MAXIMIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn prefs_path() -> Option<std::path::PathBuf> {
     config::config_dir().map(|b| b.join("ui.json"))
@@ -202,13 +211,16 @@ fn main() -> eframe::Result {
     }
 
     let engine = if demo { soundcraft_engine::demo::demo_engine() } else { Engine::default() };
-    let prefs = load_prefs().unwrap_or_default();
+    let loaded = load_prefs();
+    // First launch (no preferences yet) opens maximized.
+    let mut prefs = loaded.unwrap_or_else(|| UiState { window_maximized: true, ..UiState::default() });
+    START_MAXIMIZED.store(prefs.window_maximized, std::sync::atomic::Ordering::Relaxed);
+    prefs.window_maximized = false;
     #[allow(unused_mut)]
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("transitDAW")
             .with_inner_size(sane_window_size(prefs.window_size))
-            .with_maximized(prefs.window_maximized)
             .with_min_inner_size([960.0, 600.0])
             .with_drag_and_drop(true)
             .with_app_id("transitdaw"),
