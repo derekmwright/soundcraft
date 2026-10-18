@@ -29,7 +29,7 @@ pub use devices::AudioConfig;
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
-use soundcraft_model::{Session, TrackId};
+use soundcraft_model::{Session, TrackId, TrackKind};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
@@ -352,9 +352,14 @@ impl AudioState {
     fn fill(&mut self, out: &mut [f32], channels: usize) {
         self.drain();
         let channels = channels.max(1);
+        // An armed or input-monitoring track keeps the engine running while stopped. An audio
+        // track needs the input stream for that; an instrument track runs without one, so it
+        // can be played live from its own keyboard or a MIDI device.
         let monitoring = self.live_notes > 0
             || self.live_tail > 0
-            || self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
+            || self.session.tracks.iter().any(|t| {
+                (t.mixer.input_monitor || t.mixer.record_arm) && (self.input.is_some() || matches!(t.kind, TrackKind::Instrument | TrackKind::Midi))
+            });
         if !self.playing && !monitoring {
             out.iter_mut().for_each(|x| *x = 0.0);
             if let Ok(mut m) = self.shared.meters.try_lock() {
