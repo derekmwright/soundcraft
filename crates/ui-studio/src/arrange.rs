@@ -287,12 +287,14 @@ fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, ha
             let lists = app.instrument_lists();
             let current = app.engine.session().track(id).and_then(|t| t.instrument.as_ref()).map(|i| i.plugin.clone());
             let mut filter = std::mem::take(&mut app.mixer.instrument_filter);
+            let mut filter_rect = app.mixer.filter_rect;
             let mut items = Vec::new();
-            picked = crate::devices::instrument_menu(ui, &lists, current.as_deref(), &mut filter, &mut items);
+            picked = crate::devices::instrument_menu(ui, &lists, current.as_deref(), &mut filter, &mut filter_rect, &mut items);
             app.mixer.instrument_filter = filter;
+            app.mixer.filter_rect = filter_rect;
             app.arrange.menu.extend(items);
         });
-        app.arrange.menu.push(crate::mixer::MenuItem { label: "Instrument".into(), value: String::new(), rect: r4(button.rect) });
+        app.arrange.menu.push(crate::mixer::MenuItem { label: "Instrument".into(), value: String::new(), rect: r4(button.rect), visible: true });
         if let Some(plugin) = picked {
             app.mixer.instrument_filter.clear();
             let _ = app.set_instrument(id, &plugin);

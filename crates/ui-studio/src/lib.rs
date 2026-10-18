@@ -545,6 +545,7 @@ impl StudioApp {
             "mixer": self.mixer.layout,
             "devices": self.mixer.devices,
             "track_menu": self.arrange.menu,
+            "menu_state": {"filter_rect": self.mixer.filter_rect},
             "plugin_scan": plugin_scan::inspect(),
         })
     }

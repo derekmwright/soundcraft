@@ -143,7 +143,7 @@ pub fn chain(app: &mut StudioApp, ui: &mut Ui) {
             ui.label(egui::RichText::new("Built-in").color(TOKENS.text_dim).size(10.5));
             for e in &builtin {
                 let b = ui.add(egui::Button::new(e.name.as_str()).right_text(egui::RichText::new(&e.category).color(TOKENS.text_dim).size(10.0)));
-                menu.push(MenuItem { label: e.name.clone(), value: e.id.clone(), rect: r4(b.rect) });
+                menu.push(MenuItem::at(ui, e.name.clone(), e.id.clone(), b.rect));
                 if b.clicked() {
                     picked = Some(e.id.clone());
                     ui.close();
@@ -286,12 +286,14 @@ fn card(
         c.pick_button = r4(pick);
         let resp = resp.on_hover_text(if ins.is_some() { "Replace the instrument" } else { "Choose an instrument" });
         let mut filter = std::mem::take(&mut app.mixer.instrument_filter);
+        let mut filter_rect = app.mixer.filter_rect;
         let mut picked = None;
         egui::Popup::menu(&resp).width(260.0).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
             let lists = app.instrument_lists();
-            picked = instrument_menu(ui, &lists, ins.map(|i| i.plugin.as_str()), &mut filter, menu);
+            picked = instrument_menu(ui, &lists, ins.map(|i| i.plugin.as_str()), &mut filter, &mut filter_rect, menu);
         });
         app.mixer.instrument_filter = filter;
+        app.mixer.filter_rect = filter_rect;
         if let Some(id) = picked {
             app.mixer.instrument_filter.clear();
             let _ = app.set_instrument(t, &id);
@@ -362,11 +364,20 @@ impl StudioApp {
 /// The instrument menu's contents: a filter box when the list is long, built-in instruments,
 /// then VST3 and CLAP instruments grouped by vendor. Returns the id picked (the caller runs
 /// `mix.instrument` through [`StudioApp::set_instrument`]). Entries go to `menu` for `ui.inspect`.
-pub fn instrument_menu(ui: &mut Ui, lists: &InstrumentLists, current: Option<&str>, filter: &mut String, menu: &mut Vec<MenuItem>) -> Option<String> {
+pub fn instrument_menu(
+    ui: &mut Ui,
+    lists: &InstrumentLists,
+    current: Option<&str>,
+    filter: &mut String,
+    filter_rect: &mut crate::arrange::R4,
+    menu: &mut Vec<MenuItem>,
+) -> Option<String> {
     let mut picked = None;
     let total = lists.builtin.len() + lists.vst3.as_ref().map_or(0, Vec::len) + lists.clap.as_ref().map_or(0, Vec::len);
     if total > FILTER_OVER {
-        ui.add(egui::TextEdit::singleline(filter).hint_text("Filter").desired_width(f32::INFINITY));
+        *filter_rect = r4(ui.add(egui::TextEdit::singleline(filter).hint_text("Filter").desired_width(f32::INFINITY)).rect);
+    } else {
+        *filter_rect = Default::default();
     }
     let f = filter.trim().to_lowercase();
     let keep = |name: &str, vendor: &str| f.is_empty() || name.to_lowercase().contains(&f) || vendor.to_lowercase().contains(&f);
@@ -375,7 +386,7 @@ pub fn instrument_menu(ui: &mut Ui, lists: &InstrumentLists, current: Option<&st
     };
     let mut item = |ui: &mut Ui, id: &str, label: &str, picked: &mut Option<String>| {
         let b = ui.add(egui::Button::selectable(current == Some(id), label));
-        menu.push(MenuItem { label: label.to_string(), value: id.to_string(), rect: r4(b.rect) });
+        menu.push(MenuItem::at(ui, label.to_string(), id.to_string(), b.rect));
         if b.clicked() {
             *picked = Some(id.to_string());
             ui.close();

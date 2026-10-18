@@ -69,6 +69,15 @@ pub struct MenuItem {
     pub label: String,
     pub value: String,
     pub rect: R4,
+    /// False while the entry is scrolled out of its menu's view (a click there would miss).
+    pub visible: bool,
+}
+
+impl MenuItem {
+    /// An entry drawn in `ui` at `rect`, visible when its center is inside the ui's clip.
+    pub fn at(ui: &Ui, label: String, value: String, rect: Rect) -> Self {
+        MenuItem { label, value, rect: r4(rect), visible: ui.clip_rect().contains(rect.center()) }
+    }
 }
 
 /// One strip as last drawn, with the values it shows.
@@ -172,6 +181,8 @@ pub struct MixerState {
     pub(crate) names: std::collections::HashMap<String, String>,
     /// The instrument menu's filter text (shown when the list is long).
     pub instrument_filter: String,
+    /// Where the instrument menu's filter box was last drawn (for `ui.inspect`).
+    pub filter_rect: R4,
     /// Gestures started, to give each composite its own merge key.
     serial: u64,
 }
@@ -749,7 +760,7 @@ fn choice_menu(resp: &egui::Response, current: &str, choices: &[(String, String)
                 ui.separator();
             }
             let b = ui.add(egui::Button::selectable(label == current, label.as_str()));
-            menu.push(MenuItem { label: label.clone(), value: value.clone(), rect: r4(b.rect) });
+            menu.push(MenuItem::at(ui, label.clone(), value.clone(), b.rect));
             if b.clicked() {
                 picked = Some(value.clone());
                 ui.close();
@@ -844,13 +855,19 @@ pub(crate) fn send_row(
     {
         let _ = app.retarget_send(id, slot, &v);
     }
-    resp.context_menu(|ui| {
+    // Its own popup id: `Popup::context_menu` closes the popup on a primary click, which would
+    // otherwise be the retarget menu's (both default to the response's id).
+    egui::Popup::context_menu(&resp).id(resp.id.with("send_ctx")).show(|ui| {
         let label = if snd.pre_fader { "Post-fader" } else { "Pre-fader" };
-        if ui.button(label).clicked() {
+        let b = ui.button(label);
+        menu.push(MenuItem::at(ui, label.into(), "pre".into(), b.rect));
+        if b.clicked() {
             let _ = app.set_send_pre(id, slot, !snd.pre_fader);
             ui.close();
         }
-        if ui.button("Remove Send").clicked() {
+        let b = ui.button("Remove Send");
+        menu.push(MenuItem::at(ui, "Remove Send".into(), "remove".into(), b.rect));
+        if b.clicked() {
             let _ = app.remove_send(id, slot);
             ui.close();
         }

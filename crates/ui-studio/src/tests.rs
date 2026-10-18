@@ -576,7 +576,7 @@ fn a_long_instrument_list_filters_and_groups_by_vendor() {
     let mut items = Vec::new();
     let mut filter = "arturia".to_string();
     let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-        instrument_menu(ui, &lists, None, &mut filter, &mut items);
+        instrument_menu(ui, &lists, None, &mut filter, &mut Default::default(), &mut items);
     });
     out.textures_delta.clear();
     assert_eq!(items.len(), 10, "{items:?}");
@@ -734,4 +734,57 @@ fn the_device_chain_lists_the_sends_with_pre_and_post() {
     click(&mut app, at);
     frames(&mut app, &ctx, 6, &mut time);
     assert!(app.engine.session().track(t).unwrap().mixer.sends.iter().all(Option::is_none));
+}
+
+fn click_right(app: &mut StudioApp, at: (f32, f32)) {
+    let (req, _rx) = crate::ControlRequest::new("ui.click", json!({"x": at.0, "y": at.1, "button": "right"}));
+    let ctx = egui::Context::default();
+    let _ = crate::control::handle_for_test(app, &ctx, &req);
+}
+
+#[test]
+fn a_send_target_click_retargets_and_a_right_click_has_pre_post_and_remove() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    app.new_fx_channel(Some(t), 0.0).unwrap();
+    app.new_fx_channel(None, 0.0).unwrap();
+    app.focus(t);
+    frames(&mut app, &ctx, 3, &mut time);
+    let send = |app: &StudioApp| app.engine.session().track(t).unwrap().mixer.sends[0].clone().unwrap();
+    for wide in [false, true] {
+        let menu_of = |app: &StudioApp| if wide { app.mixer.devices.menu.clone() } else { app.mixer.layout.menu.clone() };
+        let row_of = |app: &StudioApp| if wide { app.mixer.devices.sends[0].clone() } else { strip(app, t).sends[0].clone() };
+        let pre0 = send(&app).pre_fader;
+        // A primary click opens the retarget menu and none of the context items.
+        let at = mid(row_of(&app).target_rect);
+        click(&mut app, at);
+        frames(&mut app, &ctx, 6, &mut time);
+        let menu = menu_of(&app);
+        let labels: Vec<&str> = menu.iter().map(|m| m.label.as_str()).collect();
+        assert!(labels.contains(&"FX 1") && labels.contains(&"FX 2"), "targets listed (wide={wide}): {labels:?}");
+        assert!(!labels.iter().any(|l| l.ends_with("-fader") || *l == "Remove Send"), "no context items: {labels:?}");
+        let cur = send(&app).target;
+        let current = row_of(&app).target;
+        let pick = menu.iter().find(|m| m.label != current && !m.value.is_empty()).cloned().expect("another target");
+        click(&mut app, mid(pick.rect));
+        frames(&mut app, &ctx, 6, &mut time);
+        assert_ne!(send(&app).target, cur, "picking {} retargeted (wide={wide})", pick.label);
+        // A right-click opens only the context items; Pre-fader toggles the send.
+        let at = mid(row_of(&app).target_rect);
+        click_right(&mut app, at);
+        frames(&mut app, &ctx, 6, &mut time);
+        let labels: Vec<String> = menu_of(&app).iter().map(|m| m.label.clone()).collect();
+        assert_eq!(labels, ["Pre-fader", "Remove Send"], "only the context items (wide={wide})");
+        let item = menu_of(&app).into_iter().find(|m| m.label == "Pre-fader").unwrap();
+        click(&mut app, mid(item.rect));
+        frames(&mut app, &ctx, 6, &mut time);
+        assert_eq!(send(&app).pre_fader, !pre0, "Pre-fader toggled (wide={wide})");
+        // Back to post for the next pass.
+        let at = mid(row_of(&app).target_rect);
+        click_right(&mut app, at);
+        frames(&mut app, &ctx, 6, &mut time);
+        let item = menu_of(&app).into_iter().find(|m| m.label == "Post-fader").expect("Post-fader");
+        click(&mut app, mid(item.rect));
+        frames(&mut app, &ctx, 6, &mut time);
+        assert_eq!(send(&app).pre_fader, pre0);
+    }
 }
