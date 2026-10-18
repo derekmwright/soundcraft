@@ -1,0 +1,227 @@
+//! What the arrangement's gestures and shortcuts do, as engine commands. Nothing here changes
+//! the session except through `Engine::execute` (and the cursor, see `StudioApp::set_cursor`).
+
+use crate::StudioApp;
+use serde_json::{Value, json};
+use soundcraft_model::{ClipId, TrackId, TrackKind};
+use soundcraft_time::{Range, Samples};
+
+impl StudioApp {
+    /// The selected clips and their tracks, in session order.
+    pub fn selected_clips(&self) -> Vec<(TrackId, ClipId, Range)> {
+        let s = self.engine.session();
+        let sel = &s.edit.selected_clips;
+        let mut out = Vec::new();
+        for t in &s.tracks {
+            for c in t.clips() {
+                if sel.contains(&c.id) {
+                    out.push((t.id, c.id, Range::new(c.start, c.end())));
+                }
+            }
+        }
+        out
+    }
+
+    fn clip_ids(&self) -> Vec<ClipId> {
+        self.engine.session().tracks.iter().flat_map(|t| t.clips().iter().map(|c| c.id)).collect()
+    }
+
+    /// Click on a clip: select it (`additive` adds it to or removes it from the selection).
+    pub fn click_clip(&mut self, clip: ClipId, additive: bool) {
+        let mut clips: Vec<u64> = if additive { self.engine.session().edit.selected_clips.iter().map(|c| c.0).collect() } else { Vec::new() };
+        if additive && clips.contains(&clip.0) {
+            clips.retain(|c| *c != clip.0);
+        } else {
+            clips.push(clip.0);
+        }
+        if clips.is_empty() {
+            let _ = self.run("edit.select_none", json!({}));
+        } else {
+            let _ = self.run("edit.select", json!({"clips": clips}));
+        }
+    }
+
+    /// Click on empty timeline: deselect the clips, select the track and put the cursor there.
+    /// While playing, the playhead jumps there too (Ableton).
+    pub fn click_empty(&mut self, track: Option<TrackId>, at: Samples) {
+        let at = at.max(0);
+        let params = match track {
+            Some(t) => json!({"tracks": [t.0], "start": at}),
+            None => json!({"start": at}),
+        };
+        let _ = self.run("edit.select", params);
+        self.set_cursor(at, track);
+        self.locate_playing(at);
+    }
+
+    /// Click on the ruler: the cursor moves (and a running playhead), the selection stays.
+    pub fn click_ruler(&mut self, at: Samples) {
+        let at = at.max(0);
+        self.set_cursor(at, None);
+        self.locate_playing(at);
+    }
+
+    /// Move `clips` by `by` samples, the first one's track to `to_track` when given.
+    pub fn move_clips(&mut self, clips: &[ClipId], by: Samples, to_track: Option<TrackId>) -> Result<Value, String> {
+        let ids: Vec<u64> = clips.iter().map(|c| c.0).collect();
+        let mut p = json!({"clips": ids, "by": by});
+        if let Some(t) = to_track {
+            p["track"] = json!(t.0);
+        }
+        self.run("edit.move_clips", p)
+    }
+
+    /// Alt-drag: a copy of `clip` lands at `at` on `to_track`; the original stays and the copy is
+    /// selected. Built from Copy and Paste (one undo step: Copy has none); the clipboard is
+    /// restored afterwards so the gesture doesn't replace what the user copied.
+    pub fn copy_clip_to(&mut self, clip: ClipId, at: Samples, to_track: TrackId) -> Result<Value, String> {
+        let Some((from, range)) = self.engine.session().find_clip(clip).map(|(t, c)| (t, Range::new(c.start, c.end()))) else {
+            return Err("no such clip".into());
+        };
+        let before = self.clip_ids();
+        let clipboard = self.engine.clipboard.clone();
+        let copied = self.run("edit.copy", json!({"tracks": [from.0], "start": range.start, "end": range.end}));
+        let pasted = copied.and_then(|_| self.run("edit.paste", json!({"tracks": [to_track.0], "at": at.max(0)})));
+        self.engine.clipboard = clipboard;
+        let pasted = pasted?;
+        let new: Vec<u64> = self.clip_ids().into_iter().filter(|c| !before.contains(c)).map(|c| c.0).collect();
+        if !new.is_empty() {
+            let _ = self.run("edit.select", json!({"clips": new}));
+        }
+        Ok(pasted)
+    }
+
+    /// Trim one edge of a clip to `to`.
+    pub fn trim_clip(&mut self, clip: ClipId, start_edge: bool, to: Samples) -> Result<Value, String> {
+        let edge = if start_edge { "start" } else { "end" };
+        self.run("edit.trim_clip", json!({"clip": clip.0, edge: to.max(0)}))
+    }
+
+    /// Split at the cursor: the selected clips under the cursor, or else every clip under the
+    /// cursor on the cursor's track.
+    pub fn split_at_cursor(&mut self) -> Result<Value, String> {
+        let at = self.cursor();
+        let mut tracks: Vec<u64> = Vec::new();
+        for (t, _, r) in self.selected_clips() {
+            if r.start < at && at < r.end && !tracks.contains(&t.0) {
+                tracks.push(t.0);
+            }
+        }
+        if tracks.is_empty() {
+            let Some(t) = self.cursor_track() else {
+                self.status = "Split: put the cursor on a clip first.".into();
+                return Err(self.status.clone());
+            };
+            tracks.push(t.0);
+        }
+        self.run("edit.separate", json!({"tracks": tracks, "at": at}))
+    }
+
+    /// Delete the selected clips (only them, not the time range they cover).
+    pub fn delete_selected(&mut self) -> Result<Value, String> {
+        let sel = self.selected_clips();
+        if sel.is_empty() {
+            return Ok(json!({"removed": 0}));
+        }
+        let mut tracks: Vec<u64> = sel.iter().map(|(t, _, _)| t.0).collect();
+        tracks.dedup();
+        let clips: Vec<u64> = sel.iter().map(|(_, c, _)| c.0).collect();
+        // An empty range with clips named removes exactly those clips (`cmd/edit.rs` `clear`).
+        self.run("edit.clear", json!({"tracks": tracks, "clips": clips, "start": 0, "end": 0}))
+    }
+
+    /// The tracks and range covering the selected clips.
+    fn selection_span(&self) -> Option<(Vec<u64>, Range)> {
+        let sel = self.selected_clips();
+        let first = sel.first()?;
+        let mut range = first.2;
+        let mut tracks = Vec::new();
+        for (t, _, r) in &sel {
+            range = Range::new(range.start.min(r.start), range.end.max(r.end));
+            if !tracks.contains(&t.0) {
+                tracks.push(t.0);
+            }
+        }
+        Some((tracks, range))
+    }
+
+    /// Copy the selected clips.
+    pub fn copy_selected(&mut self, cut: bool) -> Result<Value, String> {
+        let Some((tracks, range)) = self.selection_span() else {
+            self.status = "Nothing selected to copy.".into();
+            return Err(self.status.clone());
+        };
+        let r = self.run(if cut { "edit.cut" } else { "edit.copy" }, json!({"tracks": tracks, "start": range.start, "end": range.end}))?;
+        self.copied = if cut { Vec::new() } else { tracks.iter().map(|t| (TrackId(*t), range)).collect() };
+        Ok(r)
+    }
+
+    /// Paste at the cursor, on the cursor's track (and the ones below it for a multi-track copy).
+    /// Never onto the copied clips themselves: Paste there would silently replace the original
+    /// (UX gap 2026-10-18, plan 06), so it is refused with a hint.
+    pub fn paste_at_cursor(&mut self) -> Result<Value, String> {
+        let at = self.cursor();
+        let len = self.engine.clipboard.length;
+        let lanes = self.engine.clipboard.tracks.len().max(1);
+        let s = self.engine.session();
+        let first = self.cursor_track().or_else(|| s.edit.selected_tracks.first().copied()).or_else(|| s.tracks.first().map(|t| t.id));
+        let Some(first) = first else {
+            self.status = "Paste: add a track first.".into();
+            return Err(self.status.clone());
+        };
+        let start = s.tracks.iter().position(|t| t.id == first).unwrap_or(0);
+        let tracks: Vec<TrackId> = s.tracks.iter().skip(start).filter(|t| t.kind.has_playlist()).take(lanes).map(|t| t.id).collect();
+        let target = Range::new(at, at.saturating_add(len.max(1)));
+        if self.copied.iter().any(|(t, r)| tracks.contains(t) && r.start < target.end && target.start < r.end) {
+            self.status = "Paste would land on the copied clip and replace it: click where it should go first.".into();
+            return Err(self.status.clone());
+        }
+        let before = self.clip_ids();
+        let ids: Vec<u64> = tracks.iter().map(|t| t.0).collect();
+        let r = self.run("edit.paste", json!({"tracks": ids, "at": at}))?;
+        let new: Vec<u64> = self.clip_ids().into_iter().filter(|c| !before.contains(c)).map(|c| c.0).collect();
+        if !new.is_empty() {
+            let _ = self.run("edit.select", json!({"clips": new}));
+        }
+        Ok(r)
+    }
+
+    /// Duplicate the selected clips right after themselves (Ctrl+D).
+    pub fn duplicate_selected(&mut self) -> Result<Value, String> {
+        let Some((tracks, range)) = self.selection_span() else { return Ok(json!({})) };
+        let before = self.clip_ids();
+        let r = self.run("edit.duplicate", json!({"tracks": tracks, "start": range.start, "end": range.end}))?;
+        let new: Vec<u64> = self.clip_ids().into_iter().filter(|c| !before.contains(c)).map(|c| c.0).collect();
+        if !new.is_empty() {
+            let _ = self.run("edit.select", json!({"clips": new}));
+        }
+        Ok(r)
+    }
+
+    /// Add a track (Add Track): `audio` or `instrument`. It becomes the cursor's track.
+    pub fn add_track(&mut self, kind: &str) -> Result<Value, String> {
+        let p = if kind == "audio" { json!({"kind": "audio", "format": "stereo"}) } else { json!({"kind": kind}) };
+        let r = self.run("track.new", p)?;
+        if let Some(id) = r.get("tracks").and_then(|t| t.get(0)).and_then(Value::as_u64) {
+            let at = self.cursor();
+            self.set_cursor(at, Some(TrackId(id)));
+        }
+        Ok(r)
+    }
+
+    /// A one-bar MIDI clip at the cursor on the cursor's track (MIDI or instrument tracks).
+    pub fn new_midi_clip(&mut self, track: Option<TrackId>) -> Result<Value, String> {
+        let s = self.engine.session();
+        let Some(t) = track.or_else(|| self.cursor_track()).and_then(|t| s.track(t)).filter(|t| t.kind.is_midi()).map(|t| t.id) else {
+            self.status = "New MIDI clip: click on an instrument track first.".into();
+            return Err(self.status.clone());
+        };
+        let at = self.cursor();
+        self.run("midi.new_clip", json!({"tracks": [t.0], "start": at, "end": at}))
+    }
+
+    /// Whether the track can hold clips (not a master, aux or VCA fader).
+    pub fn holds_clips(&self, t: TrackId) -> bool {
+        self.engine.session().track(t).is_some_and(|t| t.kind.has_playlist() && t.kind != TrackKind::Video)
+    }
+}

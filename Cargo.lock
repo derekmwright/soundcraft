@@ -3779,6 +3779,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-ui-studio"
+version = "0.8.0"
+dependencies = [
+ "egui",
+ "image",
+ "log",
+ "serde",
+ "serde_json",
+ "soundcraft-clap-host",
+ "soundcraft-engine",
+ "soundcraft-midi",
+ "soundcraft-mix",
+ "soundcraft-model",
+ "soundcraft-playback",
+ "soundcraft-time",
+ "soundcraft-vst3-host",
+]
+
+[[package]]
 name = "soundcraft-video"
 version = "0.8.0"
 dependencies = [
@@ -4256,6 +4275,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "transit"
+version = "0.8.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "log",
+ "rfd",
+ "serde_json",
+ "soundcraft-engine",
+ "soundcraft-playback",
+ "soundcraft-ui-studio",
 ]
 
 [[package]]
