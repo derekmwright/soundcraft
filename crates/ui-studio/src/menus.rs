@@ -105,6 +105,11 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         let _ = app.new_midi_clip(None);
                         ui.close();
                     }
+                    let unused = crate::mixer::orphan_busses(&app.engine.session_arc()).len();
+                    if unused > 0 && ui.button(format!("Remove unused buses ({unused})")).clicked() {
+                        let _ = app.remove_unused_busses();
+                        ui.close();
+                    }
                 });
                 ui.menu_button("View", |ui| {
                     let u = &mut app.ui;

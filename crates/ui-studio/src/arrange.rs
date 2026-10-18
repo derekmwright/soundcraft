@@ -326,8 +326,10 @@ fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, ha
         }
     });
     ui.separator();
-    if ui.button("Delete Track").clicked() {
-        let _ = app.run("track.delete", json!({"tracks": [id.0]}));
+    let del = ui.button("Delete Track");
+    app.arrange.menu.push(crate::mixer::MenuItem::at(ui, "Delete Track".into(), String::new(), del.rect));
+    if del.clicked() {
+        let _ = app.delete_track(id);
         ui.close();
     }
 }

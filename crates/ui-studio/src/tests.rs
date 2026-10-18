@@ -1542,3 +1542,108 @@ fn clearing_the_main_meter_clears_the_master_tracks_meter_and_back() {
     app.reset_meters(None);
     assert!(!app.main_meter.clip && !app.meters[&master].clip, "Ctrl-click clears everything");
 }
+
+fn status_of(app: &StudioApp) -> String {
+    app.status.clone()
+}
+
+#[test]
+fn deleting_an_fx_channel_takes_its_bus_and_sends_in_one_undo_step() {
+    let (mut app, _ctx, _time, t) = mixer_app();
+    let fx = app.new_fx_channel(Some(t), -7.0).unwrap();
+    let before = undo_len(&mut app);
+    app.delete_track(fx).unwrap();
+    let s = app.engine.session();
+    assert!(s.track(fx).is_none() && s.busses.is_empty(), "track and bus gone");
+    assert!(s.track(t).unwrap().mixer.sends.iter().all(Option::is_none), "the send is gone");
+    assert_eq!(status_of(&app), "Removed FX 1 and its send");
+    assert_eq!(undo_len(&mut app), before + 1, "one undo entry");
+    app.run("edit.undo", json!({})).unwrap();
+    let s = app.engine.session();
+    let bus = s.bus_by_name("FX 1").expect("bus is back").id;
+    assert_eq!(s.track(fx).unwrap().mixer.input, soundcraft_model::Route::Bus(bus));
+    let send = s.track(t).unwrap().mixer.sends[0].clone().expect("send is back");
+    assert_eq!((send.target, send.level_db), (soundcraft_model::Route::Bus(bus), -7.0));
+}
+
+#[test]
+fn deleting_an_fx_channel_with_two_senders_says_so() {
+    let (mut app, _ctx, _time, t) = mixer_app();
+    let v = new_track(&mut app, json!({"kind": "audio", "name": "Vox"}));
+    let fx = app.new_fx_channel(Some(t), 0.0).unwrap();
+    app.add_send(v, "FX 1").unwrap();
+    let before = undo_len(&mut app);
+    app.delete_track(fx).unwrap();
+    assert_eq!(status_of(&app), "Removed FX 1 and its 2 sends");
+    assert_eq!(undo_len(&mut app), before + 1);
+    assert!(app.engine.session().busses.is_empty());
+}
+
+#[test]
+fn deleting_an_fx_channel_whose_bus_feeds_another_aux_keeps_the_bus() {
+    let (mut app, _ctx, _time, t) = mixer_app();
+    let fx = app.new_fx_channel(Some(t), 0.0).unwrap();
+    let other = new_track(&mut app, json!({"kind": "aux", "format": "stereo", "name": "Sub"}));
+    app.run("track.input", json!({"tracks": [other.0], "input": "FX 1"})).unwrap();
+    app.delete_track(fx).unwrap();
+    let s = app.engine.session();
+    assert!(s.track(fx).is_none());
+    assert!(s.bus_by_name("FX 1").is_some(), "the bus stays for the other aux");
+    assert!(s.track(t).unwrap().mixer.sends[0].is_some(), "and its send");
+    assert!(status_of(&app).contains("bus stays"));
+}
+
+#[test]
+fn delete_key_on_a_selected_fx_track_runs_the_composite() {
+    let (mut app, _ctx, _time, t) = mixer_app();
+    let fx = app.new_fx_channel(Some(t), 0.0).unwrap();
+    app.run("edit.select", json!({"tracks": [fx.0]})).unwrap();
+    app.delete_selected().unwrap();
+    let s = app.engine.session();
+    assert!(s.track(fx).is_none() && s.busses.is_empty());
+}
+
+#[test]
+fn track_header_menu_delete_uses_the_composite() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    let fx = app.new_fx_channel(Some(t), 0.0).unwrap();
+    app.ui.show_mixer = false;
+    frames(&mut app, &ctx, 4, &mut time);
+    let hdr = app.arrange.layout.tracks.iter().find(|r| r.id == fx.0).unwrap().header;
+    let head_mid = (hdr[0] + 30.0, (hdr[1] + hdr[3]) / 2.0);
+    right_click(&mut app, head_mid);
+    frames(&mut app, &ctx, 6, &mut time);
+    let item = app.arrange.menu.iter().find(|m| m.label == "Delete Track").cloned().expect("Delete Track");
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert!(app.engine.session().busses.is_empty(), "the bus went with it");
+}
+
+#[test]
+fn orphan_buses_leave_the_routing_menus_and_one_entry_removes_them() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    app.run("mix.new_bus", json!({"name": "Lost 1"})).unwrap();
+    app.run("mix.new_bus", json!({"name": "Lost 2"})).unwrap();
+    let fx = app.new_fx_channel(Some(t), 0.0).unwrap();
+    frames(&mut app, &ctx, 3, &mut time);
+    // The + Send menu: the FX channel, never the orphans, and the entry at the end.
+    let at = mid(strip(&app, t).output);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 6, &mut time);
+    let labels: Vec<String> = app.mixer.layout.menu.iter().map(|m| m.label.clone()).collect();
+    assert!(labels.contains(&"FX 1".to_string()), "{labels:?}");
+    assert!(!labels.iter().any(|l| l.contains("Lost")), "{labels:?}");
+    assert_eq!(labels.last().map(String::as_str), Some("Remove unused buses (2)"));
+    let s = app.engine.session_arc();
+    assert!(crate::mixer::send_targets(&s, s.track(fx).unwrap(), None).is_empty());
+    assert!(!crate::mixer::input_choices(&s, s.track(t).unwrap(), 2).iter().any(|(l, _)| l.contains("Lost")));
+    let before = undo_len(&mut app);
+    let item = app.mixer.layout.menu.last().cloned().unwrap();
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    let names: Vec<String> = app.engine.session().busses.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names, vec!["FX 1"], "both orphans removed");
+    assert_eq!(undo_len(&mut app), before + 1, "one undo entry");
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(app.engine.session().busses.len(), 3);
+}

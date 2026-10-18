@@ -48,6 +48,8 @@ pub struct MixGesture {
 
 /// The value a "+ Send" menu entry carries for "New FX Channel…".
 pub const NEW_FX: &str = "\u{1}new-fx-channel";
+/// The value of the "Remove unused buses (n)" entry that ends the send, output and input menus.
+pub const REMOVE_UNUSED: &str = "\u{1}remove-unused-busses";
 
 /// One send row as last drawn (a strip's or the device chain's).
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -217,7 +219,7 @@ pub struct MixerState {
     /// Where the instrument menu's filter box was last drawn (for `ui.inspect`).
     pub filter_rect: R4,
     /// Gestures started, to give each composite its own merge key.
-    serial: u64,
+    pub(crate) serial: u64,
     /// A readout being edited in place.
     pub edit: Option<fine::ReadoutEdit>,
     /// Where the editing field was last drawn (for `ui.inspect`).
@@ -281,6 +283,24 @@ fn meter_k(lin: f32) -> f32 {
     ((20.0 * lin.log10() + 60.0) / 66.0).clamp(0.0, 1.0)
 }
 
+/// The busses nobody listens to (no track has one as its input): nobody hears them.
+pub fn orphan_busses(s: &Session) -> Vec<BusId> {
+    s.busses.iter().filter(|b| !heard(s, b.id)).map(|b| b.id).collect()
+}
+
+/// Whether any track listens to `bus`.
+fn heard(s: &Session, bus: BusId) -> bool {
+    s.tracks.iter().any(|t| t.mixer.input == Route::Bus(bus))
+}
+
+/// Ends a routing menu with "Remove unused buses (n)" when the session has orphans.
+fn push_unused_entry(s: &Session, choices: &mut Vec<(String, String)>) {
+    let n = orphan_busses(s).len();
+    if n > 0 {
+        choices.push((format!("Remove unused buses ({n})"), REMOVE_UNUSED.into()));
+    }
+}
+
 /// The aux track fed by `bus`, if any: an FX or group channel.
 fn channel_of_bus(s: &Session, bus: BusId) -> Option<&Track> {
     s.tracks.iter().find(|t| t.kind == TrackKind::Aux && t.mixer.input == Route::Bus(bus))
@@ -341,7 +361,7 @@ pub fn send_targets(s: &Session, t: &Track, except: Option<usize>) -> Vec<(Strin
         t.mixer.sends.iter().enumerate().filter(|(i, _)| Some(*i) != except).filter_map(|(_, x)| x.as_ref()).map(|x| &x.target).collect();
     s.busses
         .iter()
-        .filter(|b| !taken.contains(&&Route::Bus(b.id)) && !feeding_loops(s, t, b.id))
+        .filter(|b| !taken.contains(&&Route::Bus(b.id)) && !feeding_loops(s, t, b.id) && heard(s, b.id))
         .map(|b| (bus_label(s, b.id), b.name.clone()))
         .collect()
 }
@@ -379,7 +399,7 @@ pub fn output_choices(s: &Session, t: &Track) -> Vec<(String, String)> {
     let mut v = vec![("Main".to_string(), "main".to_string())];
     for b in &s.busses {
         // Never a bus that comes back to this track's input, however many hops away.
-        if feeding_loops(s, t, b.id) {
+        if feeding_loops(s, t, b.id) || (!heard(s, b.id) && t.mixer.output != Route::Bus(b.id)) {
             continue;
         }
         v.push((bus_label(s, b.id), b.name.clone()));
@@ -404,7 +424,7 @@ pub fn input_choices(s: &Session, t: &Track, device_inputs: usize) -> Vec<(Strin
         }
     }
     for b in &s.busses {
-        if listening_loops(s, t, b.id) {
+        if listening_loops(s, t, b.id) || !heard(s, b.id) {
             continue;
         }
         v.push((format!("Bus: {}", b.name), b.name.clone()));
@@ -951,7 +971,7 @@ fn choice_menu(resp: &egui::Response, current: &str, choices: &[(String, String)
             ui.weak("Nothing to pick");
         }
         for (label, value) in choices {
-            if value == NEW_FX {
+            if value == NEW_FX || value == REMOVE_UNUSED {
                 ui.separator();
             }
             let b = ui.add(egui::Button::selectable(label == current, label.as_str()));
@@ -1053,11 +1073,16 @@ pub(crate) fn send_row(
     if !choices.iter().any(|(l, _)| *l == target) {
         choices.insert(0, (target.clone(), String::new()));
     }
+    push_unused_entry(s, &mut choices);
     if let Some(v) = choice_menu(&resp, &target, &choices, menu)
         && !v.is_empty()
         && v != target
     {
-        let _ = app.retarget_send(id, slot, &v);
+        if v == REMOVE_UNUSED {
+            let _ = app.remove_unused_busses();
+        } else {
+            let _ = app.retarget_send(id, slot, &v);
+        }
     }
     // Its own popup id: `Popup::context_menu` closes the popup on a primary click, which would
     // otherwise be the retarget menu's (both default to the response's id).
@@ -1153,8 +1178,13 @@ pub(crate) fn add_send_row(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Tr
     p.text(pos2(r.min.x + 4.0, r.center().y), Align2::LEFT_CENTER, "+ Send", FontId::proportional(10.5), TOKENS.text_dim);
     let mut choices = send_targets(s, t, None);
     choices.push(("New FX Channel…".into(), NEW_FX.into()));
+    push_unused_entry(s, &mut choices);
     if let Some(v) = choice_menu(&resp, "", &choices, menu) {
-        let _ = app.add_send(t.id, &v);
+        if v == REMOVE_UNUSED {
+            let _ = app.remove_unused_busses();
+        } else {
+            let _ = app.add_send(t.id, &v);
+        }
     }
     r4(r)
 }
@@ -1374,9 +1404,14 @@ fn strip(
     let in_r = Rect::from_min_size(pos2(x0, y), vec2(w, 16.0));
     if matches!(t.kind, TrackKind::Audio | TrackKind::Aux) {
         let cur = route_label(s, &m.input, true, if t.kind == TrackKind::Audio { t.channels() } else { 0 });
-        let choices = input_choices(s, t, app.device_inputs());
+        let mut choices = input_choices(s, t, app.device_inputs());
+        push_unused_entry(s, &mut choices);
         if let Some(v) = dropdown(ui, clip, in_r, ui.id().with(("input", id.0)), &cur, &choices, menu) {
-            let _ = app.set_input(id, &v);
+            if v == REMOVE_UNUSED {
+                let _ = app.remove_unused_busses();
+            } else {
+                let _ = app.set_input(id, &v);
+            }
         }
         sl.input = r4(in_r);
         sl.input_label = cur;
@@ -1394,9 +1429,14 @@ fn strip(
     // Output.
     let out_r = Rect::from_min_size(pos2(x0, y), vec2(w, 16.0));
     let cur = route_label(s, &m.output, false, t.channels());
-    let choices = output_choices(s, t);
+    let mut choices = output_choices(s, t);
+    push_unused_entry(s, &mut choices);
     if let Some(v) = dropdown(ui, clip, out_r, ui.id().with(("output", id.0)), &cur, &choices, menu) {
-        let _ = app.set_output(id, &v);
+        if v == REMOVE_UNUSED {
+            let _ = app.remove_unused_busses();
+        } else {
+            let _ = app.set_output(id, &v);
+        }
     }
     sl.output = r4(out_r);
     sl.output_label = cur;

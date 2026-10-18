@@ -3,7 +3,7 @@
 
 use crate::StudioApp;
 use serde_json::{Value, json};
-use soundcraft_model::{ClipId, TrackId, TrackKind};
+use soundcraft_model::{ClipId, Route, TrackId, TrackKind};
 use soundcraft_time::{Range, Samples};
 
 impl StudioApp {
@@ -132,13 +132,114 @@ impl StudioApp {
     pub fn delete_selected(&mut self) -> Result<Value, String> {
         let sel = self.selected_clips();
         if sel.is_empty() {
-            return Ok(json!({"removed": 0}));
+            // No clips: Delete takes the selected tracks (never the master).
+            let s = self.engine.session();
+            let tracks: Vec<TrackId> =
+                s.edit.selected_tracks.iter().copied().filter(|t| s.track(*t).is_some_and(|t| t.kind != TrackKind::Master)).collect();
+            for t in &tracks {
+                let _ = self.delete_track(*t);
+            }
+            return Ok(json!({"removed": 0, "tracks": tracks.len()}));
         }
         let mut tracks: Vec<u64> = sel.iter().map(|(t, _, _)| t.0).collect();
         tracks.dedup();
         let clips: Vec<u64> = sel.iter().map(|(_, c, _)| c.0).collect();
         // An empty range with clips named removes exactly those clips (`cmd/edit.rs` `clear`).
         self.run("edit.clear", json!({"tracks": tracks, "clips": clips, "start": 0, "end": 0}))
+    }
+
+    /// Delete a track. An FX channel (an aux track listening to a bus) takes its bus with it when
+    /// nothing else listens to or feeds the bus, and its senders' sends to it go first: one undo
+    /// step. If other tracks listen to or feed the bus, only the track goes.
+    pub fn delete_track(&mut self, t: TrackId) -> Result<Value, String> {
+        let s = self.engine.session_arc();
+        let Some(track) = s.track(t) else { return Err("no such track".into()) };
+        let name = track.name.clone();
+        let bus = match (&track.kind, &track.mixer.input) {
+            (TrackKind::Aux, Route::Bus(b)) => Some(*b),
+            _ => None,
+        };
+        let Some(bus) = bus else { return self.run("track.delete", json!({"tracks": [t.0]})) };
+        let (listeners, feeders, senders) = s.bus_usage(bus);
+        if listeners != [t] || !feeders.is_empty() {
+            let r = self.run("track.delete", json!({"tracks": [t.0]}));
+            if r.is_ok() {
+                self.status = format!("Deleted {name}; its bus stays, other tracks use it");
+            }
+            return r;
+        }
+        let mut sends: Vec<(u64, usize)> = Vec::new();
+        for id in &senders {
+            for (slot, x) in s.track(*id).map(|x| x.mixer.sends.iter().enumerate()).into_iter().flatten() {
+                if x.as_ref().is_some_and(|x| x.target == Route::Bus(bus)) {
+                    sends.push((id.0, slot));
+                }
+            }
+        }
+        self.mixer.serial += 1;
+        let key = format!("delete-fx:{}", self.mixer.serial);
+        self.engine.end_merge();
+        let r = (|| {
+            let e = &mut self.engine;
+            for (id, slot) in &sends {
+                e.execute_merged("mix.send_remove", &json!({"track": id, "slot": slot}), &key)?;
+            }
+            let r = e.execute_merged("track.delete", &json!({"tracks": [t.0]}), &key)?;
+            e.execute_merged("mix.remove_bus", &json!({"bus": bus.0}), &key)?;
+            Ok::<Value, soundcraft_engine::EngineError>(r)
+        })();
+        self.engine.end_merge();
+        match r {
+            Ok(r) => {
+                self.status = match sends.len() {
+                    0 => format!("Removed {name}"),
+                    1 => format!("Removed {name} and its send"),
+                    n => format!("Removed {name} and its {n} sends"),
+                };
+                Ok(r)
+            }
+            Err(e) => {
+                if !std::sync::Arc::ptr_eq(&s, &self.engine.session_arc()) {
+                    self.engine.undo();
+                }
+                self.status = format!("Delete {name}: {e}");
+                Err(self.status.clone())
+            }
+        }
+    }
+
+    /// Remove every bus nobody listens to, as one undo step.
+    pub fn remove_unused_busses(&mut self) -> Result<Value, String> {
+        let s = self.engine.session_arc();
+        let orphans = crate::mixer::orphan_busses(&s);
+        if orphans.is_empty() {
+            self.status = "No unused buses".into();
+            return Ok(json!({"removed": 0}));
+        }
+        self.mixer.serial += 1;
+        let key = format!("remove-unused:{}", self.mixer.serial);
+        self.engine.end_merge();
+        let r = (|| {
+            for b in &orphans {
+                // `force`: a bus nobody hears may still have sends and outputs; they are cleared.
+                self.engine.execute_merged("mix.remove_bus", &json!({"bus": b.0, "force": true}), &key)?;
+            }
+            Ok::<(), soundcraft_engine::EngineError>(())
+        })();
+        self.engine.end_merge();
+        match r {
+            Ok(()) => {
+                self.status = format!("Removed {} unused bus{}", orphans.len(), if orphans.len() == 1 { "" } else { "es" });
+                Ok(json!({"removed": orphans.len()}))
+            }
+            Err(e) => {
+                if !std::sync::Arc::ptr_eq(&s, &self.engine.session_arc()) {
+                    self.engine.undo();
+                }
+                self.status = format!("Remove unused buses: {e}");
+                Err(self.status.clone())
+            }
+        }
     }
 
     /// The tracks and range covering the selected clips.
