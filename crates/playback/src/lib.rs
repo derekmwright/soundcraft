@@ -1346,6 +1346,90 @@ mod tests {
         assert_eq!(dropped_on, Some(here), "teardown must run on the player's thread, not the audio thread: {log:?}");
     }
 
+    /// Puts out a constant level whenever it is processed, so a test can hear whether a track ran.
+    struct Tone {
+        inner: Box<dyn Plugin>,
+    }
+
+    impl Plugin for Tone {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.inner.info()
+        }
+        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+            self.inner.prepare(sr, mb, ch);
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.inner.set_param(id, v)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.inner.param(id)
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            for ch in io.iter_mut() {
+                for x in ch.iter_mut().take(frames) {
+                    *x = 0.5;
+                }
+            }
+        }
+    }
+
+    /// Gate (silent armed instrument, 2026-10-17): the stopped-transport audibility table. Each row is
+    /// a (track kind, armed, input monitor) cell and whether the engine must run for it while the
+    /// transport is stopped and no audio input stream is open. An armed or monitoring instrument runs,
+    /// so it can be played from its own keyboard; an idle one does not (no CPU for nothing); an armed
+    /// audio track without an input stream has nothing to monitor. A new cell is one more row.
+    #[test]
+    fn stopped_transport_audibility_table() {
+        use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+        let cells = [
+            (TrackKind::Instrument, true, false, true),
+            (TrackKind::Instrument, false, true, true),
+            (TrackKind::Instrument, false, false, false),
+            (TrackKind::Audio, true, false, false),
+            (TrackKind::Audio, false, true, false),
+        ];
+        for (kind, armed, monitor, expect_sound) in cells {
+            let mut s = Session::default();
+            let t = s.add_track(kind, ChannelFormat::Stereo, None);
+            let slot = if kind == TrackKind::Instrument { soundcraft_mix::INSTRUMENT_SLOT } else { 0 };
+            {
+                let tr = s.track_mut(t).unwrap();
+                tr.mixer.record_arm = armed;
+                tr.mixer.input_monitor = monitor;
+                if slot == soundcraft_mix::INSTRUMENT_SLOT {
+                    tr.instrument = Some(Insert::new("clap:test.tone"));
+                } else {
+                    tr.mixer.inserts[0] = Some(Insert::new("clap:test.tone"));
+                }
+            }
+            let s = Arc::new(s);
+            let shared = Arc::new(Shared {
+                position: AtomicI64::new(0),
+                playing: AtomicBool::new(false),
+                speed: AtomicU32::new(1000),
+                meters: Mutex::new(MeterSnapshot::default()),
+            });
+            let (tx, rx) = channel();
+            let (gtx, _grx) = channel();
+            let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, gtx);
+            let plugin = Tone { inner: soundcraft_dsp::create("gain").unwrap() };
+            tx.send(Cmd::Session(
+                Arc::clone(&s),
+                vec![PreparedInstance { track: t, slot, id: "clap:test.tone".into(), ch: 2, plugin: Box::new(plugin) }],
+            ))
+            .unwrap();
+            let mut out = vec![0.0f32; 2 * 2048];
+            // Two callbacks: the first adopts the instance, the second is steady state.
+            st.fill(&mut out, 2);
+            st.fill(&mut out, 2);
+            let peak = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            assert_eq!(peak > 0.1, expect_sound, "kind={kind:?} armed={armed} monitor={monitor}: peak {peak}");
+        }
+    }
+
     #[test]
     fn plugin_states_are_read_without_the_audio_thread() {
         let mut side = Side::new(48_000.0, channel().1);
