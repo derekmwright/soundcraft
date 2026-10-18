@@ -4288,6 +4288,7 @@ dependencies = [
  "serde_json",
  "soundcraft-engine",
  "soundcraft-playback",
+ "soundcraft-ui-egui",
  "soundcraft-ui-studio",
 ]
 

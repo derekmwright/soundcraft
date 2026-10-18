@@ -21,7 +21,7 @@ are bundled.
 
 ## Fonts
 
-SoundCraft bundles no font files. It uses the default fonts shipped inside the `egui` crate
+SoundCraft bundles no font files; the transit app bundles Inter and JetBrains Mono (rows under Files). SoundCraft uses the default fonts shipped inside the `egui` crate
 (Ubuntu-Light: Ubuntu Font Licence 1.0; Hack: MIT; Noto Emoji: OFL-1.1; emoji-icon-font: OFL-1.1/MIT)
 and, at runtime, the operating system's own UI fonts when available (never redistributed).
 
@@ -45,3 +45,12 @@ and, at runtime, the operating system's own UI fonts when available (never redis
 | `assets/app-icon/soundcraft.ico` | SoundCraft contributors | original, rendered from `icon.svg` | MIT OR Apache-2.0 |
 | `assets/app-icon/hicolor/` | SoundCraft contributors | original, rendered from `icon.svg` (16–512 px PNGs and the scalable SVG) | MIT OR Apache-2.0 |
 | `docs/images/` | SoundCraft contributors | screenshots of SoundCraft rendered from the synthesised demo session | MIT OR Apache-2.0 |
+| `apps/transit/assets/fonts/inter/Inter-Regular.ttf` | The Inter Project Authors | Inter 4.1, https://github.com/rsms/inter | SIL OFL 1.1 (`apps/transit/assets/fonts/inter/OFL.txt`); modified: tabular figures (tnum) and ss02 frozen as defaults with opentype-feature-freezer; family renamed Inter Tab |
+| `apps/transit/assets/fonts/inter/Inter-Medium.ttf` | The Inter Project Authors | Inter 4.1, https://github.com/rsms/inter | SIL OFL 1.1 (`apps/transit/assets/fonts/inter/OFL.txt`); modified: tabular figures (tnum) and ss02 frozen as defaults with opentype-feature-freezer; family renamed Inter Tab |
+| `apps/transit/assets/fonts/inter/Inter-SemiBold.ttf` | The Inter Project Authors | Inter 4.1, https://github.com/rsms/inter | SIL OFL 1.1 (`apps/transit/assets/fonts/inter/OFL.txt`); modified: tabular figures (tnum) and ss02 frozen as defaults with opentype-feature-freezer; family renamed Inter Tab |
+| `apps/transit/assets/fonts/inter/Inter-Bold.ttf` | The Inter Project Authors | Inter 4.1, https://github.com/rsms/inter | SIL OFL 1.1 (`apps/transit/assets/fonts/inter/OFL.txt`); modified: tabular figures (tnum) and ss02 frozen as defaults with opentype-feature-freezer; family renamed Inter Tab |
+| `apps/transit/assets/fonts/inter/OFL.txt` | The Inter Project Authors | license text | SIL OFL 1.1 |
+| `apps/transit/assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf` | The JetBrains Mono Project Authors | JetBrains Mono 2.304, https://github.com/JetBrains/JetBrainsMono | SIL OFL 1.1 (`apps/transit/assets/fonts/jetbrains-mono/OFL.txt`); unmodified |
+| `apps/transit/assets/fonts/jetbrains-mono/JetBrainsMono-Medium.ttf` | The JetBrains Mono Project Authors | JetBrains Mono 2.304, https://github.com/JetBrains/JetBrainsMono | SIL OFL 1.1 (`apps/transit/assets/fonts/jetbrains-mono/OFL.txt`); unmodified |
+| `apps/transit/assets/fonts/jetbrains-mono/JetBrainsMono-Bold.ttf` | The JetBrains Mono Project Authors | JetBrains Mono 2.304, https://github.com/JetBrains/JetBrainsMono | SIL OFL 1.1 (`apps/transit/assets/fonts/jetbrains-mono/OFL.txt`); unmodified |
+| `apps/transit/assets/fonts/jetbrains-mono/OFL.txt` | The JetBrains Mono Project Authors | license text | SIL OFL 1.1 |
