@@ -3736,6 +3736,7 @@ dependencies = [
  "soundcraft-asio-panel",
  "soundcraft-audio-io",
  "soundcraft-dsp",
+ "soundcraft-midi",
  "soundcraft-mix",
  "soundcraft-model",
  "soundcraft-time",
