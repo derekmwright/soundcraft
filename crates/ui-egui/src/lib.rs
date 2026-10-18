@@ -810,7 +810,7 @@ impl SoundApp {
 
     /// Done with the input, if open: it goes back to the player (`Player::close_input`), which
     /// keeps an input it opened with the output (ASIO) and closes any other.
-    fn close_input(&mut self) {
+    pub fn close_input(&mut self) {
         let Some(r) = self.recorder.take() else { return };
         match &self.player {
             Some(p) => p.close_input(r),
