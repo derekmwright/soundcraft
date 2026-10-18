@@ -224,8 +224,14 @@ fn main() -> eframe::Result {
             let player =
                 if no_audio { None } else { Some(soundcraft_playback::Player::with_config(Arc::new(engine.session().clone()), &prefs.audio)) };
             let mut app = StudioApp::new(engine, player, services());
-            // Our own autosave folder: the two apps must not recover each other's sessions.
-            app.autosave_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave")));
+            // Our own autosave folder: the two apps must not recover each other's sessions. Runs
+            // without preferences (agents' tests) autosave into a folder of their own, so they
+            // neither offer the user's leftovers nor leave theirs for the user.
+            app.autosave_dir = if prefs_enabled() {
+                prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave")))
+            } else {
+                Some(std::env::temp_dir().join(format!("transit-test-{}", std::process::id())).join("Autosave"))
+            };
             app.leftovers = app.autosave_dir.as_deref().map(soundcraft_engine::autosave::leftovers).unwrap_or_default();
             app.ui = prefs;
             // The plug-in scan cache is SoundCraft's, shared; runs without preferences keep none.
