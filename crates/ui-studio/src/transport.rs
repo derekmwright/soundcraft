@@ -1,49 +1,12 @@
 //! The transport bar: Return to Zero, Stop, Play, Record, Cycle; the position in bars|beats and
-//! min:sec; the tempo and meter; the main meter. Icons are drawn in code (no assets).
+//! min:sec; the tempo and meter; the main meter. Icons are Lucide SVGs ([`crate::icons`]).
 
 use crate::StudioApp;
+use crate::icons::{self, Icon};
 use crate::theme::{TOKENS, TRANSPORT_H};
-use egui::{Align2, Color32, Rect, Sense, Shape, Stroke, Ui, pos2, vec2};
+use egui::{Align2, Color32, Rect, Sense, Ui, pos2, vec2};
 use serde_json::json;
 use soundcraft_time::Samples;
-
-#[derive(Clone, Copy)]
-enum Icon {
-    Rtz,
-    Stop,
-    Play,
-    Record,
-    Cycle,
-}
-
-fn icon(p: &egui::Painter, r: Rect, which: Icon, color: Color32) {
-    let c = r.center();
-    let s = 6.0;
-    match which {
-        Icon::Play => {
-            p.add(Shape::convex_polygon(vec![pos2(c.x - s * 0.8, c.y - s), pos2(c.x + s, c.y), pos2(c.x - s * 0.8, c.y + s)], color, Stroke::NONE));
-        }
-        Icon::Stop => {
-            p.rect_filled(Rect::from_center_size(c, vec2(s * 1.7, s * 1.7)), 1.0, color);
-        }
-        Icon::Record => {
-            p.circle_filled(c, s, color);
-        }
-        Icon::Rtz => {
-            p.rect_filled(Rect::from_center_size(pos2(c.x - s, c.y), vec2(2.0, s * 2.0)), 0.0, color);
-            p.add(Shape::convex_polygon(vec![pos2(c.x + s, c.y - s), pos2(c.x + s, c.y + s), pos2(c.x - s + 2.0, c.y)], color, Stroke::NONE));
-        }
-        Icon::Cycle => {
-            let r1 = Rect::from_center_size(c, vec2(s * 2.6, s * 1.5));
-            p.rect_stroke(r1, 4.0, Stroke::new(1.6, color), egui::StrokeKind::Middle);
-            p.add(Shape::convex_polygon(
-                vec![pos2(r1.max.x - 3.0, r1.min.y - 3.0), pos2(r1.max.x + 2.0, r1.min.y), pos2(r1.max.x - 3.0, r1.min.y + 3.0)],
-                color,
-                Stroke::NONE,
-            ));
-        }
-    }
-}
 
 /// A square transport button; returns whether it was clicked.
 fn button(app: &mut StudioApp, ui: &mut Ui, name: &str, which: Icon, on: bool, on_color: Color32) -> bool {
@@ -57,8 +20,9 @@ fn button(app: &mut StudioApp, ui: &mut Ui, name: &str, which: Icon, on: bool, o
         TOKENS.button
     };
     p.rect_filled(r, 4.0, bg);
-    icon(p, r, which, if on { on_color } else { TOKENS.text });
+    icons::paint_in(p, r, which, if on { on_color } else { TOKENS.text });
     app.arrange.layout.transport.insert(name.to_string(), [r.min.x, r.min.y, r.max.x, r.max.y]);
+    app.arrange.layout.transport_icons.insert(name.to_string(), which.name().to_string());
     resp.on_hover_text(name).clicked()
 }
 
@@ -87,7 +51,7 @@ pub fn bar(app: &mut StudioApp, ui: &mut Ui) {
                 let playing = app.is_playing();
                 let recording = app.engine.transport.recording;
                 let cycle = app.engine.session().edit.loop_playback;
-                if button(app, ui, "rtz", Icon::Rtz, false, TOKENS.accent) {
+                if button(app, ui, "rtz", Icon::Rewind, false, TOKENS.accent) {
                     let _ = app.run("transport.rtz", json!({}));
                 }
                 if button(app, ui, "stop", Icon::Stop, false, TOKENS.accent) {
@@ -99,7 +63,7 @@ pub fn bar(app: &mut StudioApp, ui: &mut Ui) {
                 if button(app, ui, "record", Icon::Record, recording, TOKENS.record) {
                     let _ = app.run("transport.record", json!({}));
                 }
-                if button(app, ui, "cycle", Icon::Cycle, cycle, TOKENS.accent) {
+                if button(app, ui, "cycle", Icon::Loop, cycle, TOKENS.accent) {
                     let _ = app.run("options.loop_playback", json!({"value": !cycle}));
                 }
                 ui.add_space(14.0);

@@ -53,6 +53,9 @@ craft-ui = { version = "0.1.0", git = "https://github.com/storytold/craft-libs",
 egui = "0.36"
 eframe = { version = "0.36", default-features = false }
 egui_kittest = "0.36"
+# SVG icons (Lucide), rasterized once per size by resvg.
+egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
+resvg = { version = "0.45.1", default-features = false }
 rfd = "0.17"
 image = { version = "0.25", default-features = false, features = ["png"] }
 

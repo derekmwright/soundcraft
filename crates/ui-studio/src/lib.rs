@@ -14,6 +14,7 @@ pub mod devices;
 pub mod fine;
 pub mod groups;
 pub mod host;
+pub mod icons;
 pub mod keys;
 pub mod menus;
 pub mod mixer;
@@ -623,5 +624,7 @@ mod browser_tests;
 mod groups_tests;
 #[cfg(test)]
 mod keys_tests;
+#[cfg(test)]
+mod slice5_tests;
 #[cfg(test)]
 mod tests;

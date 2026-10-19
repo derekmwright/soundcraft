@@ -19,6 +19,7 @@
 
 use crate::StudioApp;
 use crate::arrange::R4;
+use crate::icons::Icon;
 use crate::theme::TOKENS;
 use egui::{Align2, CursorIcon, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::{Value, json};
@@ -186,6 +187,8 @@ pub struct RowLayout {
     pub name: String,
     /// The name as drawn: elided with "…" (extension kept) when the row is too narrow.
     pub shown: String,
+    /// The type icon drawn before the name (its Lucide name), empty for notes.
+    pub icon: String,
     pub kind: Option<Kind>,
     pub depth: usize,
     pub root: bool,
@@ -1098,7 +1101,9 @@ fn body(app: &mut StudioApp, ui: &mut Ui) {
     {
         let text = if files { &mut app.browser.filter } else { &mut app.browser.plugin_filter };
         let id = ui.id().with(if files { "browser_filter" } else { "browser_plugin_filter" });
-        ui.put(fr, egui::TextEdit::singleline(text).id(id).hint_text("Filter").desired_width(fr.width()));
+        let margin = egui::Margin { left: 24, right: 4, top: 2, bottom: 2 };
+        ui.put(fr, egui::TextEdit::singleline(text).id(id).hint_text("Filter").margin(margin).desired_width(fr.width()));
+        crate::icons::paint(&p, pos2(fr.min.x + 12.0, fr.center().y), Icon::Filter, 13.0, TOKENS.text_dim);
     }
     layout.filter = r4(fr);
     let mut top = fr.max.y + 6.0;
@@ -1137,7 +1142,7 @@ fn locations_bar(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, area: Rect
     let plus = Rect::from_min_size(pos2(bar.max.x - 20.0, bar.min.y + 1.0), vec2(20.0, 18.0));
     let resp = ui.interact(plus, ui.id().with("browser_add_folder"), Sense::click());
     p.rect_filled(plus, 3.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
-    p.text(plus.center(), Align2::CENTER_CENTER, "+", FontId::proportional(14.0), TOKENS.text);
+    crate::icons::paint(p, plus.center(), Icon::Plus, 14.0, TOKENS.text);
     if resp.on_hover_text("Add Folder…").clicked() {
         app.browser.adding = if app.browser.adding.is_some() { None } else { Some(String::new()) };
     }
@@ -1306,12 +1311,7 @@ fn tree(app: &mut StudioApp, ui: &mut Ui, area: Rect, layout: &mut BrowserLayout
         let x = r.min.x + 8.0 + row.depth as f32 * INDENT;
         let c = pos2(x + 5.0, r.center().y);
         if row.kind == Kind::Folder {
-            let pts = if expanded {
-                vec![pos2(c.x - 4.0, c.y - 2.5), pos2(c.x + 4.0, c.y - 2.5), pos2(c.x, c.y + 3.0)]
-            } else {
-                vec![pos2(c.x - 2.5, c.y - 4.0), pos2(c.x + 3.0, c.y), pos2(c.x - 2.5, c.y + 4.0)]
-            };
-            p.add(egui::Shape::convex_polygon(pts, TOKENS.text_dim, Stroke::NONE));
+            crate::icons::paint(&p, c, if expanded { Icon::ChevronDown } else { Icon::ChevronRight }, 12.0, TOKENS.text_dim);
         }
         let ink = match row.kind {
             Kind::Folder | Kind::Audio => TOKENS.text,
@@ -1328,7 +1328,20 @@ fn tree(app: &mut StudioApp, ui: &mut Ui, area: Rect, layout: &mut BrowserLayout
             _ => String::new(),
         };
         let right_w = if right.is_empty() { 0.0 } else { (right.chars().count() as f32 * 5.6).min(r.width() * 0.55) };
-        let name_r = Rect::from_min_max(pos2(x + 14.0, r.min.y), pos2(r.max.x - 10.0 - right_w, r.max.y));
+        // The entry's type: folder (open or closed), audio file, or a file we can't use.
+        let kind_icon = match row.kind {
+            Kind::Folder if expanded => Some(Icon::FolderOpen),
+            Kind::Folder => Some(Icon::Folder),
+            Kind::Audio => Some(Icon::FileAudio),
+            Kind::Closed => Some(Icon::File),
+            Kind::Note => None,
+        };
+        if let Some(i) = kind_icon {
+            crate::icons::paint(&p, pos2(x + 20.0, r.center().y), i, 13.0, ink);
+            out.icon = i.name().to_string();
+        }
+        let name_x = if kind_icon.is_some() { x + 30.0 } else { x + 14.0 };
+        let name_r = Rect::from_min_max(pos2(name_x, r.min.y), pos2(r.max.x - 10.0 - right_w, r.max.y));
         let size = if row.root.is_some() { 12.5 } else { 12.0 };
         let font = FontId::proportional(size);
         let shown = elide(&p, &row.name, &font, name_r.width());
@@ -1362,13 +1375,7 @@ fn tree(app: &mut StudioApp, ui: &mut Ui, area: Rect, layout: &mut BrowserLayout
             let hovering = ui.input(|i| i.pointer.hover_pos()).is_some_and(|h| r.contains(h));
             let xresp = ui.interact(xb, ui.id().with(("browser_remove", li)), Sense::click());
             if hovering || xresp.hovered() {
-                p.text(
-                    xb.center(),
-                    Align2::CENTER_CENTER,
-                    "×",
-                    FontId::proportional(14.0),
-                    if xresp.hovered() { TOKENS.text } else { TOKENS.text_dim },
-                );
+                crate::icons::paint(&p, xb.center(), Icon::Remove, 13.0, if xresp.hovered() { TOKENS.text } else { TOKENS.text_dim });
             }
             if xresp.on_hover_text("Remove from Locations").clicked() {
                 remove = Some(li);
@@ -1492,30 +1499,6 @@ fn plugin_rows(items: &[PluginItem], favorites: &[String], filter: &str) -> Vec<
     out
 }
 
-/// A five-point star, filled or outlined.
-fn star(p: &egui::Painter, c: Pos2, r: f32, filled: bool, color: egui::Color32) {
-    let pts: Vec<Pos2> = (0..10)
-        .map(|k| {
-            let a = std::f32::consts::PI * (k as f32 / 5.0) - std::f32::consts::FRAC_PI_2;
-            let rr = if k % 2 == 0 { r } else { r * 0.45 };
-            pos2(c.x + rr * a.cos(), c.y + rr * a.sin())
-        })
-        .collect();
-    if filled {
-        let mut mesh = egui::Mesh::default();
-        mesh.colored_vertex(c, color);
-        for q in &pts {
-            mesh.colored_vertex(*q, color);
-        }
-        for k in 0..10u32 {
-            mesh.add_triangle(0, 1 + k, 1 + (k + 1) % 10);
-        }
-        p.add(egui::Shape::mesh(mesh));
-    } else {
-        p.add(egui::Shape::closed_line(pts, Stroke::new(1.0, color)));
-    }
-}
-
 fn plugins(app: &mut StudioApp, ui: &mut Ui, area: Rect, layout: &mut BrowserLayout) {
     let items = catalog(app);
     let mut rows = Vec::new();
@@ -1599,7 +1582,7 @@ fn plugins(app: &mut StudioApp, ui: &mut Ui, area: Rect, layout: &mut BrowserLay
                     } else {
                         TOKENS.text_dim.gamma_multiply(0.6)
                     };
-                    star(&p, sr.center(), 6.0, fav, ink);
+                    crate::icons::paint(&p, sr.center(), if fav { Icon::StarFilled } else { Icon::Star }, 13.0, ink);
                     if sresp.on_hover_text(if fav { "Remove from Favorites" } else { "Add to Favorites" }).clicked() {
                         star_click = Some(it.id.clone());
                     }

@@ -81,6 +81,8 @@ pub struct Layout {
     pub add_instrument: R4,
     /// Transport bar buttons (`play`, `stop`, `record`, `rtz`, `cycle`).
     pub transport: std::collections::BTreeMap<String, R4>,
+    /// The icon each transport button shows (its Lucide name, e.g. `play`).
+    pub transport_icons: std::collections::BTreeMap<String, String>,
     /// Where a dragged track header would land: a line between rows or a group header's outline.
     pub drop: Option<R4>,
 }
@@ -157,6 +159,7 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
         samples_per_px: map.spp,
         scroll: map.scroll,
         transport: std::mem::take(&mut app.arrange.layout.transport),
+        transport_icons: std::mem::take(&mut app.arrange.layout.transport_icons),
         ..Layout::default()
     };
     let selected_tracks = s.edit.selected_tracks.clone();
@@ -330,18 +333,13 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     resp.context_menu(|ui| track_menu(app, ui, id, kind, has_instrument));
 }
 
-/// A group's disclosure triangle: collapses or expands its members (view state only).
+/// A group's disclosure chevron: collapses or expands its members (view state only).
 fn disclosure(app: &mut StudioApp, ui: &mut Ui, t: &Track, b: Rect, list: Rect, row: &mut TrackRow) {
     row.disclosure = r4(b);
     let resp = ui.interact(b.intersect(list), ui.id().with(("disclose", t.id.0)), Sense::click());
-    let c = b.center();
-    let pts = if row.collapsed {
-        vec![pos2(c.x - 3.0, c.y - 5.0), pos2(c.x + 4.0, c.y), pos2(c.x - 3.0, c.y + 5.0)]
-    } else {
-        vec![pos2(c.x - 5.0, c.y - 3.0), pos2(c.x + 5.0, c.y - 3.0), pos2(c.x, c.y + 4.0)]
-    };
     let ink = if resp.hovered() { TOKENS.text } else { TOKENS.text_dim };
-    ui.painter().with_clip_rect(list).add(egui::Shape::convex_polygon(pts, ink, Stroke::NONE));
+    let icon = if row.collapsed { crate::icons::Icon::ChevronRight } else { crate::icons::Icon::ChevronDown };
+    crate::icons::paint(&ui.painter().with_clip_rect(list), b.center(), icon, 14.0, ink);
     if resp.clicked() {
         app.toggle_group(t.id);
     }

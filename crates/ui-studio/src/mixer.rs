@@ -1011,12 +1011,7 @@ fn dropdown(ui: &mut Ui, clip: Rect, r: Rect, id: egui::Id, current: &str, choic
     p.rect_filled(r, 2.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.bg });
     let text_r = r.shrink2(vec2(4.0, 0.0));
     p.with_clip_rect(text_r.intersect(clip)).text(text_r.left_center(), Align2::LEFT_CENTER, current, FontId::proportional(10.5), TOKENS.text);
-    let c = pos2(r.max.x - 7.0, r.center().y);
-    p.add(egui::Shape::convex_polygon(
-        vec![pos2(c.x - 3.0, c.y - 1.5), pos2(c.x + 3.0, c.y - 1.5), pos2(c.x, c.y + 2.0)],
-        TOKENS.text_dim,
-        Stroke::NONE,
-    ));
+    crate::icons::paint(&p, pos2(r.max.x - 7.0, r.center().y), crate::icons::Icon::ChevronDown, 10.0, TOKENS.text_dim);
     choice_menu(&resp, current, choices, menu)
 }
 
@@ -1218,7 +1213,7 @@ pub(crate) fn send_row(
     row.level_text = text;
     // Remove.
     let resp = ui.interact(xb.intersect(clip), ui.id().with(("send_remove", salt)), Sense::click());
-    p.text(xb.center(), Align2::CENTER_CENTER, "×", FontId::proportional(12.0), if resp.hovered() { TOKENS.record } else { TOKENS.text_dim });
+    crate::icons::paint(&p, xb.center(), crate::icons::Icon::Remove, 11.0, if resp.hovered() { TOKENS.record } else { TOKENS.text_dim });
     if resp.on_hover_text("Remove send").clicked() {
         let _ = app.remove_send(id, slot);
     }
@@ -1384,7 +1379,7 @@ fn inserts_block(
         if resp.hovered() {
             p.rect_filled(rr, 2.0, TOKENS.button_hover);
         }
-        p.text(pos2(rr.min.x + 4.0, rr.center().y), Align2::LEFT_CENTER, "+", FontId::proportional(11.0), TOKENS.text_dim);
+        crate::icons::paint(&p, pos2(rr.min.x + 9.0, rr.center().y), crate::icons::Icon::Plus, 12.0, TOKENS.text_dim);
         let resp = resp.on_hover_text("Add an effect to this track");
         let before = list.len();
         crate::devices::add_device_menu(app, &resp, id, menu);

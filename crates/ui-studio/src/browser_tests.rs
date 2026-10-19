@@ -867,3 +867,18 @@ fn importing_announces_itself_before_the_synchronous_import() {
     assert_eq!(t.app.browser.import_notice, "Importing loop 90.wav…");
     assert!(t.app.status.starts_with("Imported loop 90.wav"), "{}", t.app.status);
 }
+
+#[test]
+fn rows_show_their_type_icons_and_a_click_on_the_chevron_row_expands() {
+    let mut t = T::new();
+    t.add_and_expand();
+    let kicks = t.row(&t.path("Kicks"));
+    assert_eq!(kicks.icon, "folder");
+    t.click(mid(kicks.rect.unwrap()));
+    t.settle();
+    assert_eq!(t.row(&t.path("Kicks")).icon, "folder-open", "an expanded folder shows the open folder");
+    assert_eq!(t.row_named("Kick 01.wav").icon, "file-audio");
+    assert_eq!(t.row_named("Kit.nki").icon, "file");
+    // The name starts after the icon, still elided to fit.
+    assert_eq!(t.row_named("loop 90.wav").shown, "loop 90.wav");
+}
