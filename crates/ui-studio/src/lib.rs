@@ -20,6 +20,7 @@ pub mod menus;
 pub mod mixer;
 pub mod plugin_scan;
 pub mod shortcuts;
+pub mod telemetry;
 pub mod theme;
 pub mod transport;
 pub mod waveform;
@@ -215,6 +216,8 @@ pub struct StudioApp {
     pub browser: browser::BrowserState,
     /// Help > Keyboard Shortcuts as last drawn (slice 5).
     pub shortcuts_window: menus::ShortcutsLayout,
+    /// The output-callback telemetry readout and its window (polled a few times a second).
+    pub telemetry: telemetry::TelemetryState,
 }
 
 impl StudioApp {
@@ -262,6 +265,7 @@ impl StudioApp {
             keys: keys::KeysState::default(),
             browser: browser::BrowserState::default(),
             shortcuts_window: menus::ShortcutsLayout::default(),
+            telemetry: telemetry::TelemetryState::default(),
         }
     }
 
@@ -591,6 +595,7 @@ impl StudioApp {
         menus::dialogs(self, &ctx);
         menus::recovery(self, &ctx);
         menus::shortcuts_window(self, &ctx);
+        telemetry::window(self, &ctx);
         if self.is_playing() || self.engine.transport.recording {
             ctx.request_repaint_after(std::time::Duration::from_millis(1000 / 30));
         } else if self.main_meter.level[0] > 0.0001 {
@@ -641,6 +646,7 @@ impl StudioApp {
             "keys": self.keys.layout,
             "browser": self.browser.layout,
             "shortcuts": self.shortcuts_window,
+            "telemetry": self.telemetry.layout,
             "theme": if theme::current() == egui::Theme::Light { "light" } else { "dark" },
         })
     }

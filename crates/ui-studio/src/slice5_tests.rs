@@ -203,6 +203,7 @@ fn tokens_are_the_only_colors() {
         ("menus.rs", include_str!("menus.rs")),
         ("mixer.rs", include_str!("mixer.rs")),
         ("transport.rs", include_str!("transport.rs")),
+        ("telemetry.rs", include_str!("telemetry.rs")),
         ("waveform.rs", include_str!("waveform.rs")),
         ("icons.rs", include_str!("icons.rs")),
         ("shortcuts.rs", include_str!("shortcuts.rs")),
@@ -241,6 +242,7 @@ fn every_handler_takes_its_keys_from_the_table() {
         include_str!("arrange.rs"),
         include_str!("devices.rs"),
         include_str!("transport.rs"),
+        include_str!("telemetry.rs"),
         include_str!("lib.rs"),
     ];
     for src in sources {
@@ -377,6 +379,7 @@ fn painted_corners_use_the_radius_tokens() {
         ("menus.rs", include_str!("menus.rs")),
         ("mixer.rs", include_str!("mixer.rs")),
         ("transport.rs", include_str!("transport.rs")),
+        ("telemetry.rs", include_str!("telemetry.rs")),
     ] {
         // (call, index of the radius argument)
         for (call, at) in
@@ -480,4 +483,113 @@ fn the_shortcut_filter_searches_notes_and_spells_out_shift_plus() {
     }
     assert!(TABLE.iter().any(|s| text(s) == "Shift+Plus"));
     assert!(!TABLE.iter().any(|s| text(s).ends_with("++")));
+}
+
+fn snap() -> soundcraft_playback::telemetry::CallbackTelemetry {
+    let mut h = [0u64; 16];
+    h[3] = 7;
+    h[15] = 1;
+    soundcraft_playback::telemetry::CallbackTelemetry {
+        callbacks: 100,
+        frames: 51_200,
+        timed_callbacks: 100,
+        max_duration_ns: 3_000_000,
+        max_load_ppm: 123_456,
+        over_budget_callbacks: 2,
+        duration_histogram: h,
+        backend_errors: 3,
+        device_lost_errors: 1,
+        contention_silence_frames: 999,
+        unavailable_silence_frames: 888,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn the_telemetry_readout_is_absent_without_a_player() {
+    let mut t = T::new();
+    assert!(t.app.player.is_none());
+    t.frames(30);
+    let tel = t.inspect()["telemetry"].clone();
+    assert_eq!(tel["shown"], false);
+    assert_eq!(t.app.telemetry.reads, 0, "no player, nothing read");
+    // Even a stale open flag cannot show a window without a readout.
+    t.app.telemetry.open = true;
+    t.frames(2);
+    assert_eq!(t.inspect()["telemetry"]["open"], false);
+}
+
+#[test]
+fn the_telemetry_readout_texts_and_click_open_the_details_window() {
+    use crate::telemetry::{detail_rows, load_text, readout_text};
+    let s = snap();
+    assert_eq!(load_text(123_456), "12.3%");
+    assert_eq!(load_text(1_000_000), "100.0%");
+    assert_eq!(load_text(0), "0.0%");
+    assert_eq!(readout_text(&s), "Load 12.3%  Over 2");
+    let mut t = T::new();
+    t.app.telemetry.injected = Some(s);
+    t.frames(30);
+    let tel = t.inspect()["telemetry"].clone();
+    assert_eq!(tel["shown"], true);
+    assert_eq!(tel["text"], "Load 12.3%  Over 2");
+    assert_eq!(tel["warning"], 3, "the warning icon carries the backend error count");
+    assert_eq!(tel["open"], false);
+    let rect: [f32; 4] = serde_json::from_value(tel["rect"].clone()).unwrap();
+    let rev = (t.app.engine.is_dirty(), t.app.engine.revision);
+    t.click(mid(rect));
+    let tel = t.inspect()["telemetry"].clone();
+    assert_eq!(tel["open"], true, "clicking the readout opens the window");
+    let rows: Vec<String> = serde_json::from_value(tel["rows"].clone()).unwrap();
+    assert_eq!(rows, detail_rows(&s));
+    assert!(rows.contains(&"up to 8 \u{b5}s: 7".to_string()), "{rows:?}");
+    assert!(rows.contains(&"over 16.384 ms: 1".to_string()), "{rows:?}");
+    assert!(rows.contains(&"Over-budget callbacks (nominal): 2".to_string()));
+    assert!(rows.contains(&"Peak callback load (since open): 12.3%".to_string()));
+    assert!(!rows.iter().any(|r| r.contains("999") || r.contains("888") || r.to_lowercase().contains("teardown")), "teardown counters stay hidden");
+    // Clicking again closes it; so does the title bar's close button.
+    t.click(mid(rect));
+    assert_eq!(t.inspect()["telemetry"]["open"], false);
+    t.click(mid(rect));
+    let w: [f32; 4] = serde_json::from_value(t.inspect()["telemetry"]["window"].clone()).unwrap();
+    t.click((w[2] - 14.0, w[1] + 13.0));
+    assert_eq!(t.inspect()["telemetry"]["open"], false, "closed from its title bar");
+    assert_eq!((t.app.engine.is_dirty(), t.app.engine.revision), rev, "the readout never touches the document");
+}
+
+#[test]
+fn the_telemetry_readout_has_no_warning_without_errors() {
+    let mut t = T::new();
+    t.app.telemetry.injected = Some(soundcraft_playback::telemetry::CallbackTelemetry::default());
+    t.frames(30);
+    let tel = t.inspect()["telemetry"].clone();
+    assert_eq!(tel["text"], "Load 0.0%  Over 0");
+    assert!(tel["warning"].is_null());
+}
+
+#[test]
+fn telemetry_math_saturates_when_the_snapshot_is_torn() {
+    use crate::telemetry::{detail_rows, error_count};
+    // timed_callbacks ahead of callbacks (a reader that straddled a publication) and a huge sum.
+    let s = soundcraft_playback::telemetry::CallbackTelemetry {
+        callbacks: 5,
+        timed_callbacks: 9,
+        duration_histogram: [u64::MAX; 16],
+        device_lost_errors: 4,
+        ..Default::default()
+    };
+    let rows = detail_rows(&s);
+    assert!(rows.contains(&"Callbacks without a timing: 0".to_string()), "{rows:?}");
+    assert!(rows.contains(&format!("Histogram total: {}", u64::MAX)), "saturated, not wrapped");
+    assert_eq!(error_count(&s), Some(4), "device loss alone still warns");
+    assert_eq!(error_count(&Default::default()), None);
+}
+
+#[test]
+fn the_telemetry_is_read_a_few_times_a_second_not_every_frame() {
+    let mut t = T::new();
+    t.app.telemetry.injected = Some(snap());
+    t.frames(120); // two seconds at 60 fps
+    let reads = t.app.telemetry.reads;
+    assert!((7..=9).contains(&reads), "about four reads a second, not 120: {reads}");
 }

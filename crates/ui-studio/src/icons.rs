@@ -32,10 +32,12 @@ pub enum Icon {
     FolderOpen,
     FileAudio,
     File,
+    /// A warning (Lucide triangle-alert): audio backend trouble in the telemetry readout.
+    Warning,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 18] = [
+    pub const ALL: [Icon; 19] = [
         Icon::Rewind,
         Icon::Stop,
         Icon::Play,
@@ -54,6 +56,7 @@ impl Icon {
         Icon::FolderOpen,
         Icon::FileAudio,
         Icon::File,
+        Icon::Warning,
     ];
 
     /// The Lucide name (the file under `assets/icons/`), plus `-filled` for filled variants.
@@ -77,6 +80,7 @@ impl Icon {
             Icon::FolderOpen => "folder-open",
             Icon::FileAudio => "file-audio",
             Icon::File => "file",
+            Icon::Warning => "triangle-alert",
         }
     }
 
@@ -99,6 +103,7 @@ impl Icon {
             Icon::FolderOpen => include_bytes!("../assets/icons/folder-open.svg"),
             Icon::FileAudio => include_bytes!("../assets/icons/file-audio.svg"),
             Icon::File => include_bytes!("../assets/icons/file.svg"),
+            Icon::Warning => include_bytes!("../assets/icons/triangle-alert.svg"),
         }
     }
 

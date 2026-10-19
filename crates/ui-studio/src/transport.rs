@@ -79,6 +79,7 @@ pub fn bar(app: &mut StudioApp, ui: &mut Ui) {
                 readout(ui, &format!("{}/{}", m.numerator, m.denominator), 40.0, TOKENS.text);
                 ui.add_space(2.0 * crate::theme::SPACE);
                 main_meter(app, ui);
+                crate::telemetry::readout(app, ui);
                 if let Some(hint) = app.record_hint() {
                     ui.add_space(crate::theme::SPACE);
                     ui.label(egui::RichText::new(hint).color(TOKENS.record));
