@@ -1,9 +1,16 @@
 //! Output callback diagnostics, accumulated without locks, allocation or retry loops.
 //!
-//! Duration measures our callback (rendering and sample conversion), not device latency or
-//! scheduling lateness. Exceeding frames / device rate is a deadline overrun, not a hardware
-//! xrun report: CPAL 0.16 has no portable, typed xrun notification. Backend errors are separate.
-//! Counters last for one Player/stream. Reopening a device starts a new set.
+//! Duration measures our rendering and sample conversion, excluding telemetry publication and
+//! CPAL's work before/after our closure (for example ASIO interleaving and OutputReady). It does
+//! not measure device latency or scheduling lateness. The nominal budget is frames / device
+//! rate, NOT the time remaining until a hardware deadline. In particular WASAPI supplies the
+//! available buffer space, while the queued padding determines how long before it runs dry.
+//! A callback can miss that deadline without exceeding the nominal budget; no over-budget
+//! count therefore does not prove glitch-free audio. CPAL 0.16 has no portable typed xrun report.
+//!
+//! Counters and maxima last for one Player/stream. Reopening starts a new set. The first callback
+//! is included: cold-start work can cause an audible failure and must not be hidden as warm-up.
+//! Suggested labels: "Peak callback load (since open)" and "Over-budget callbacks (nominal)".
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -14,8 +21,11 @@ pub const DURATION_LIMITS_NS: [u64; 15] =
 
 /// Approximate, nonblocking view of lifetime output diagnostics.
 ///
-/// Fields are loaded independently and may straddle a callback; after callbacks stop the
-/// snapshot is exact. Do not use it for transport synchronization. The silent fallback clock
+/// Fields are loaded independently and can span several publications if the reader is delayed:
+/// `timed_callbacks` can exceed `callbacks`, and the histogram sum can disagree with either.
+/// Individual fields are atomic, but cross-field arithmetic needs checked/saturating operations
+/// and cannot establish an exact average or rate. After all writers stop with synchronization,
+/// the snapshot is exact. Do not use it for transport synchronization. The silent fallback clock
 /// does not contribute callback durations/counts, but can contribute render-silence counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CallbackTelemetry {
@@ -25,19 +35,24 @@ pub struct CallbackTelemetry {
     /// Callbacks with a wall-time measurement. Native only; WebAudio timing is unavailable.
     pub timed_callbacks: u64,
     pub total_duration_ns: u64,
+    /// Largest measured callback work time since this player opened, including startup.
     pub max_duration_ns: u64,
-    /// Maximum duration / buffer duration, in millionths (1_000_000 means 100%).
+    /// Largest work time / nominal frame duration since open, in millionths (1_000_000 = 100%).
+    /// This is not remaining device headroom or CPU utilization; startup is included.
     pub max_load_ppm: u64,
-    /// Duration strictly exceeded frames / device rate; zero-size/unknown-rate blocks excluded.
-    pub deadline_overruns: u64,
+    /// Work time strictly exceeded frames / device rate; zero-size/unknown-rate blocks excluded.
+    /// A throughput diagnostic, not a count of missed hardware deadlines or xruns.
+    pub over_budget_callbacks: u64,
     /// Exclusive bins with inclusive upper limits [`DURATION_LIMITS_NS`], followed by overflow.
     pub duration_histogram: [u64; 16],
     /// CPAL error callbacks of all kinds. These are not necessarily xruns.
     pub backend_errors: u64,
     pub device_lost_errors: u64,
-    /// Render frames silenced because the holder's lock was busy.
+    /// Render frames silenced because the holder's lock was busy during teardown. With the
+    /// current ownership model these teardown diagnostics cannot be read after Player::drop;
+    /// they are not live underrun counters. Internal teardown probes can retain the storage.
     pub contention_silence_frames: u64,
-    /// Render frames silenced because the player had taken its state back at teardown.
+    /// Teardown frames silenced after the state was taken; same observation limit as contention.
     pub unavailable_silence_frames: u64,
     /// Render frames silenced because rendering panicked, or an earlier panic latched the fault.
     pub fault_silence_frames: u64,
@@ -53,7 +68,7 @@ pub(crate) struct Counters {
     total_duration_ns: AtomicU64,
     max_duration_ns: AtomicU64,
     max_load_ppm: AtomicU64,
-    deadline_overruns: AtomicU64,
+    over_budget_callbacks: AtomicU64,
     duration_histogram: [AtomicU64; 16],
     pub backend_errors: AtomicU64,
     pub device_lost_errors: AtomicU64,
@@ -71,7 +86,7 @@ impl Counters {
             total_duration_ns: self.total_duration_ns.load(Ordering::Relaxed),
             max_duration_ns: self.max_duration_ns.load(Ordering::Relaxed),
             max_load_ppm: self.max_load_ppm.load(Ordering::Relaxed),
-            deadline_overruns: self.deadline_overruns.load(Ordering::Relaxed),
+            over_budget_callbacks: self.over_budget_callbacks.load(Ordering::Relaxed),
             duration_histogram: std::array::from_fn(|i| self.duration_histogram[i].load(Ordering::Relaxed)),
             backend_errors: self.backend_errors.load(Ordering::Relaxed),
             device_lost_errors: self.device_lost_errors.load(Ordering::Relaxed),
@@ -115,13 +130,13 @@ impl Accumulator {
                 let budget = frames as u128 * 1_000_000_000;
                 let load = (used * 1_000_000 / budget).min(u128::from(u64::MAX)) as u64;
                 s.max_load_ppm = s.max_load_ppm.max(load);
-                s.deadline_overruns = s.deadline_overruns.saturating_add(u64::from(used > budget));
+                s.over_budget_callbacks = s.over_budget_callbacks.saturating_add(u64::from(used > budget));
             }
             counters.timed_callbacks.store(s.timed_callbacks, Ordering::Relaxed);
             counters.total_duration_ns.store(s.total_duration_ns, Ordering::Relaxed);
             counters.max_duration_ns.store(s.max_duration_ns, Ordering::Relaxed);
             counters.max_load_ppm.store(s.max_load_ppm, Ordering::Relaxed);
-            counters.deadline_overruns.store(s.deadline_overruns, Ordering::Relaxed);
+            counters.over_budget_callbacks.store(s.over_budget_callbacks, Ordering::Relaxed);
         }
         counters.frames.store(s.frames, Ordering::Relaxed);
         counters.callbacks.store(s.callbacks, Ordering::Relaxed);
@@ -169,7 +184,7 @@ mod tests {
         let s = counters.snapshot();
         assert_eq!((s.callbacks, s.frames, s.timed_callbacks), (4, 288, 4));
         assert_eq!((s.total_duration_ns, s.max_duration_ns), (5_000_001, 1_500_000));
-        assert_eq!((s.deadline_overruns, s.max_load_ppm), (2, 1_500_000));
+        assert_eq!((s.over_budget_callbacks, s.max_load_ppm), (2, 1_500_000));
         assert_eq!(s.duration_histogram.iter().sum::<u64>(), 4);
         assert_eq!(s.backend_errors, 0, "inferred overruns are not backend reports");
     }
@@ -185,19 +200,32 @@ mod tests {
         accumulate.record(&counters, 64, 48_000, None);
         let s = counters.snapshot();
         assert_eq!((s.callbacks, s.timed_callbacks, s.frames), (8, 7, 128));
-        assert_eq!((s.deadline_overruns, s.max_load_ppm), (0, 0));
+        assert_eq!((s.over_budget_callbacks, s.max_load_ppm), (0, 0));
         assert_eq!((s.total_duration_ns, s.max_duration_ns), (u64::MAX, u64::MAX));
         assert_eq!(s.duration_histogram, [2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3]);
     }
 
     #[test]
-    fn error_notifications_do_not_invent_deadline_overruns() {
+    fn error_notifications_do_not_invent_over_budget_callbacks() {
         let counters = Counters::default();
         counters.error(false);
         counters.error(true);
         let s = counters.snapshot();
         assert_eq!((s.backend_errors, s.device_lost_errors), (2, 1));
-        assert_eq!((s.callbacks, s.deadline_overruns), (0, 0));
+        assert_eq!((s.callbacks, s.over_budget_callbacks), (0, 0));
+    }
+
+    #[test]
+    fn startup_work_remains_visible_in_lifetime_peaks() {
+        let counters = Counters::default();
+        let mut accumulate = Accumulator::default();
+        accumulate.record(&counters, 48, 48_000, Some(Duration::from_millis(2)));
+        for _ in 0..128 {
+            accumulate.record(&counters, 48, 48_000, Some(Duration::from_micros(10)));
+        }
+        let s = counters.snapshot();
+        assert_eq!((s.max_duration_ns, s.max_load_ppm, s.over_budget_callbacks), (2_000_000, 2_000_000, 1));
+        assert_eq!(Counters::default().snapshot(), CallbackTelemetry::default());
     }
 
     #[test]
@@ -213,7 +241,7 @@ mod tests {
         while !worker.is_finished() {
             let s = counters.snapshot();
             assert!(s.callbacks <= 20_000);
-            assert_eq!(s.deadline_overruns, 0);
+            assert_eq!(s.over_budget_callbacks, 0);
         }
         worker.join().unwrap();
         let s = counters.snapshot();

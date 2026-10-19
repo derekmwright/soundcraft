@@ -1209,6 +1209,21 @@ impl OutputCallback {
     }
 }
 
+/// The same error handler is registered with CPAL and exercised by hardware-free tests.
+fn output_error_callback(gone: Arc<Fault>) -> impl FnMut(cpal::StreamError) + Send + 'static {
+    // CPAL may call this on the audio thread (on ALSA repeatedly while the device is broken).
+    // Mark it so the logger hands records off instead of writing them here.
+    move |e| {
+        mark_audio_thread();
+        let device_lost = matches!(e, cpal::StreamError::DeviceNotAvailable);
+        gone.telemetry.error(device_lost);
+        if device_lost {
+            gone.gone.store(true, Ordering::Relaxed);
+        }
+        log::warn!("audio stream error: {e}");
+    }
+}
+
 /// The output stream: render through preallocated scratch and convert to the device format.
 fn build_output<T>(
     device: &cpal::Device,
@@ -1229,16 +1244,7 @@ where
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             output.fill(data, &held, &failed, &guard);
         },
-        // cpal may call this on the audio thread (on ALSA in a loop while the device stays
-        // broken): marked, so the logger hands the record off instead of writing it.
-        move |e: cpal::StreamError| {
-            mark_audio_thread();
-            gone.telemetry.error(matches!(e, cpal::StreamError::DeviceNotAvailable));
-            if matches!(e, cpal::StreamError::DeviceNotAvailable) {
-                gone.gone.store(true, Ordering::Relaxed);
-            }
-            log::warn!("audio stream error: {e}");
-        },
+        output_error_callback(gone),
         None,
     )
 }
@@ -1377,6 +1383,34 @@ mod tests {
             assert_eq!(s.timed_callbacks, 3);
             assert_eq!(s.duration_histogram.iter().sum::<u64>(), 3);
         }
+    }
+
+    #[test]
+    fn cpal_error_callback_classifies_device_loss_without_inventing_budget_failures() {
+        let fault = Arc::new(Fault::default());
+        let mut callback = output_error_callback(Arc::clone(&fault));
+        callback(cpal::StreamError::BackendSpecific { err: cpal::BackendSpecificError { description: "test backend failure".into() } });
+        assert_eq!(fault.trouble(false), None);
+        callback(cpal::StreamError::DeviceNotAvailable);
+        assert_eq!((fault.trouble(false), fault.trouble(false)), (Some(OutputTrouble::Gone), None));
+        let s = fault.telemetry.snapshot();
+        assert_eq!((s.backend_errors, s.device_lost_errors), (2, 1));
+        assert_eq!((s.callbacks, s.over_budget_callbacks), (0, 0));
+    }
+
+    #[test]
+    fn silent_clock_has_no_device_counts_and_new_players_start_fresh() {
+        let player = silent_player();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while player.fault.beats.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(player.fault.beats.load(Ordering::Relaxed) > 0, "exercise the real silent-clock worker");
+        assert_eq!(player.callback_telemetry(), telemetry::CallbackTelemetry::default());
+        output_error_callback(Arc::clone(&player.fault))(cpal::StreamError::DeviceNotAvailable);
+        assert_eq!(player.callback_telemetry().device_lost_errors, 1);
+        let fresh = silent_player();
+        assert_eq!(fresh.callback_telemetry(), telemetry::CallbackTelemetry::default());
     }
 
     #[test]
