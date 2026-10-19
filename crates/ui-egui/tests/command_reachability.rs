@@ -22,6 +22,7 @@ const KNOWN_UNREACHED: &[&str] = &[
     "mix.clear_solos",
     "mix.insert_move",
     "mix.phase_invert",
+    "mix.remove_bus", // studio UI only; old UI has no bus management surface
     "mix.send_surround_pan",
     "mix.solo_safe",
     "options.post_roll",

@@ -49,7 +49,11 @@ mod tests {
         let WgpuSetup::CreateNew(eframe_default) = NativeOptions::default().wgpu_options.wgpu_setup else {
             panic!("default native options must create a wgpu instance");
         };
-        assert!(eframe_default.instance_descriptor.backends.contains(Backends::GL));
+        // eframe reads WGPU_BACKEND itself, so its default only includes GL when that is unset.
+        if std::env::var_os("WGPU_BACKEND").is_none() {
+            assert!(eframe_default.instance_descriptor.backends.contains(Backends::GL));
+        }
+        // `configure` never reads the environment: the caller passes any override.
         assert_eq!(configured_backends(None), Backends::DX12);
     }
 
