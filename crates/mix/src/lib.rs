@@ -387,6 +387,8 @@ pub struct MixEngine {
     retired: Vec<Box<dyn Plugin>>,
     /// Ownership workspace reused for parallel strip processing.
     work: Vec<(usize, Strip)>,
+    /// Render every strip on the calling thread (tests compare it with the parallel render).
+    serial: bool,
 }
 
 /// What `sync` needs to fill a slot.
@@ -445,7 +447,9 @@ impl SlotCtx<'_> {
 }
 
 impl MixEngine {
+    /// Also spawns the process's render pool on first use (never from the audio thread).
     pub fn new(sample_rate: f32, max_block: usize) -> Self {
+        init_render_pool();
         let max_block = max_block.clamp(16, 16_384);
         MixEngine {
             sample_rate: if sample_rate.is_finite() && sample_rate > 0.0 { sample_rate } else { 48_000.0 },
@@ -473,6 +477,7 @@ impl MixEngine {
             adopt: HashMap::new(),
             retired: Vec::new(),
             work: Vec::new(),
+            serial: false,
         }
     }
 
@@ -751,7 +756,7 @@ impl MixEngine {
         // their instances can still be drained and torn down off the audio thread, not dropped
         // by the unwind.
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_strips(&mut work, |(i, st)| {
+            run_strips(&mut work, !self.serial, |(i, st)| {
                 if let Some(t) = s.tracks.get(*i) {
                     process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo);
                 }
@@ -1422,7 +1427,7 @@ pub fn on_audio_thread() -> bool {
 }
 
 /// Run `f` on this thread as (or as not) the audio thread, then restore the thread's own mark
-/// (also when `f` unwinds): a pool worker renders for realtime playback and offline bounces alike.
+/// (also when `f` unwinds): a global pool worker may render for an offline bounce.
 #[cfg(not(target_arch = "wasm32"))]
 fn as_audio_thread(audio: bool, f: impl FnOnce()) {
     struct Restore(bool);
@@ -1435,21 +1440,85 @@ fn as_audio_thread(audio: bool, f: impl FnOnce()) {
     f();
 }
 
-/// Process strips, in parallel on native targets when there are enough of them.
+/// Strips render in parallel from this many on; below it the fan-out costs more than it saves.
+const PARALLEL_STRIPS: usize = 4;
+
+/// The render pool never has more workers than this, whatever the core count.
+const MAX_RENDER_WORKERS: usize = 8;
+
+/// The realtime render pool: strips rendered for the audio thread run here, never on Rayon's
+/// global pool, which offline bounces and video decode/encode share and which runs at normal
+/// priority behind whatever they queued. `None` when the machine has too few cores for a pool to
+/// pay (or the threads could not be spawned): the audio thread then renders its strips itself.
 #[cfg(not(target_arch = "wasm32"))]
-fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
-    use rayon::prelude::*;
-    if work.len() >= 4 {
-        // The workers render on behalf of this thread: on the audio thread, they are it too.
-        let audio = on_audio_thread();
-        work.par_iter_mut().for_each(|w| as_audio_thread(audio, || f(w)));
-    } else {
-        work.iter_mut().for_each(f);
+static RENDER_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+
+/// Spawn the render pool, once per process. [`MixEngine::new`] calls this, so the pool exists
+/// before the first callback; it never spawns from the audio thread (a `MixEngine` built there,
+/// on a sample-rate change, reuses the pool an earlier engine built).
+#[cfg(not(target_arch = "wasm32"))]
+fn init_render_pool() {
+    if !on_audio_thread() {
+        RENDER_POOL.get_or_init(build_render_pool);
     }
 }
 
 #[cfg(target_arch = "wasm32")]
-fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
+fn init_render_pool() {}
+
+/// One worker per core but the one the audio callback runs on, at most [`MAX_RENDER_WORKERS`].
+/// Fewer than two workers is no pool: one worker plus a waiting callback is slower than the
+/// callback alone.
+///
+/// Priority: the workers run at the OS default priority. Raising them (`SetThreadPriority` or
+/// MMCSS "Pro Audio" on Windows, `SCHED_FIFO` on Linux) needs FFI, which this crate's
+/// `unsafe_code = "forbid"` rules out; the pool is still dedicated, so nothing queued by a bounce
+/// or a video job runs ahead of a strip.
+#[cfg(not(target_arch = "wasm32"))]
+fn build_render_pool() -> Option<rayon::ThreadPool> {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let workers = cores.saturating_sub(1).min(MAX_RENDER_WORKERS);
+    if workers < 2 {
+        return None;
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .thread_name(|i| format!("mix-render-{i}"))
+        // A worker only ever renders for the audio thread, so it is the audio thread for good.
+        .start_handler(|_| mark_audio_thread())
+        .build()
+        .map_err(|e| log::warn!("mix: no render pool ({e}); the audio thread renders strips itself"))
+        .ok()
+}
+
+/// Process strips, in parallel on native targets when there are enough of them.
+///
+/// On the audio thread the strips go to the dedicated render pool (or run right here when there
+/// is none); they never wait behind Rayon's global pool. Elsewhere (offline bounces) they use the
+/// global pool as before. The strips are independent and are summed afterwards in a fixed order,
+/// so the result is the same whichever way they ran.
+///
+/// Known residual, as before this pool existed: each parallel dispatch pushes one job onto Rayon's
+/// injector queue, which allocates a 1.5 KB block on the caller every 63 pushes.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_strips<T: Send>(work: &mut [T], parallel: bool, f: impl Fn(&mut T) + Sync + Send) {
+    use rayon::prelude::*;
+    if !parallel || work.len() < PARALLEL_STRIPS {
+        work.iter_mut().for_each(f);
+    } else if on_audio_thread() {
+        match RENDER_POOL.get().and_then(Option::as_ref) {
+            // The pool's workers are marked as the audio thread (`build_render_pool`).
+            Some(pool) => pool.install(|| work.par_iter_mut().for_each(f)),
+            None => work.iter_mut().for_each(f),
+        }
+    } else {
+        // A global worker renders for an offline caller here: it is not the audio thread.
+        work.par_iter_mut().for_each(|w| as_audio_thread(false, || f(w)));
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn run_strips<T: Send>(work: &mut [T], _parallel: bool, f: impl Fn(&mut T) + Sync + Send) {
     work.iter_mut().for_each(f);
 }
 
@@ -2441,17 +2510,34 @@ mod audio_thread_tests {
     /// What `on_audio_thread` says inside each strip job, for strips run from a thread that is
     /// (or is not) the audio thread.
     fn seen_by_strips(audio: bool) -> Vec<bool> {
+        jobs(audio).into_iter().map(|j| j.audio).collect()
+    }
+
+    /// Where one strip job ran.
+    #[derive(Clone, Copy, Default)]
+    struct Job {
+        audio: bool,
+        /// On a worker of Rayon's global pool.
+        global: bool,
+        /// On a worker of the render pool.
+        render: bool,
+    }
+
+    fn jobs(audio: bool) -> Vec<Job> {
+        init_render_pool();
         std::thread::spawn(move || {
             if audio {
                 mark_audio_thread();
             }
-            let mut work = vec![None; 64];
-            run_strips(&mut work, |w| {
+            let mut work = vec![Job::default(); 64];
+            run_strips(&mut work, true, |w| {
                 // Long enough that the pool's workers take part.
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                *w = Some(on_audio_thread());
+                let render = std::thread::current().name().is_some_and(|n| n.starts_with("mix-render-"));
+                let global = rayon::current_thread_index().is_some() && !render;
+                *w = Job { audio: on_audio_thread(), global, render };
             });
-            work.into_iter().map(|w| w.unwrap()).collect()
+            work
         })
         .join()
         .unwrap()
@@ -2461,6 +2547,73 @@ mod audio_thread_tests {
     fn strips_rendered_for_the_audio_thread_count_as_the_audio_thread_and_only_then() {
         assert!(seen_by_strips(true).iter().all(|&rt| rt), "a worker rendering for the audio thread is on it");
         assert!(seen_by_strips(false).iter().all(|&rt| !rt), "the workers don't stay marked afterwards");
+    }
+
+    /// ADR 0012 gate G1: a render on the audio thread dispatches no job to the global pool.
+    #[test]
+    fn audio_thread_strips_never_reach_the_global_rayon_pool() {
+        let audio = jobs(true);
+        assert!(audio.iter().all(|j| !j.global), "an audio-thread strip ran on the global pool");
+        if RENDER_POOL.get().is_some_and(Option::is_some) {
+            assert!(audio.iter().any(|j| j.render), "with a render pool, the strips fan out to it");
+        }
+        let offline = jobs(false);
+        assert!(offline.iter().all(|j| !j.render), "an offline render never takes the render pool");
+    }
+
+    /// Sixteen strips of distinct deterministic material, levels, pans and built-in inserts.
+    fn sixteen_strips() -> Session {
+        use soundcraft_audio_io::AudioBuffer;
+        use soundcraft_model::{Insert, SourceAudio, SourceId};
+        let mut s = Session::default();
+        let len = 48_000usize;
+        for k in 0..16u32 {
+            let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+            let f = 0.003 + 0.0007 * k as f32;
+            let signal: Vec<f32> = (0..len).map(|i| (i as f32 * f).sin() * 0.2 + ((i * (k as usize + 3)) % 97) as f32 * 1e-3).collect();
+            let src = SourceId(1000 + u64::from(k));
+            s.pool.insert(src, std::sync::Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![signal] })));
+            let id = s.new_clip_id();
+            let tr = s.track_mut(t).unwrap();
+            tr.playlist_mut().unwrap().clips.push(Clip::audio(id, "x", src, 0, 0, len as i64));
+            tr.mixer.volume_db = -(k as f32) * 0.5;
+            tr.mixer.pan = vec![(k as f32 / 7.5) - 1.0];
+            tr.mixer.inserts[0] = Some(Insert::new(if k % 2 == 0 { "compressor" } else { "room_reverb" }));
+        }
+        s
+    }
+
+    /// Render `blocks` blocks of 512 on a fresh thread, marked as the audio thread or not.
+    fn render_blocks(s: &Session, serial: bool, audio: bool, blocks: i64) -> Vec<Vec<f32>> {
+        let s = s.clone();
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.serial = serial;
+        std::thread::spawn(move || {
+            if audio {
+                mark_audio_thread();
+            }
+            let mut all = vec![Vec::new(); 2];
+            let mut out = vec![vec![0.0f32; 512]; 2];
+            for b in 0..blocks {
+                eng.render(&s, b * 512, 512, &mut out);
+                for (a, o) in all.iter_mut().zip(&out) {
+                    a.extend_from_slice(o);
+                }
+            }
+            all
+        })
+        .join()
+        .unwrap()
+    }
+
+    #[test]
+    fn parallel_and_serial_renders_are_bit_identical() {
+        let s = sixteen_strips();
+        let serial = render_blocks(&s, true, false, 40);
+        assert!(serial[0].iter().any(|x| x.abs() > 1e-3), "the fixture should sound");
+        assert!(serial == render_blocks(&s, false, true, 40), "render pool differs from serial");
+        assert!(serial == render_blocks(&s, false, false, 40), "global pool differs from serial");
+        assert!(serial == render_blocks(&s, true, true, 40), "serial on the audio thread differs");
     }
 }
 
