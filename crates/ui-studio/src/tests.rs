@@ -1597,7 +1597,7 @@ fn deleting_an_fx_channel_whose_bus_feeds_another_aux_keeps_the_bus() {
 fn delete_key_on_a_selected_fx_track_runs_the_composite() {
     let (mut app, _ctx, _time, t) = mixer_app();
     let fx = app.new_fx_channel(Some(t), 0.0).unwrap();
-    app.run("edit.select", json!({"tracks": [fx.0]})).unwrap();
+    app.focus_header(fx, false);
     app.delete_selected().unwrap();
     let s = app.engine.session();
     assert!(s.track(fx).is_none() && s.busses.is_empty());
@@ -1646,4 +1646,167 @@ fn orphan_buses_leave_the_routing_menus_and_one_entry_removes_them() {
     assert_eq!(undo_len(&mut app), before + 1, "one undo entry");
     app.run("edit.undo", json!({})).unwrap();
     assert_eq!(app.engine.session().busses.len(), 3);
+}
+
+/// Two empty audio tracks and one with a clip, in a fresh app with the arrangement laid out.
+fn delete_app() -> (StudioApp, egui::Context, f64, [TrackId; 3]) {
+    let (mut app, ctx, mut time, a) = mixer_app();
+    let b = TrackId(app.run("track.new", json!({"kind": "audio", "name": "Bass"})).unwrap()["tracks"][0].as_u64().unwrap());
+    let c = TrackId(app.run("track.new", json!({"kind": "instrument", "name": "Keys"})).unwrap()["tracks"][0].as_u64().unwrap());
+    app.run("midi.new_clip", json!({"tracks": [c.0], "start": 0, "end": 0})).unwrap();
+    app.run("edit.select_none", json!({})).unwrap();
+    app.ui.show_mixer = false;
+    frames(&mut app, &ctx, 4, &mut time);
+    (app, ctx, time, [a, b, c])
+}
+
+fn header_mid(app: &StudioApp, t: TrackId) -> (f32, f32) {
+    let hdr = app.arrange.layout.tracks.iter().find(|r| r.id == t.0).unwrap().header;
+    (hdr[0] + 30.0, (hdr[1] + hdr[3]) / 2.0)
+}
+
+fn track_count(app: &StudioApp) -> usize {
+    app.engine.session().tracks.iter().filter(|t| t.kind != soundcraft_model::TrackKind::Master).count()
+}
+
+const NO_HEADER: &str = "Select a track header to delete the track";
+
+#[test]
+fn clip_click_then_delete_twice_keeps_the_track() {
+    let (mut app, ctx, mut time, [_, _, keys]) = delete_app();
+    let clip = app.engine.session().track(keys).unwrap().clips()[0].id;
+    app.click_clip(clip, false);
+    key(&mut app, "Delete");
+    frames(&mut app, &ctx, 4, &mut time);
+    assert!(app.engine.session().track(keys).unwrap().clips().is_empty(), "first Delete removes the clip");
+    key(&mut app, "Delete");
+    frames(&mut app, &ctx, 4, &mut time);
+    assert!(app.engine.session().track(keys).is_some(), "second Delete leaves the track");
+    assert_eq!(app.status, NO_HEADER);
+}
+
+#[test]
+fn lane_click_then_delete_keeps_the_track() {
+    let (mut app, ctx, mut time, [a, ..]) = delete_app();
+    app.click_empty(Some(a), 1000);
+    key(&mut app, "Delete");
+    frames(&mut app, &ctx, 4, &mut time);
+    assert!(app.engine.session().track(a).is_some());
+    assert_eq!(app.status, NO_HEADER);
+}
+
+#[test]
+fn select_all_then_delete_keeps_every_track() {
+    let (mut app, ctx, mut time, _) = delete_app();
+    let n = track_count(&app);
+    let undo = undo_len(&mut app);
+    app.run("edit.select_all", json!({})).unwrap();
+    key(&mut app, "Delete");
+    frames(&mut app, &ctx, 4, &mut time);
+    assert_eq!(track_count(&app), n);
+    assert_eq!(undo_len(&mut app), undo);
+    assert_eq!(app.status, NO_HEADER);
+}
+
+#[test]
+fn header_click_then_delete_removes_an_empty_track_in_one_undo_step() {
+    let (mut app, ctx, mut time, [a, ..]) = delete_app();
+    let at = header_mid(&app, a);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 4, &mut time);
+    assert!(app.tracks_selected_by_header);
+    let undo = undo_len(&mut app);
+    key(&mut app, "Delete");
+    frames(&mut app, &ctx, 4, &mut time);
+    assert!(app.engine.session().track(a).is_none());
+    assert!(app.dialog.is_none(), "an empty track needs no confirmation");
+    assert_eq!(undo_len(&mut app), undo + 1);
+    assert_eq!(app.status, "Deleted Gtr");
+}
+
+#[test]
+fn deleting_a_track_with_clips_asks_first_escape_cancels_enter_deletes() {
+    let (mut app, ctx, mut time, [_, _, keys]) = delete_app();
+    let at = header_mid(&app, keys);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 4, &mut time);
+    key(&mut app, "Delete");
+    frames(&mut app, &ctx, 4, &mut time);
+    assert!(matches!(app.dialog, Some(crate::Dialog::DeleteTracks { clips: true, .. })));
+    assert!(app.engine.session().track(keys).is_some());
+    key(&mut app, "Escape");
+    frames(&mut app, &ctx, 4, &mut time);
+    assert!(app.dialog.is_none());
+    assert!(app.engine.session().track(keys).is_some(), "Escape cancels");
+    let undo = undo_len(&mut app);
+    let at = header_mid(&app, keys);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 4, &mut time);
+    key(&mut app, "Delete");
+    frames(&mut app, &ctx, 4, &mut time);
+    assert!(app.dialog.is_some());
+    key(&mut app, "Enter");
+    frames(&mut app, &ctx, 4, &mut time);
+    assert!(app.dialog.is_none());
+    assert!(app.engine.session().track(keys).is_none(), "Enter deletes");
+    assert_eq!(undo_len(&mut app), undo + 1);
+}
+
+#[test]
+fn shift_clicking_two_headers_then_delete_confirms_and_is_one_undo_step() {
+    let (mut app, ctx, mut time, [a, b, _]) = delete_app();
+    let at = header_mid(&app, a);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 4, &mut time);
+    let at = header_mid(&app, b);
+    click_with(&mut app, at, json!({"shift": true}));
+    frames(&mut app, &ctx, 4, &mut time);
+    assert_eq!(app.engine.session().edit.selected_tracks.len(), 2);
+    let undo = undo_len(&mut app);
+    key(&mut app, "Delete");
+    frames(&mut app, &ctx, 4, &mut time);
+    assert!(matches!(app.dialog, Some(crate::Dialog::DeleteTracks { clips: false, .. })));
+    assert_eq!(track_count(&app), 3, "nothing deleted before the answer");
+    key(&mut app, "Enter");
+    frames(&mut app, &ctx, 4, &mut time);
+    assert_eq!(track_count(&app), 1);
+    assert_eq!(undo_len(&mut app), undo + 1, "one undo entry");
+    assert_eq!(app.status, "Deleted 2 tracks");
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(track_count(&app), 3);
+}
+
+#[test]
+fn the_header_menu_delete_asks_when_the_track_has_clips() {
+    let (mut app, ctx, mut time, [_, _, keys]) = delete_app();
+    let at = header_mid(&app, keys);
+    right_click(&mut app, at);
+    frames(&mut app, &ctx, 6, &mut time);
+    let item = app.arrange.menu.iter().find(|m| m.label == "Delete Track").cloned().expect("Delete Track");
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert!(app.dialog.is_some());
+    assert!(app.engine.session().track(keys).is_some());
+}
+
+#[test]
+fn the_master_is_never_deleted() {
+    let (mut app, ..) = delete_app();
+    let master = app.engine.session().tracks.iter().find(|t| t.kind == soundcraft_model::TrackKind::Master).map(|t| t.id);
+    if let Some(m) = master {
+        assert!(app.request_delete_tracks(vec![m]).is_err());
+        assert!(app.engine.session().track(m).is_some());
+    }
+}
+
+#[test]
+fn remove_unused_buses_says_what_it_cleared() {
+    let (mut app, _ctx, _time, t) = mixer_app();
+    app.run("mix.new_bus", json!({"name": "Lost 1"})).unwrap();
+    app.run("mix.new_bus", json!({"name": "Lost 2"})).unwrap();
+    app.run("mix.send", json!({"tracks": [t.0], "slot": 0, "target": "Lost 1", "level": 0.0})).ok();
+    app.run("track.output", json!({"tracks": [t.0], "output": "Lost 2"})).ok();
+    app.remove_unused_busses().unwrap();
+    assert!(app.status.starts_with("Removed 2 unused buses"), "{}", app.status);
+    assert!(app.status.contains("cleared"), "{}", app.status);
 }

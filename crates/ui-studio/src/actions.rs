@@ -128,19 +128,22 @@ impl StudioApp {
         self.run("edit.separate", json!({"tracks": tracks, "at": at}))
     }
 
-    /// Delete the selected clips (only them, not the time range they cover).
+    /// Delete the selected clips (only them, not the time range they cover). With no clips
+    /// selected, Delete takes the selected tracks, but only when their headers were what the
+    /// user selected (Ableton); anything else does nothing.
     pub fn delete_selected(&mut self) -> Result<Value, String> {
         let sel = self.selected_clips();
         if sel.is_empty() {
-            // No clips: Delete takes the selected tracks (never the master).
             let s = self.engine.session();
             let tracks: Vec<TrackId> =
                 s.edit.selected_tracks.iter().copied().filter(|t| s.track(*t).is_some_and(|t| t.kind != TrackKind::Master)).collect();
-            for t in &tracks {
-                let _ = self.delete_track(*t);
+            if !self.tracks_selected_by_header || tracks.is_empty() {
+                self.status = "Select a track header to delete the track".into();
+                return Err(self.status.clone());
             }
-            return Ok(json!({"removed": 0, "tracks": tracks.len()}));
+            return self.request_delete_tracks(tracks);
         }
+        self.tracks_selected_by_header = false;
         let mut tracks: Vec<u64> = sel.iter().map(|(t, _, _)| t.0).collect();
         tracks.dedup();
         let clips: Vec<u64> = sel.iter().map(|(_, c, _)| c.0).collect();
@@ -148,25 +151,100 @@ impl StudioApp {
         self.run("edit.clear", json!({"tracks": tracks, "clips": clips, "start": 0, "end": 0}))
     }
 
-    /// Delete a track. An FX channel (an aux track listening to a bus) takes its bus with it when
-    /// nothing else listens to or feeds the bus, and its senders' sends to it go first: one undo
-    /// step. If other tracks listen to or feed the bus, only the track goes.
-    pub fn delete_track(&mut self, t: TrackId) -> Result<Value, String> {
+    /// Delete `tracks` now when that is one empty track; otherwise ask first ("Delete 3 tracks
+    /// and their clips?"). The master is never deleted.
+    pub fn request_delete_tracks(&mut self, tracks: Vec<TrackId>) -> Result<Value, String> {
         let s = self.engine.session_arc();
-        let Some(track) = s.track(t) else { return Err("no such track".into()) };
+        let tracks: Vec<TrackId> = tracks.into_iter().filter(|t| s.track(*t).is_some_and(|t| t.kind != TrackKind::Master)).collect();
+        if tracks.is_empty() {
+            self.status = "The master track can't be deleted".into();
+            return Err(self.status.clone());
+        }
+        let clips = tracks.iter().any(|t| s.track(*t).is_some_and(|t| !t.clips().is_empty()));
+        if tracks.len() > 1 || clips {
+            self.dialog = Some(crate::Dialog::DeleteTracks { tracks, clips });
+            return Ok(json!({"confirm": true}));
+        }
+        self.delete_tracks(&tracks)
+    }
+
+    /// Delete one track (see [`Self::delete_tracks`]).
+    pub fn delete_track(&mut self, t: TrackId) -> Result<Value, String> {
+        self.delete_tracks(&[t])
+    }
+
+    /// Delete tracks as one undo step. An FX channel (an aux track listening to a bus) takes its
+    /// bus with it when nothing else listens to or feeds the bus, and its senders' sends to it go
+    /// first. The first error stops the batch, undoes it and goes to the status line. The master
+    /// is never deleted.
+    pub fn delete_tracks(&mut self, tracks: &[TrackId]) -> Result<Value, String> {
+        self.tracks_selected_by_header = false;
+        self.mixer.serial += 1;
+        let key = format!("delete-tracks:{}", self.mixer.serial);
+        let before = self.engine.session_arc();
+        self.engine.end_merge();
+        let mut notes: Vec<String> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut last = json!({});
+        let mut failed: Option<String> = None;
+        for t in tracks {
+            match self.delete_track_in(*t, &key) {
+                Ok((v, name, note)) => {
+                    last = v;
+                    names.push(name);
+                    notes.extend(note);
+                }
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        self.engine.end_merge();
+        if let Some(e) = failed {
+            if !std::sync::Arc::ptr_eq(&before, &self.engine.session_arc()) {
+                self.engine.undo();
+            }
+            self.status = e;
+            return Err(self.status.clone());
+        }
+        self.status = match (names.len(), notes.first()) {
+            (1, Some(n)) => n.clone(),
+            (1, None) => format!("Deleted {}", names[0]),
+            (n, _) => format!("Deleted {n} tracks"),
+        };
+        Ok(last)
+    }
+
+    /// One track's deletion under `key`: (result, name, a status note for the special cases).
+    fn delete_track_in(&mut self, t: TrackId, key: &str) -> Result<(Value, String, Option<String>), String> {
+        let s = self.engine.session_arc();
+        let Some(track) = s.track(t) else { return Err("Delete track: no such track".into()) };
         let name = track.name.clone();
+        if track.kind == TrackKind::Master {
+            return Err("The master track can't be deleted".into());
+        }
+        let fail = |e: soundcraft_engine::EngineError| format!("Delete {name}: {e}");
         let bus = match (&track.kind, &track.mixer.input) {
             (TrackKind::Aux, Route::Bus(b)) => Some(*b),
             _ => None,
         };
-        let Some(bus) = bus else { return self.run("track.delete", json!({"tracks": [t.0]})) };
+        let Some(bus) = bus else {
+            let folder_bus = match (&track.kind, &track.mixer.input) {
+                (TrackKind::Folder, Route::Bus(b)) => Some(*b),
+                _ => None,
+            };
+            let r = self.engine.execute_merged("track.delete", &json!({"tracks": [t.0]}), key).map_err(fail)?;
+            let note = folder_bus
+                .filter(|b| crate::mixer::orphan_busses(&self.engine.session_arc()).contains(b))
+                .map(|_| format!("Deleted {name}; its bus stays, remove it with Remove unused buses"));
+            return Ok((r, name, note));
+        };
         let (listeners, feeders, senders) = s.bus_usage(bus);
         if listeners != [t] || !feeders.is_empty() {
-            let r = self.run("track.delete", json!({"tracks": [t.0]}));
-            if r.is_ok() {
-                self.status = format!("Deleted {name}; its bus stays, other tracks use it");
-            }
-            return r;
+            let r = self.engine.execute_merged("track.delete", &json!({"tracks": [t.0]}), key).map_err(fail)?;
+            let note = format!("Deleted {name}; its bus stays, other tracks use it");
+            return Ok((r, name, Some(note)));
         }
         let mut sends: Vec<(u64, usize)> = Vec::new();
         for id in &senders {
@@ -176,36 +254,18 @@ impl StudioApp {
                 }
             }
         }
-        self.mixer.serial += 1;
-        let key = format!("delete-fx:{}", self.mixer.serial);
-        self.engine.end_merge();
-        let r = (|| {
-            let e = &mut self.engine;
-            for (id, slot) in &sends {
-                e.execute_merged("mix.send_remove", &json!({"track": id, "slot": slot}), &key)?;
-            }
-            let r = e.execute_merged("track.delete", &json!({"tracks": [t.0]}), &key)?;
-            e.execute_merged("mix.remove_bus", &json!({"bus": bus.0}), &key)?;
-            Ok::<Value, soundcraft_engine::EngineError>(r)
-        })();
-        self.engine.end_merge();
-        match r {
-            Ok(r) => {
-                self.status = match sends.len() {
-                    0 => format!("Removed {name}"),
-                    1 => format!("Removed {name} and its send"),
-                    n => format!("Removed {name} and its {n} sends"),
-                };
-                Ok(r)
-            }
-            Err(e) => {
-                if !std::sync::Arc::ptr_eq(&s, &self.engine.session_arc()) {
-                    self.engine.undo();
-                }
-                self.status = format!("Delete {name}: {e}");
-                Err(self.status.clone())
-            }
+        let e = &mut self.engine;
+        for (id, slot) in &sends {
+            e.execute_merged("mix.send_remove", &json!({"track": id, "slot": slot}), key).map_err(fail)?;
         }
+        let r = e.execute_merged("track.delete", &json!({"tracks": [t.0]}), key).map_err(fail)?;
+        e.execute_merged("mix.remove_bus", &json!({"bus": bus.0}), key).map_err(fail)?;
+        let note = match sends.len() {
+            0 => format!("Removed {name}"),
+            1 => format!("Removed {name} and its send"),
+            n => format!("Removed {name} and its {n} sends"),
+        };
+        Ok((r, name, Some(note)))
     }
 
     /// Remove every bus nobody listens to, as one undo step.
@@ -219,17 +279,31 @@ impl StudioApp {
         self.mixer.serial += 1;
         let key = format!("remove-unused:{}", self.mixer.serial);
         self.engine.end_merge();
+        let (mut sends, mut outputs) = (0, 0);
         let r = (|| {
             for b in &orphans {
                 // `force`: a bus nobody hears may still have sends and outputs; they are cleared.
-                self.engine.execute_merged("mix.remove_bus", &json!({"bus": b.0, "force": true}), &key)?;
+                let r = self.engine.execute_merged("mix.remove_bus", &json!({"bus": b.0, "force": true}), &key)?;
+                let n = |k: &str| r["cleared"][k].as_array().map_or(0, Vec::len);
+                sends += n("senders");
+                outputs += n("feeders");
             }
             Ok::<(), soundcraft_engine::EngineError>(())
         })();
         self.engine.end_merge();
         match r {
             Ok(()) => {
-                self.status = format!("Removed {} unused bus{}", orphans.len(), if orphans.len() == 1 { "" } else { "es" });
+                let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
+                let mut cleared = Vec::new();
+                if sends > 0 {
+                    cleared.push(plural(sends, "send"));
+                }
+                if outputs > 0 {
+                    cleared.push(plural(outputs, "output"));
+                }
+                let tail = if cleared.is_empty() { String::new() } else { format!(" (cleared {})", cleared.join(", ")) };
+                let buses = if orphans.len() == 1 { "1 unused bus".to_string() } else { format!("{} unused buses", orphans.len()) };
+                self.status = format!("Removed {buses}{tail}");
                 Ok(json!({"removed": orphans.len()}))
             }
             Err(e) => {

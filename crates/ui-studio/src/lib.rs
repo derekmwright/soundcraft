@@ -121,6 +121,8 @@ pub struct MeterDisplay {
 pub enum Dialog {
     /// Save changes before running `then` (session.new/open, app.quit).
     SaveChanges { then: (String, Value) },
+    /// Delete several tracks, or tracks that hold clips (Delete key or the track menu).
+    DeleteTracks { tracks: Vec<TrackId>, clips: bool },
 }
 
 /// An editor asked for (by `ui.set` or a menu) and not open yet: retried until the plug-in is
@@ -173,6 +175,10 @@ pub struct StudioApp {
     synthetic_mods: Option<egui::Modifiers>,
     theme_applied: bool,
     pub dialog: Option<Dialog>,
+    /// The selected tracks were picked by clicking their headers (arrangement header or mixer
+    /// strip): only then does Delete take the tracks (Ableton). Any other selection change, such
+    /// as a clip click, a lane click or Select All, clears it. View state, not the document.
+    pub tracks_selected_by_header: bool,
     editors: Vec<EditorWanted>,
     /// The arrangement: gesture in progress, scroll, and last frame's layout (for `ui.inspect`).
     pub arrange: arrange::ArrangeState,
@@ -221,6 +227,7 @@ impl StudioApp {
             synthetic_mods: None,
             theme_applied: false,
             dialog: None,
+            tracks_selected_by_header: false,
             editors: Vec::new(),
             arrange: arrange::ArrangeState::default(),
             copied: Vec::new(),
@@ -284,6 +291,11 @@ impl StudioApp {
         if id.starts_with("session.save") || id.starts_with("file.bounce") {
             // Third-party plugins keep state the session can't see: store it first.
             self.capture_plugin_states();
+        }
+        // Any edit command (selection included) ends a header selection; `focus_header` sets it
+        // again after its own `edit.select`.
+        if id.starts_with("edit.") || id.starts_with("clip.") || id.starts_with("midi.") {
+            self.tracks_selected_by_header = false;
         }
         let replacing = matches!(id, "session.new" | "session.open" | "session.close" | "session.revert");
         let (restore, mode) = {
@@ -555,7 +567,10 @@ impl StudioApp {
             "cursor": self.cursor(),
             "cursor_track": self.cursor_track(),
             "selected_clips": self.engine.session().edit.selected_clips,
-            "dialog": self.dialog.as_ref().map(|Dialog::SaveChanges { .. }| "save_changes"),
+            "dialog": self.dialog.as_ref().map(|d| match d {
+                Dialog::SaveChanges { .. } => "save_changes",
+                Dialog::DeleteTracks { .. } => "delete_tracks",
+            }),
             "frame_ms": self.frame_ms,
             "audio_device": self.player.as_ref().map(|p| p.device_name.clone()),
             "editors_open": open,

@@ -456,6 +456,25 @@ impl StudioApp {
         self.set_cursor(at, Some(t));
     }
 
+    /// A click on a track's header (arrangement) or channel strip (mixer): focus it, and let
+    /// Delete take it. `additive` (Shift) adds it to the selected tracks, or removes it again.
+    pub fn focus_header(&mut self, t: TrackId, additive: bool) {
+        if !additive {
+            self.focus(t);
+            self.tracks_selected_by_header = true;
+            return;
+        }
+        let mut tracks: Vec<u64> = self.engine.session().edit.selected_tracks.iter().map(|x| x.0).collect();
+        if let Some(i) = tracks.iter().position(|x| *x == t.0) {
+            tracks.remove(i);
+        } else {
+            tracks.push(t.0);
+        }
+        self.ui.focus_track = Some(t);
+        let _ = self.run("edit.select", json!({"tracks": tracks}));
+        self.tracks_selected_by_header = !tracks.is_empty();
+    }
+
     /// Fader gesture: one undo step per drag (merge key `fader:<track>`).
     pub fn set_volume_merged(&mut self, t: TrackId, db: f32) -> Result<Value, String> {
         self.engine.execute_merged("mix.volume", &json!({"tracks": [t.0], "db": db}), &format!("fader:{}", t.0)).map_err(|e| e.to_string())
@@ -1397,7 +1416,8 @@ fn strip(
     // Anywhere on the strip focuses it; controls drawn after this take their own clicks.
     let resp = ui.interact(r.intersect(clip), ui.id().with(("strip_name", id.0)), Sense::click());
     if resp.clicked() {
-        app.focus(id);
+        let shift = ui.input(|i| i.modifiers.shift);
+        app.focus_header(id, shift);
     }
     let mut y = r.min.y + 26.0;
     // Input (audio and aux tracks; instrument input is MIDI and there is no MIDI device layer).

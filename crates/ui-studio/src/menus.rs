@@ -8,6 +8,7 @@ use crate::theme::{STATUS_H, TOKENS};
 use crate::{Dialog, StudioApp};
 use egui::{Key, Modifiers};
 use serde_json::{Value, json};
+use soundcraft_model::TrackId;
 
 impl StudioApp {
     /// Run a session-replacing command or Quit, asking to save unsaved changes first.
@@ -278,6 +279,9 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
 
 /// The save-changes question.
 pub fn dialogs(app: &mut StudioApp, ctx: &egui::Context) {
+    if let Some(Dialog::DeleteTracks { tracks, clips }) = app.dialog.clone() {
+        return delete_tracks_dialog(app, ctx, &tracks, clips);
+    }
     let Some(Dialog::SaveChanges { then }) = app.dialog.clone() else { return };
     let mut choice = None;
     egui::Modal::new(egui::Id::new("save_changes")).show(ctx, |ui| {
@@ -310,6 +314,39 @@ pub fn dialogs(app: &mut StudioApp, ctx: &egui::Context) {
         }
         Some(_) => app.dialog = None,
         None => {}
+    }
+}
+
+/// "Delete 3 tracks and their clips?" [Delete] [Cancel]; Enter confirms, Escape cancels.
+fn delete_tracks_dialog(app: &mut StudioApp, ctx: &egui::Context, tracks: &[TrackId], clips: bool) {
+    let mut choice = None;
+    egui::Modal::new(egui::Id::new("delete_tracks")).show(ctx, |ui| {
+        ui.set_width(340.0);
+        let what = match (tracks.len(), clips) {
+            (1, true) => {
+                let name = app.engine.session().track(tracks[0]).map_or("the track".to_string(), |t| format!("“{}”", t.name));
+                format!("Delete {name} and its clips?")
+            }
+            (1, false) => "Delete the track?".to_string(),
+            (n, true) => format!("Delete {n} tracks and their clips?"),
+            (n, false) => format!("Delete {n} tracks?"),
+        };
+        ui.label(egui::RichText::new(what).strong());
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Delete").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                choice = Some(true);
+            }
+            if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                choice = Some(false);
+            }
+        });
+    });
+    if let Some(yes) = choice {
+        app.dialog = None;
+        if yes {
+            let _ = app.delete_tracks(tracks);
+        }
     }
 }
 

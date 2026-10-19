@@ -273,7 +273,8 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     let name_area = Rect::from_min_max(r.min, pos2(r.max.x - 92.0, r.max.y));
     let resp = ui.interact(name_area.intersect(list), ui.id().with(("hdr", t.id.0)), Sense::click());
     if resp.clicked() {
-        app.focus(t.id);
+        let shift = ui.input(|i| i.modifiers.shift);
+        app.focus_header(t.id, shift);
     }
     let id = t.id;
     let kind = t.kind;
@@ -329,7 +330,7 @@ fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, ha
     let del = ui.button("Delete Track");
     app.arrange.menu.push(crate::mixer::MenuItem::at(ui, "Delete Track".into(), String::new(), del.rect));
     if del.clicked() {
-        let _ = app.delete_track(id);
+        let _ = app.request_delete_tracks(vec![id]);
         ui.close();
     }
 }
