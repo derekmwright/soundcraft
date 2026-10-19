@@ -8,6 +8,7 @@
 
 pub mod actions;
 pub mod arrange;
+pub mod browser;
 pub mod control;
 pub mod devices;
 pub mod fine;
@@ -76,6 +77,8 @@ pub struct UiState {
     /// state of the open session, never in the document; shown by `ui.inspect`, never loaded.
     #[serde(skip_deserializing)]
     pub collapsed: Vec<TrackId>,
+    /// The browser's view preferences (slice 4): shown, width, tab, locations, favorites.
+    pub browser: browser::BrowserPrefs,
 }
 
 impl Default for UiState {
@@ -97,6 +100,7 @@ impl Default for UiState {
             focus_track: None,
             keys: keys::KeysPrefs::default(),
             collapsed: Vec::new(),
+            browser: browser::BrowserPrefs::default(),
         }
     }
 }
@@ -194,6 +198,8 @@ pub struct StudioApp {
     pub mixer: mixer::MixerState,
     /// The piano roll (slice 3): open clip, selection, gesture, scroll, last frame's layout.
     pub keys: keys::KeysState,
+    /// The browser (slice 4): listings, selection, drag, last frame's layout.
+    pub browser: browser::BrowserState,
 }
 
 impl StudioApp {
@@ -239,6 +245,7 @@ impl StudioApp {
             copied: Vec::new(),
             mixer: mixer::MixerState::default(),
             keys: keys::KeysState::default(),
+            browser: browser::BrowserState::default(),
         }
     }
 
@@ -540,10 +547,12 @@ impl StudioApp {
         ui.set_style(ctx.global_style());
         keys::shortcuts(self, &ctx); // slice 3: before the arrangement's keys
         groups::shortcuts(self, &ctx);
+        browser::shortcuts(self, &ctx);
         menus::shortcuts(self, &ctx);
         menus::menu_bar(self, ui);
         transport::bar(self, ui);
         menus::status_bar(self, ui);
+        browser::panel(self, ui); // slice 4: left of the panes and the arrangement
         // Slice 3: the piano roll replaces the mixer and device chain panes while it is open.
         if !keys::pane(self, ui) {
             mixer::panes(self, ui);
@@ -603,10 +612,13 @@ impl StudioApp {
             "wheel_merge": self.mixer.wheel.is_some(),
             "plugin_scan": plugin_scan::inspect(),
             "keys": self.keys.layout,
+            "browser": self.browser.layout,
         })
     }
 }
 
+#[cfg(test)]
+mod browser_tests;
 #[cfg(test)]
 mod groups_tests;
 #[cfg(test)]

@@ -201,6 +201,10 @@ fn services() -> Services {
     Services {
         pick_open: Some(Box::new(|purpose: &str| {
             let d = rfd::FileDialog::new();
+            if purpose == "folder" {
+                // The browser's Add Folder (slice 4).
+                return d.pick_folder().map(|p| p.to_string_lossy().into_owned());
+            }
             let d = match purpose {
                 "session.open" => d.add_filter("Session", &["scraft"]),
                 _ => d.add_filter("Audio", &["wav", "wave", "aif", "aiff", "flac", "mp3", "ogg"]),

@@ -118,20 +118,27 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                 // Where the Track menu sits, for `ui.inspect` and tests (slice 2c).
                 app.arrange.bar_menu.retain(|m| m.label != "Track");
                 app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Track".into(), String::new(), track_menu.response.rect));
-                ui.menu_button("View", |ui| {
+                let mut view_items = Vec::new();
+                let view_menu = ui.menu_button("View", |ui| {
                     let u = &mut app.ui;
                     for (label, key, flag) in [
+                        ("Browser", "Ctrl+Alt+B", &mut u.browser.show),
                         ("Mixer", "Ctrl+Alt+M", &mut u.show_mixer),
                         ("Devices", "Ctrl+Alt+L", &mut u.show_devices),
                         ("Full Mixer Window", "F3", &mut u.mixer_full),
                     ] {
                         let text = if *flag { format!("✓ {label}") } else { format!("   {label}") };
-                        if ui.add(egui::Button::new(text).shortcut_text(key)).clicked() {
+                        let b = ui.add(egui::Button::new(text).shortcut_text(key));
+                        view_items.push(crate::mixer::MenuItem::at(ui, label.into(), String::new(), b.rect));
+                        if b.clicked() {
                             *flag = !*flag;
                             ui.close();
                         }
                     }
                 });
+                // Where the View menu and its entries sit, for `ui.inspect` and tests (slice 4).
+                app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "View".into(), String::new(), view_menu.response.rect));
+                app.arrange.bar_menu.extend(view_items);
                 ui.menu_button("Transport", |ui| {
                     let cycle = app.engine.session().edit.loop_playback;
                     let items: [(&str, &str, &str, Value); 4] = [
