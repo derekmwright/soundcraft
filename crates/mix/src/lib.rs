@@ -726,7 +726,6 @@ impl MixEngine {
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
     pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
         let frames = frames.min(self.max_block);
-        promote_callback_thread();
         // Stopped, the position stands still: not a seek (it would cut auditioned notes).
         if pos != self.last_end && !self.monitor_only {
             // Seek: silence held notes and ringing plugins.
@@ -1471,58 +1470,13 @@ pub const MAX_RENDER_WORKERS: usize = 8;
 pub const RENDER_POOL_ENV: &str = "SOUNDCRAFT_RENDER_POOL";
 
 /// Environment variable: `1` leaves the render pool's workers at the OS default priority instead
-/// of promoting them with [`soundcraft_rt::promote_audio_thread`], and likewise the audio
-/// callback thread. Read once, when the render pool is built.
+/// of promoting them with [`soundcraft_rt::promote_audio_thread`]. Read once, when the render
+/// pool is built. It does not affect the audio callback thread: this crate never promotes that.
 pub const RENDER_NO_PRIORITY_ENV: &str = "SOUNDCRAFT_RENDER_NO_PRIORITY";
 
 /// Audio-thread strips render serially when set ([`MixEngine::force_serial`]). On by default;
 /// [`RENDER_POOL_ENV`] clears it at startup.
 static FORCE_SERIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// False under [`RENDER_NO_PRIORITY_ENV`]: the audio callback thread is then left alone.
-#[cfg(not(target_arch = "wasm32"))]
-static PROMOTE_CALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// What the first audio callback thread's promotion achieved (see [`promote_callback_thread`]).
-#[cfg(not(target_arch = "wasm32"))]
-static CALLBACK_PROMOTION: std::sync::OnceLock<soundcraft_rt::Promotion> = std::sync::OnceLock::new();
-
-#[cfg(not(target_arch = "wasm32"))]
-std::thread_local! {
-    /// Whether this thread has had its one promotion attempt as the audio callback thread.
-    static CALLBACK_TRIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Promote the calling thread once if it is the audio callback thread (marked with
-/// [`mark_audio_thread`]); every later call is one thread-local read. Serial rendering runs the
-/// strips on the callback thread, so it needs the realtime class the pool workers get at start.
-///
-/// Allocation: the repeat path allocates nothing (a `const` thread-local `Cell`). The first call
-/// on a thread makes the OS call, which may allocate inside the OS (MMCSS registration), once
-/// per thread, in that thread's first block. A thread that is not marked (an offline render) is
-/// never promoted.
-#[cfg(not(target_arch = "wasm32"))]
-fn promote_callback_thread() {
-    if !on_audio_thread() || CALLBACK_TRIED.replace(true) {
-        return;
-    }
-    if PROMOTE_CALLBACK.load(std::sync::atomic::Ordering::Relaxed) {
-        let _ = CALLBACK_PROMOTION.set(soundcraft_rt::promote_audio_thread());
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn promote_callback_thread() {}
-
-/// The first audio callback thread's promotion (`None` before its first block, or under
-/// [`RENDER_NO_PRIORITY_ENV`]). For diagnostics and tests.
-#[must_use]
-pub fn callback_promotion() -> Option<soundcraft_rt::Promotion> {
-    #[cfg(not(target_arch = "wasm32"))]
-    return CALLBACK_PROMOTION.get().copied();
-    #[cfg(target_arch = "wasm32")]
-    return None;
-}
 
 /// What each render pool worker's [`soundcraft_rt::promote_audio_thread`] achieved, by worker
 /// index; written once by the worker's start handler, never on the render path.
@@ -1553,7 +1507,12 @@ pub fn render_worker_promotions() -> [Option<soundcraft_rt::Promotion>; MAX_REND
 /// pay (or the threads could not be spawned): the audio thread then renders its strips itself.
 ///
 /// Serial is the realtime default until the bounded render plan (notes/10) lands; measured
-/// 2026-10-18: promoted serial 0 late blocks vs promoted pool 1-5 per 2000 under load. The pool
+/// 2026-10-18: promoted serial 0 late blocks vs promoted pool 1-5 per 2000 under load.
+///
+/// The audio callback thread is promoted by the audio backend (`playback`), before its first data
+/// callback; `MixEngine::render` makes no OS priority call (MMCSS registration is a service call
+/// that can block). Only the pool workers are promoted here, by their start handler at pool
+/// build, off the callback. The pool
 /// is still built (and its workers promoted) so [`MixEngine::force_serial`]`(false)` and
 /// [`RENDER_POOL_ENV`] can opt in.
 #[cfg(not(target_arch = "wasm32"))]
@@ -1572,7 +1531,6 @@ fn init_render_pool() {
                 FORCE_SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
             }
             let promote = !env_flag(RENDER_NO_PRIORITY_ENV);
-            PROMOTE_CALLBACK.store(promote, std::sync::atomic::Ordering::Relaxed);
             build_render_pool(promote)
         });
     }
