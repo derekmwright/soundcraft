@@ -33,6 +33,10 @@ name = "editor_main_thread"
 harness = false
 
 [[test]]
+name = "param_thread"
+harness = false
+
+[[test]]
 name = "module_exit"
 harness = false
 

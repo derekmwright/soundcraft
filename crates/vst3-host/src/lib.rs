@@ -47,6 +47,8 @@ pub mod scan;
 #[allow(unsafe_code)]
 mod ffi;
 #[cfg(not(target_arch = "wasm32"))]
+mod params;
+#[cfg(not(target_arch = "wasm32"))]
 mod plugin;
 #[cfg(not(target_arch = "wasm32"))]
 mod registry;

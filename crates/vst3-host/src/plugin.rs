@@ -1,6 +1,7 @@
 //! `Vst3Plugin`: a loaded VST3 instance behind the safe `soundcraft_dsp::Plugin` trait.
 
 use crate::ffi::{AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, HostContext, Instance, NoteEvent, PARAM_QUEUE_CAP, PITCH_BEND};
+use crate::params::{ParamCurves, PendingParams};
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, ProcessStatus, Transport, Unit};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +19,7 @@ const SYNCED: u64 = u64::MAX;
 enum Mapping {
     /// Toggle/choice index `0..=steps` ↔ `index / steps`.
     Stepped(f64),
-    /// Plain value through the controller's `plainParamToNormalized`.
+    /// Plain value through the controller's curve, sampled on the UI thread ([`ParamCurves`]).
     Plain,
     /// Linear over the info range (the controller gave no usable plain range).
     Linear,
@@ -44,8 +45,15 @@ pub struct Vst3Plugin {
     /// only these are re-sent on activation; values read from the plugin never are. `unsynced`
     /// cannot tell, since the state reader clears it once the controller has a value.
     host_set: Vec<bool>,
-    /// Normalized values waiting for the next block (coalesced per id; bounded).
-    pending: Vec<(u32, f64)>,
+    /// The controller's curves of the `Mapping::Plain` parameters, shared with the editor handle,
+    /// which re-samples them on the UI thread when the plugin asks for a restart.
+    curves: Arc<ParamCurves>,
+    /// The curves' generation the queued values were converted with.
+    curves_seen: u64,
+    /// Normalized values waiting for the next block (latest per parameter; never drops).
+    pending: PendingParams,
+    /// One block's share of `pending`, handed to the processor (capacity `PARAM_QUEUE_CAP`).
+    batch: Vec<(u32, f64)>,
     /// Host-set normalized values the controller has not seen yet (same order as `ids`; the bits
     /// of an `f64`, or [`SYNCED`]). `set_param` may run on the audio thread, so it never calls the
     /// controller; the state reader, which already does, hands them over first.
@@ -94,11 +102,19 @@ impl Vst3Plugin {
                 }
             })
             .collect();
+        // Creation runs on the UI (control) thread: the only place, with the editor handle's
+        // refresh, where the controller's curves are read.
+        let plain: Vec<bool> = maps.iter().map(|m| *m == Mapping::Plain).collect();
+        let curves = Arc::new(ParamCurves::new(&ids, &plain));
+        curves.refresh(|id, n| inst.to_plain(id, n));
         let mut p = Vst3Plugin {
             info,
             values: Vec::with_capacity(ids.len()),
             host_set: vec![false; ids.len()],
-            pending: Vec::with_capacity(ids.len().min(PARAM_QUEUE_CAP)),
+            curves_seen: curves.generation(),
+            curves,
+            pending: PendingParams::new(ids.len()),
+            batch: Vec::with_capacity(PARAM_QUEUE_CAP),
             unsynced: ids.iter().map(|_| AtomicU64::new(SYNCED)).collect(),
             notes: Vec::with_capacity(EVENT_CAP),
             midi_map: Vec::new(),
@@ -129,29 +145,40 @@ impl Vst3Plugin {
         p
     }
 
+    /// Normalized → plain without calling the controller (safe on the audio thread).
     fn plain_from_normalized(&self, i: usize, n: f64) -> Option<f32> {
         let pi = self.info.params.get(i)?;
-        let id = *self.ids.get(i)?;
+        let linear = f64::from(pi.min) + n * f64::from(pi.max - pi.min);
         let v = match self.maps.get(i)? {
             Mapping::Stepped(steps) => (n * steps).round(),
-            Mapping::Plain => self.inst.to_plain(id, n)?,
-            Mapping::Linear => f64::from(pi.min) + n * f64::from(pi.max - pi.min),
+            Mapping::Plain => self.curves.to_plain(i, n).unwrap_or(linear),
+            Mapping::Linear => linear,
         };
         v.is_finite().then_some(v as f32)
     }
 
+    /// Plain → normalized without calling the controller (safe on the audio thread).
     fn normalized_from_plain(&self, i: usize, v: f32) -> Option<f64> {
         let pi = self.info.params.get(i)?;
-        let id = *self.ids.get(i)?;
         let span = f64::from(pi.max - pi.min);
         let linear = if span > 0.0 { (f64::from(v) - f64::from(pi.min)) / span } else { 0.0 };
         let n = match self.maps.get(i)? {
             Mapping::Stepped(steps) if *steps > 0.0 => f64::from(v) / steps,
             Mapping::Stepped(_) => 0.0,
-            Mapping::Plain => self.inst.to_normalized(id, f64::from(v)).unwrap_or(linear),
+            Mapping::Plain => self.curves.to_normalized(i, f64::from(v)).unwrap_or(linear),
             Mapping::Linear => linear,
         };
         n.is_finite().then(|| n.clamp(0.0, 1.0))
+    }
+
+    /// Converts the host-set plain value of parameter `i` and queues it for the next block (and
+    /// for the controller before the next state save).
+    fn queue(&mut self, i: usize) {
+        let Some(n) = self.values.get(i).and_then(|&v| self.normalized_from_plain(i, v)) else { return };
+        if let Some(u) = self.unsynced.get(i) {
+            u.store(n.to_bits(), Ordering::Relaxed);
+        }
+        self.pending.set(i, n);
     }
 
     /// The editor's size in pixels without opening it (creates and releases a view). For
@@ -221,10 +248,8 @@ impl Plugin for Vst3Plugin {
         // their own preset (Rhapsody), and sending those readings back set its volume and pan to
         // the minimum, silencing it.
         self.pending.clear();
-        for i in resend_indices(&self.host_set, PARAM_QUEUE_CAP) {
-            if let (Some(&id), Some(n)) = (self.ids.get(i), self.values.get(i).and_then(|&v| self.normalized_from_plain(i, v))) {
-                self.pending.push((id, n));
-            }
+        for i in resend_indices(&self.host_set, self.ids.len()).collect::<Vec<_>>() {
+            self.queue(i);
         }
     }
 
@@ -233,9 +258,11 @@ impl Plugin for Vst3Plugin {
         self.controls.clear();
     }
 
+    /// Runs on the audio thread (automation): converts through the sampled curves, never the
+    /// controller, and queues without allocating.
     fn set_param(&mut self, id: &str, value: f32) -> bool {
         let Some(i) = self.info.params.iter().position(|p| p.id == id) else { return false };
-        let (Some(pi), Some(&vid)) = (self.info.params.get(i), self.ids.get(i)) else { return false };
+        let Some(pi) = self.info.params.get(i) else { return false };
         let v = pi.clamp(value);
         if let Some(slot) = self.values.get_mut(i) {
             *slot = v;
@@ -243,15 +270,7 @@ impl Plugin for Vst3Plugin {
         if let Some(h) = self.host_set.get_mut(i) {
             *h = true;
         }
-        let Some(n) = self.normalized_from_plain(i, v) else { return true };
-        if let Some(u) = self.unsynced.get(i) {
-            u.store(n.to_bits(), Ordering::Relaxed);
-        }
-        if let Some(e) = self.pending.iter_mut().find(|(pid, _)| *pid == vid) {
-            e.1 = n;
-        } else if self.pending.len() < self.pending.capacity() {
-            self.pending.push((vid, n));
-        }
+        self.queue(i);
         true
     }
 
@@ -271,6 +290,16 @@ impl Plugin for Vst3Plugin {
         }
         if self.inst.host().latency_changed.swap(false, Ordering::Relaxed) {
             self.latency = self.inst.latency() as usize;
+        }
+        // The UI thread re-sampled the curves: the host's plain values may now map elsewhere.
+        let generation = self.curves.generation();
+        if generation != self.curves_seen {
+            self.curves_seen = generation;
+            for i in 0..self.ids.len() {
+                if self.host_set.get(i).copied().unwrap_or(false) {
+                    self.queue(i);
+                }
+            }
         }
         let last = u32::try_from(frames - 1).unwrap_or(u32::MAX);
         for e in &mut self.notes {
@@ -297,18 +326,21 @@ impl Plugin for Vst3Plugin {
             let k = self.notes.iter().position(|e| e.time() >= end).unwrap_or(self.notes.len());
             let offset = u32::try_from(start).unwrap_or(u32::MAX);
             let notes = self.notes.get(..k).unwrap_or(&[]);
+            // Leave room in the pool for this block's controller points; the rest waits.
+            self.batch.clear();
+            self.pending.take_into(&self.ids, &mut self.batch, PARAM_QUEUE_CAP.saturating_sub(self.controls.len()));
             let r = self.inst.process(
                 n,
                 &mut self.inputs,
                 &mut self.outputs,
-                &self.pending,
+                &self.batch,
                 &self.controls,
                 notes,
                 offset,
                 self.position,
                 self.transport.as_ref(),
             );
-            self.pending.clear();
+            self.batch.clear();
             self.notes.drain(..k);
             self.position = self.position.saturating_add(i64::try_from(n).unwrap_or(0));
             match r {
@@ -425,7 +457,14 @@ impl Plugin for Vst3Plugin {
 
     fn editor(&mut self) -> Option<Box<dyn PluginEditor>> {
         let link = self.inst.editor()?;
-        Some(Box::new(Vst3Editor { link, host: self.inst.host_ref(), info: self.info, ids: self.ids.clone(), maps: self.maps.clone() }))
+        Some(Box::new(Vst3Editor {
+            link,
+            host: self.inst.host_ref(),
+            info: self.info,
+            ids: self.ids.clone(),
+            maps: self.maps.clone(),
+            curves: Arc::clone(&self.curves),
+        }))
     }
 
     fn state_reader(&mut self) -> Option<Box<dyn soundcraft_dsp::PluginStateReader>> {
@@ -451,6 +490,8 @@ struct Vst3Editor {
     info: &'static PluginInfo,
     ids: Vec<u32>,
     maps: Vec<Mapping>,
+    /// The instance's sampled curves, re-sampled here (UI thread) on a parameter restart.
+    curves: Arc<ParamCurves>,
 }
 
 impl Vst3Editor {
@@ -495,8 +536,13 @@ impl PluginEditor for Vst3Editor {
         self.link.is_open()
     }
 
+    /// Also the UI-thread hook for `restartComponent(kParamValuesChanged | kParamTitlesChanged)`:
+    /// the host polls every editor handle each UI frame, open or not.
     fn idle(&mut self) -> Vec<(String, f32)> {
         self.link.idle();
+        if self.host.params_changed.swap(false, Ordering::Relaxed) {
+            self.curves.refresh(|id, n| self.link.to_plain(id, n));
+        }
         let mut out = Vec::new();
         for (vid, n) in self.host.take_edits() {
             let Some(i) = self.ids.iter().position(|&x| x == vid) else { continue };

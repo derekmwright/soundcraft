@@ -12,6 +12,9 @@
 //!   sample is the velocity of the held note (sample-accurate), 0 when none. Poly pressure, and
 //!   MIDI CC 7 through `IMidiMapping` (hidden parameter 1), set it to their value too.
 //!
+//! Probe mode (`VST3_FIXTURE_PROBES` set; see "probe mode" below) checks VST3's edit-controller
+//! threading rule and reports the Freq values Gain's processor receives.
+//!
 //! The module checks the host's module lifecycle the way real plugins depend on it (see "module
 //! lifecycle" below) and aborts the process when it is broken.
 //!
@@ -20,7 +23,7 @@
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 use std::ffi::{c_char, c_int, c_void};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{Class, ComRef, ComWrapper, uid};
@@ -183,13 +186,22 @@ impl IAudioProcessorTrait for GainProcessor {
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
         let d = unsafe { &*data };
         assert!(!d.processContext.is_null());
+        let probes = probes();
+        if probes {
+            note_process_thread();
+        }
         if let Some(changes) = unsafe { ComRef::from_raw(d.inputParameterChanges) } {
             for i in 0..unsafe { changes.getParameterCount() } {
                 let Some(q) = (unsafe { ComRef::from_raw(changes.getParameterData(i)) }) else { continue };
                 let (mut off, mut v) = (0, 0.0);
                 let n = unsafe { q.getPointCount() };
-                if unsafe { q.getParameterId() } == 7 && n > 0 && unsafe { q.getPoint(n - 1, &mut off, &mut v) } == kResultOk {
-                    self.gain.store(v.to_bits(), Ordering::Relaxed);
+                let id = unsafe { q.getParameterId() };
+                if n > 0 && unsafe { q.getPoint(n - 1, &mut off, &mut v) } == kResultOk {
+                    if id == 7 {
+                        self.gain.store(v.to_bits(), Ordering::Relaxed);
+                    } else if id == 12 {
+                        LAST_FREQ.store(v.to_bits(), Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -199,7 +211,11 @@ impl IAudioProcessorTrait for GainProcessor {
         let frames = d.numSamples.max(0) as usize;
         let g = 2.0 * f64::from_bits(self.gain.load(Ordering::Relaxed)) as f32;
         let (ins, outs) = unsafe { (channels(&*d.inputs, frames), channels(&*d.outputs, frames)) };
-        for (i, o) in ins.iter().zip(outs) {
+        for (c, (i, o)) in ins.iter().zip(outs).enumerate() {
+            if probes && c == 1 {
+                o.fill(f64::from_bits(LAST_FREQ.load(Ordering::Relaxed)) as f32);
+                continue;
+            }
             for (x, y) in i.iter().zip(o.iter_mut()) {
                 *y = g * x;
             }
@@ -306,8 +322,31 @@ const GAIN_PARAMS: [(u32, &str, &str, i32, f64, i32); 5] = [
     (12, "Freq", "Hz", 0, 0.5, 0),
 ];
 
+/// Gain's normalized → plain conversion (Freq follows the current shape).
+fn gain_to_plain(id: u32, n: f64) -> f64 {
+    match id {
+        7 => 2.0 * n,
+        3 => (n * 2.0).round(),
+        12 if FREQ_SQUARE.load(Ordering::SeqCst) => 20.0 + 19_980.0 * n * n,
+        12 => 20.0 * 1000f64.powf(n),
+        _ => n,
+    }
+}
+
+/// Gain's plain → normalized conversion (Freq follows the current shape).
+fn gain_to_normalized(id: u32, v: f64) -> f64 {
+    match id {
+        7 => v / 2.0,
+        3 => v / 2.0,
+        12 if FREQ_SQUARE.load(Ordering::SeqCst) => ((v - 20.0) / 19_980.0).max(0.0).sqrt(),
+        12 => (v / 20.0).ln() / 1000f64.ln(),
+        _ => v,
+    }
+}
+
 impl IEditControllerTrait for GainController {
     unsafe fn setComponentState(&self, state: *mut IBStream) -> tresult {
+        ctrl_call("setComponentState");
         let Some(s) = (unsafe { ComRef::from_raw(state) }) else { return kInvalidArgument };
         let mut bytes = [0u8; 8];
         let mut n = 0;
@@ -317,6 +356,7 @@ impl IEditControllerTrait for GainController {
         kResultOk
     }
     unsafe fn setState(&self, state: *mut IBStream) -> tresult {
+        ctrl_call("setState");
         let Some(s) = (unsafe { ComRef::from_raw(state) }) else { return kInvalidArgument };
         let mut bytes = [0u8; 8];
         let mut n = 0;
@@ -326,15 +366,18 @@ impl IEditControllerTrait for GainController {
         kResultOk
     }
     unsafe fn getState(&self, state: *mut IBStream) -> tresult {
+        ctrl_call("getState");
         let Some(s) = (unsafe { ComRef::from_raw(state) }) else { return kInvalidArgument };
         let mut bytes = f64::from_bits(self.freq.load(Ordering::Relaxed)).to_le_bytes();
         let mut n = 0;
         unsafe { s.write(bytes.as_mut_ptr().cast(), 8, &mut n) }
     }
     unsafe fn getParameterCount(&self) -> i32 {
+        ctrl_call("getParameterCount");
         GAIN_PARAMS.len() as i32
     }
     unsafe fn getParameterInfo(&self, index: i32, info: *mut ParameterInfo) -> tresult {
+        ctrl_call("getParameterInfo");
         let Some(&(id, title, units, steps, def, flags)) = GAIN_PARAMS.get(index as usize) else { return kInvalidArgument };
         let i = unsafe { &mut *info };
         i.id = id;
@@ -348,6 +391,7 @@ impl IEditControllerTrait for GainController {
         kResultOk
     }
     unsafe fn getParamStringByValue(&self, id: u32, n: f64, string: *mut String128) -> tresult {
+        ctrl_call("getParamStringByValue");
         let s = unsafe { &mut *string };
         let text = match id {
             3 => ["A", "B", "C"][((n * 2.0).round() as usize).min(2)].to_string(),
@@ -357,25 +401,19 @@ impl IEditControllerTrait for GainController {
         kResultOk
     }
     unsafe fn getParamValueByString(&self, _id: u32, _s: *mut TChar, _v: *mut f64) -> tresult {
+        ctrl_call("getParamValueByString");
         kNotImplemented
     }
     unsafe fn normalizedParamToPlain(&self, id: u32, n: f64) -> f64 {
-        match id {
-            7 => 2.0 * n,
-            3 => (n * 2.0).round(),
-            12 => 20.0 * 1000f64.powf(n),
-            _ => n,
-        }
+        ctrl_call("normalizedParamToPlain");
+        gain_to_plain(id, n)
     }
     unsafe fn plainParamToNormalized(&self, id: u32, v: f64) -> f64 {
-        match id {
-            7 => v / 2.0,
-            3 => v / 2.0,
-            12 => (v / 20.0).ln() / 1000f64.ln(),
-            _ => v,
-        }
+        ctrl_call("plainParamToNormalized");
+        gain_to_normalized(id, v)
     }
     unsafe fn getParamNormalized(&self, id: u32) -> f64 {
+        ctrl_call("getParamNormalized");
         match id {
             7 => f64::from_bits(self.gain.load(Ordering::Relaxed)),
             12 => f64::from_bits(self.freq.load(Ordering::Relaxed)),
@@ -383,6 +421,10 @@ impl IEditControllerTrait for GainController {
         }
     }
     unsafe fn setParamNormalized(&self, id: u32, v: f64) -> tresult {
+        ctrl_call("setParamNormalized");
+        if probes() && id == 3 {
+            reshape_freq(v >= 0.75);
+        }
         if id == 7 {
             self.gain.store(v.to_bits(), Ordering::Relaxed);
         } else if id == 12 {
@@ -391,6 +433,8 @@ impl IEditControllerTrait for GainController {
         kResultOk
     }
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
+        ctrl_call("setComponentHandler");
+        HANDLER.store(handler, Ordering::SeqCst);
         // Exercise the host's handler: an edit from the "plugin GUI" must be accepted.
         if let Some(h) = unsafe { ComRef::from_raw(handler) } {
             assert_eq!(unsafe { h.beginEdit(7) }, kResultOk);
@@ -400,6 +444,7 @@ impl IEditControllerTrait for GainController {
         kResultOk
     }
     unsafe fn createView(&self, name: FIDString) -> *mut IPlugView {
+        ctrl_call("createView");
         if name.is_null() || unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes() != b"editor" {
             return std::ptr::null_mut();
         }
@@ -702,6 +747,66 @@ impl IPluginFactory2Trait for Factory {
         copy_c8("1.2.3", &mut i.version);
         copy_c8("VST 3.8.0", &mut i.sdkVersion);
         kResultOk
+    }
+}
+
+// ---- probe mode ----------------------------------------------------------------------------
+//
+// With `VST3_FIXTURE_PROBES` set: Gain's controller ends the process (status 3) when it is called
+// on a thread that has run Gain's `process` (VST3 allows edit-controller calls on the UI thread
+// only); Gain's processor writes the last Freq value it received (normalized) to its second output
+// channel instead of the gained input; and setting Mode from the host reshapes Freq's curve to
+// `20 + 19980 n²` at C (same endpoints; `20 · 1000ⁿ` at A and B) and tells the host with
+// `restartComponent(kParamTitlesChanged)`, as a plug-in whose mode changes a range would.
+
+/// 0: not read yet, 1: off, 2: on.
+static PROBES: AtomicU32 = AtomicU32::new(0);
+/// OS threads that have run Gain's `process` (0: free slot).
+static PROCESS_THREADS: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+/// The last Freq point Gain's processor received (f64 bits).
+static LAST_FREQ: AtomicU64 = AtomicU64::new(0);
+/// Freq's curve shape: `20 · 1000ⁿ` (false) or `20 + 19980 n²` (true).
+static FREQ_SQUARE: AtomicBool = AtomicBool::new(false);
+/// The component handler the last Gain controller was given (the host's, alive with it).
+static HANDLER: AtomicPtr<IComponentHandler> = AtomicPtr::new(std::ptr::null_mut());
+
+fn probes() -> bool {
+    match PROBES.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var_os("VST3_FIXTURE_PROBES").is_some();
+            PROBES.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        n => n == 2,
+    }
+}
+
+fn note_process_thread() {
+    let me = os_thread();
+    for slot in &PROCESS_THREADS {
+        match slot.compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(t) if t == me => return,
+            Err(_) => {}
+        }
+    }
+}
+
+fn ctrl_call(what: &str) {
+    if probes() {
+        let me = os_thread();
+        if PROCESS_THREADS.iter().any(|t| t.load(Ordering::SeqCst) == me) {
+            violation(&format!("edit controller {what} called on the render thread"));
+        }
+    }
+}
+
+fn reshape_freq(square: bool) {
+    if FREQ_SQUARE.swap(square, Ordering::SeqCst) == square {
+        return;
+    }
+    if let Some(h) = unsafe { ComRef::from_raw(HANDLER.load(Ordering::SeqCst)) } {
+        unsafe { h.restartComponent(RestartFlags_::kParamTitlesChanged as i32) };
     }
 }
 
