@@ -6,10 +6,10 @@
 //! Ableton wins (Derek's muscle memory); each such choice is noted on its row. Logic keys stay
 //! where neither Ableton nor Cubase has one for the action.
 //!
-//! Matching is egui's `consume_key`: extra Shift and Alt are ignored, so within one handler the
-//! more specific binding is checked first (Ctrl+Shift+Z before Ctrl+Z). Same key in two scopes is
-//! fine: the narrower handler runs first while its pane has the keyboard (piano roll, browser
-//! drag, dialogs).
+//! Matching is exact: a row fires only when the held modifiers are the row's, no more (egui's own
+//! `consume_key` ignores extra Shift and Alt, which let the piano roll's plain arrows swallow
+//! Alt+Up and Ctrl+Alt+C act as Copy). Same key in two scopes is fine: the narrower handler runs
+//! first while its pane has the keyboard (piano roll, browser drag, dialogs).
 
 use egui::{Key, Modifiers};
 
@@ -50,6 +50,8 @@ impl Scope {
 pub enum Action {
     PlayStop,
     Record,
+    NewAudioTrack,
+    NewInstrumentTrack,
     ReturnToZero,
     Cycle,
     New,
@@ -70,6 +72,7 @@ pub enum Action {
     Duplicate,
     Split,
     Delete,
+    SelectAll,
     SelectNone,
     ZoomIn,
     ZoomOut,
@@ -143,9 +146,11 @@ pub const TABLE: &[Shortcut] = &[
         CMD,
         Key::R,
         S::Global,
-        "Logic. Ableton uses Ctrl+R for Rename; we have no rename yet, so it stays Record (open: see collisions).",
+        "Logic. Ableton uses Ctrl+R for Rename; there is no track rename yet, so it stays Record. It flips to Rename (Ableton) when track rename lands.",
     ),
-    row(A::Record, "Record", NONE, Key::F9, S::Global, "Ableton."),
+    row(A::Record, "Record", NONE, Key::F9, S::Global, "Ableton and Cubase."),
+    row(A::NewAudioTrack, "New Audio Track", CMD, Key::T, S::Global, "Ableton (Insert Audio Track)."),
+    row(A::NewInstrumentTrack, "New Instrument Track", CMD_SHIFT, Key::T, S::Global, "Ableton (Insert MIDI Track)."),
     row(A::ReturnToZero, "Return to Zero", NONE, Key::Home, S::Global, "Ableton and Cubase."),
     row(
         A::ReturnToZero,
@@ -191,13 +196,21 @@ pub const TABLE: &[Shortcut] = &[
     row(A::Cut, "Cut", CMD, Key::X, S::Arrangement, "All DAWs."),
     row(A::Paste, "Paste at Cursor", CMD, Key::V, S::Arrangement, "All DAWs; pastes at the edit cursor."),
     row(A::Duplicate, "Duplicate", CMD, Key::D, S::Arrangement, "Ableton and Cubase agree."),
-    row(A::Split, "Split at Cursor", CMD, Key::E, S::Arrangement, "Ableton wins over Cubase (Alt+X)."),
-    row(A::Split, "Split at Cursor", CMD, Key::T, S::Arrangement, "Logic. Ableton uses Ctrl+T for Insert Audio Track (open: see collisions)."),
+    row(A::Split, "Split at Cursor", CMD, Key::E, S::Arrangement, "Ableton wins over Cubase (Alt+X) and Logic (T)."),
     row(A::Delete, "Delete", NONE, Key::Delete, S::Arrangement, "Clips; tracks only when picked by their header (Ableton)."),
     row(A::Delete, "Delete", NONE, Key::Backspace, S::Arrangement, "Same as Delete (laptops)."),
+    row(
+        A::SelectAll,
+        "Select All Clips",
+        CMD,
+        Key::A,
+        S::Arrangement,
+        "Ableton. The piano roll's own Ctrl+A (notes) wins while it is active; Delete after it removes clips, never tracks.",
+    ),
     row(A::SelectNone, "Select None", NONE, Key::Escape, S::Arrangement, "Ours."),
     row(A::ZoomIn, "Zoom In", NONE, Key::Plus, S::Arrangement, "Ableton wins over Cubase (H)."),
     row(A::ZoomIn, "Zoom In", NONE, Key::Equals, S::Arrangement, "The unshifted + key."),
+    row(A::ZoomIn, "Zoom In", SHIFT, Key::Plus, S::Arrangement, "The + key where it takes Shift."),
     row(A::ZoomOut, "Zoom Out", NONE, Key::Minus, S::Arrangement, "Ableton wins over Cubase (G)."),
     row(A::Ungroup, "Ungroup", CMD_SHIFT, Key::G, S::Arrangement, "Ableton. Checked before Group."),
     row(A::Group, "Group Tracks", CMD, Key::G, S::Arrangement, "Ableton (Logic's Cmd+Shift+D makes a stack instead)."),
@@ -236,9 +249,9 @@ pub fn rows(action: Action) -> impl Iterator<Item = &'static Shortcut> {
     TABLE.iter().filter(move |s| s.action == action)
 }
 
-/// Consume a press of any of `action`'s keys (egui's `consume_key`: extra Shift/Alt ignored).
+/// Consume a press of any of `action`'s keys. The held modifiers must be exactly the row's.
 pub fn pressed(ctx: &egui::Context, action: Action) -> bool {
-    ctx.input_mut(|i| rows(action).fold(false, |hit, s| hit | i.consume_key(s.mods, s.key)))
+    ctx.input_mut(|i| rows(action).fold(false, |hit, s| hit | (i.modifiers.matches_exact(s.mods) && i.consume_key(s.mods, s.key))))
 }
 
 /// Was one of `action`'s keys pressed this frame (not consumed; modifiers ignored, for fields

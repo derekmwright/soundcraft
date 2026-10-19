@@ -91,11 +91,11 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                     }
                 });
                 let track_menu = ui.menu_button("Track", |ui| {
-                    if ui.button("Add Audio Track").clicked() {
+                    if ui.add(egui::Button::new("Add Audio Track").shortcut_text(label(A::NewAudioTrack))).clicked() {
                         let _ = app.add_track("audio");
                         ui.close();
                     }
-                    if ui.button("Add Instrument Track").clicked() {
+                    if ui.add(egui::Button::new("Add Instrument Track").shortcut_text(label(A::NewInstrumentTrack))).clicked() {
                         let _ = app.add_track("instrument");
                         ui.close();
                     }
@@ -225,7 +225,11 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
         let _ = app.run("track.clear_clip_indicators", json!({}));
     }
     // egui turns the platform's copy/cut/paste keys into these events.
+    // Only with Ctrl alone: Ctrl+Alt+C is not Copy.
     let (copy, cut, paste) = ctx.input(|i| {
+        if !i.modifiers.matches_exact(egui::Modifiers::COMMAND) {
+            return (false, false, false);
+        }
         let has = |f: fn(&egui::Event) -> bool| i.events.iter().any(f);
         (has(|e| matches!(e, egui::Event::Copy)), has(|e| matches!(e, egui::Event::Cut)), has(|e| matches!(e, egui::Event::Paste(_))))
     });
@@ -249,6 +253,15 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
     }
     if pressed(ctx, A::Split) {
         let _ = app.split_at_cursor();
+    }
+    if pressed(ctx, A::NewInstrumentTrack) {
+        let _ = app.add_track("instrument");
+    }
+    if pressed(ctx, A::NewAudioTrack) {
+        let _ = app.add_track("audio");
+    }
+    if pressed(ctx, A::SelectAll) {
+        app.select_all_clips();
     }
     if pressed(ctx, A::SaveAs) {
         app.save_as();

@@ -496,3 +496,88 @@ fn an_empty_instrument_lane_shows_the_create_clip_hint_until_a_clip_exists() {
     t.click_n(mid(lane), 2, json!({}));
     assert!(t.app.keys.layout.hint_tracks.is_empty(), "gone once a clip exists");
 }
+
+fn track_order(t: &T) -> Vec<TrackId> {
+    t.app.engine.session().tracks.iter().map(|x| x.id).collect()
+}
+
+#[test]
+fn alt_down_moves_the_track_while_the_piano_roll_is_active_and_leaves_the_notes() {
+    let mut t = T::open();
+    t.add(60, 0, 480);
+    let second = TrackId(t.app.run("track.new", json!({"kind": "instrument"})).unwrap()["tracks"][0].as_u64().unwrap());
+    t.frames(2);
+    t.app.run("edit.select", json!({"tracks": [t.track.0]})).unwrap();
+    t.key("ArrowDown", json!({}));
+    let moved = t.notes();
+    t.app.run("edit.select", json!({"tracks": [t.track.0]})).unwrap();
+    assert!(t.app.keys.active && t.app.keys_shown(), "the piano roll has the keyboard");
+    let before = track_order(&t);
+    let at = before.iter().position(|x| *x == t.track).unwrap();
+    t.key("ArrowDown", json!({"alt": true}));
+    let after = track_order(&t);
+    assert_eq!(after.iter().position(|x| *x == t.track).unwrap(), at + 1, "Alt+Down moved the track below {second:?}");
+    assert_eq!(t.notes(), moved, "and the notes did not move");
+}
+
+#[test]
+fn ctrl_alt_c_is_not_copy_but_ctrl_c_is() {
+    let mut t = T::new();
+    t.app.click_clip(t.clip, false);
+    t.frames(2);
+    t.key("C", json!({"cmd": true, "alt": true}));
+    assert!(t.app.copied.is_empty(), "Ctrl+Alt+C is not Copy");
+    t.key("C", json!({"cmd": true}));
+    assert!(!t.app.copied.is_empty(), "Ctrl+C copies");
+}
+
+#[test]
+fn ctrl_a_selects_every_clip_in_the_arrangement_and_delete_removes_clips_never_tracks() {
+    let mut t = T::new();
+    let extra = TrackId(t.app.run("track.new", json!({"kind": "instrument"})).unwrap()["tracks"][0].as_u64().unwrap());
+    let c2 = t.app.run("midi.new_clip", json!({"tracks": [extra.0], "start": 0, "end": 0})).unwrap()["clip"].as_u64().unwrap();
+    t.frames(2);
+    t.app.run("edit.select_none", json!({})).unwrap();
+    t.app.keys.active = false;
+    t.key("A", json!({"cmd": true}));
+    let mut sel: Vec<u64> = t.app.engine.session().edit.selected_clips.iter().map(|c| c.0).collect();
+    sel.sort();
+    assert_eq!(sel, vec![t.clip.0.min(c2), t.clip.0.max(c2)], "both clips");
+    let tracks = track_order(&t).len();
+    t.key("Delete", json!({}));
+    assert!(t.app.engine.session().find_clip(t.clip).is_none() && t.app.engine.session().find_clip(ClipId(c2)).is_none(), "clips gone");
+    assert_eq!(track_order(&t).len(), tracks, "tracks stay");
+    // Nothing selected but tracks (no header pick): Delete does nothing.
+    t.app.run("edit.select_all", json!({})).unwrap();
+    t.key("Delete", json!({}));
+    assert_eq!(track_order(&t).len(), tracks);
+}
+
+#[test]
+fn ctrl_a_in_the_piano_roll_selects_notes_not_clips() {
+    let mut t = T::open();
+    t.add(60, 0, 480);
+    t.app.run("edit.select_none", json!({})).unwrap();
+    t.key("A", json!({"cmd": true}));
+    assert_eq!(t.selected(), 1, "the note");
+    assert!(t.app.engine.session().edit.selected_clips.is_empty(), "no clip selected by the arrangement's Ctrl+A");
+}
+
+#[test]
+fn ctrl_t_adds_an_audio_track_and_ctrl_shift_t_an_instrument_track_and_neither_splits() {
+    use soundcraft_model::TrackKind;
+    let mut t = T::new();
+    t.app.keys.active = false;
+    let undo = t.undo_len();
+    let n = track_order(&t).len();
+    t.key("T", json!({"cmd": true}));
+    let kinds: Vec<TrackKind> = t.app.engine.session().tracks.iter().map(|x| x.kind).collect();
+    assert_eq!(kinds.len(), n + 1);
+    assert_eq!(t.app.engine.session().track(t.app.cursor_track().unwrap()).unwrap().kind, TrackKind::Audio);
+    t.key("T", json!({"cmd": true, "shift": true}));
+    assert_eq!(track_order(&t).len(), n + 2);
+    assert!(t.app.engine.session().track(t.app.cursor_track().unwrap()).unwrap().kind.is_midi());
+    assert_eq!(t.undo_len(), undo + 2, "two tracks, no split");
+    t.key("E", json!({"cmd": true}));
+    assert_eq!(track_order(&t).len(), n + 2, "Ctrl+E still splits only");
+}

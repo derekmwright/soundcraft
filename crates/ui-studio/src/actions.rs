@@ -44,6 +44,17 @@ impl StudioApp {
         }
     }
 
+    /// Ctrl+A in the arrangement: every clip. Tracks stay unselected, so Delete takes clips only.
+    pub fn select_all_clips(&mut self) {
+        let clips: Vec<u64> = self.clip_ids().into_iter().map(|c| c.0).collect();
+        self.tracks_selected_by_header = false;
+        if clips.is_empty() {
+            let _ = self.run("edit.select_none", json!({}));
+        } else {
+            let _ = self.run("edit.select", json!({"clips": clips}));
+        }
+    }
+
     /// Click on empty timeline: deselect the clips, select the track and put the cursor there.
     /// While playing, the playhead jumps there too (Ableton).
     pub fn click_empty(&mut self, track: Option<TrackId>, at: Samples) {

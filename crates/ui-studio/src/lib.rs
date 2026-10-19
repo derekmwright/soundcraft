@@ -545,6 +545,14 @@ impl StudioApp {
                     raw.events.push(egui::Event::PointerMoved(*pos));
                 }
                 egui::Event::PointerMoved(pos) => raw.events.push(egui::Event::PointerMoved(*pos)),
+                // A key press holds its modifiers for the frame, as a real keyboard reports them.
+                egui::Event::Key { pressed, modifiers, .. } => {
+                    if *pressed {
+                        self.synthetic_mods = Some(*modifiers);
+                    } else {
+                        release = true;
+                    }
+                }
                 _ => {}
             }
         }

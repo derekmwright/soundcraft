@@ -290,7 +290,7 @@ fn help_keyboard_shortcuts_opens_groups_by_scope_and_filters() {
     t.app.ui.shortcuts_filter = "zoom".into();
     t.frames(2);
     let rows: Vec<String> = serde_json::from_value(t.inspect()["shortcuts"]["rows"].clone()).unwrap();
-    assert_eq!(rows, ["Arrangement · Zoom In · +", "Arrangement · Zoom In · =", "Arrangement · Zoom Out · -"]);
+    assert_eq!(rows, ["Arrangement · Zoom In · +", "Arrangement · Zoom In · =", "Arrangement · Zoom In · Shift++", "Arrangement · Zoom Out · -"]);
     t.app.ui.shortcuts_filter.clear();
     t.click(mid(filter));
     t.input("ui.text", json!({"text": "ctrl+e"}));
@@ -350,4 +350,65 @@ fn painted_corners_use_the_radius_tokens() {
         }
         assert!(!src.contains("CornerRadius { nw"), "top corners go through theme::top_corners");
     }
+}
+
+#[test]
+fn every_table_row_is_reachable_and_no_looser_row_shadows_it() {
+    use crate::shortcuts::{Action, Scope, TABLE, pressed, text};
+    let live = [Scope::Global, Scope::Arrangement, Scope::PianoRoll, Scope::Mixer];
+    // Does `action` consume a press of `key` with exactly `mods` held? (A fresh frame each time,
+    // so one action cannot eat the press another is asked about.)
+    let fires = |key: egui::Key, mods: egui::Modifiers, action: Action| {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(mods),
+                egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: mods },
+            ],
+            ..Default::default()
+        };
+        let mut hit = false;
+        let mut out = ctx.run_ui(raw, |ui| hit = pressed(ui.ctx(), action));
+        out.textures_delta.clear();
+        hit
+    };
+    for row in TABLE.iter().filter(|r| live.contains(&r.scope)) {
+        assert!(fires(row.key, row.mods, row.action), "{} ({}) does not fire", row.label, text(row));
+        // Only rows with exactly these modifiers answer; a looser row of the same key does not.
+        for o in TABLE.iter().filter(|o| o.key == row.key && o.mods != row.mods) {
+            assert!(
+                !fires(row.key, row.mods, o.action) || TABLE.iter().any(|x| x.action == o.action && x.key == row.key && x.mods == row.mods),
+                "{} ({}) also fires on {}",
+                o.label,
+                text(o),
+                text(row)
+            );
+        }
+        // Extra Alt or Shift on top of the row's modifiers reaches none of the same-key rows.
+        for extra in [egui::Modifiers { alt: true, ..row.mods }, egui::Modifiers { shift: true, ..row.mods }] {
+            if extra == row.mods || TABLE.iter().any(|o| o.key == row.key && o.mods == extra) {
+                continue;
+            }
+            for o in TABLE.iter().filter(|o| o.key == row.key) {
+                assert!(!fires(row.key, extra, o.action), "{} fires with extra modifiers on {}", o.label, text(row));
+            }
+        }
+    }
+}
+
+#[test]
+fn the_help_window_lists_the_new_rows() {
+    let mut t = T::new();
+    t.click(mid(view_item(&t, "Help")));
+    t.click(mid(view_item(&t, "Keyboard Shortcuts")));
+    let rows: Vec<String> = serde_json::from_value(t.inspect()["shortcuts"]["rows"].clone()).unwrap();
+    for want in [
+        "Global · New Audio Track · Ctrl+T",
+        "Global · New Instrument Track · Ctrl+Shift+T",
+        "Global · Record · F9",
+        "Arrangement · Select All Clips · Ctrl+A",
+    ] {
+        assert!(rows.iter().any(|r| r == want), "{want} missing from {rows:?}");
+    }
+    assert!(!rows.iter().any(|r| r.contains("Split at Cursor · Ctrl+T")));
 }
