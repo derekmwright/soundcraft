@@ -447,6 +447,19 @@ impl SlotCtx<'_> {
 }
 
 impl MixEngine {
+    /// Force (or stop forcing) every engine in the process to render its audio-thread strips
+    /// serially on the audio thread, never on the render pool: the realtime baseline (audit F01,
+    /// "serial until the pool beats it in measured headroom"). Takes effect at the next block.
+    /// [`RENDER_SERIAL_ENV`]`=1` sets it at startup. Offline renders are not affected.
+    pub fn force_serial(on: bool) {
+        FORCE_SERIAL.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// True while [`MixEngine::force_serial`] (or [`RENDER_SERIAL_ENV`]) is in effect.
+    pub fn serial_forced() -> bool {
+        FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Also spawns the process's render pool on first use (never from the audio thread).
     pub fn new(sample_rate: f32, max_block: usize) -> Self {
         init_render_pool();
@@ -1444,7 +1457,43 @@ fn as_audio_thread(audio: bool, f: impl FnOnce()) {
 const PARALLEL_STRIPS: usize = 4;
 
 /// The render pool never has more workers than this, whatever the core count.
-const MAX_RENDER_WORKERS: usize = 8;
+pub const MAX_RENDER_WORKERS: usize = 8;
+
+/// Environment variable: `1` forces audio-thread strips to render serially on the audio thread
+/// (the realtime baseline), as [`MixEngine::force_serial`]`(true)` does. Read once, when the
+/// render pool is built.
+pub const RENDER_SERIAL_ENV: &str = "SOUNDCRAFT_RENDER_SERIAL";
+
+/// Environment variable: `1` leaves the render pool's workers at the OS default priority instead
+/// of promoting them with [`soundcraft_rt::promote_audio_thread`]. Read once, when the render
+/// pool is built (the only place the workers are promoted).
+pub const RENDER_NO_PRIORITY_ENV: &str = "SOUNDCRAFT_RENDER_NO_PRIORITY";
+
+/// Audio-thread strips render serially when set ([`MixEngine::force_serial`],
+/// [`RENDER_SERIAL_ENV`]).
+static FORCE_SERIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What each render pool worker's [`soundcraft_rt::promote_audio_thread`] achieved, by worker
+/// index; written once by the worker's start handler, never on the render path.
+#[cfg(not(target_arch = "wasm32"))]
+static WORKER_PROMOTION: [std::sync::OnceLock<soundcraft_rt::Promotion>; MAX_RENDER_WORKERS] =
+    [const { std::sync::OnceLock::new() }; MAX_RENDER_WORKERS];
+
+/// True when `name` is set to `1` (or `true`/`yes`, any case).
+#[cfg(not(target_arch = "wasm32"))]
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+/// What each render pool worker's promotion achieved, by worker index (`None` for a worker that
+/// does not exist or has not started yet; `Unsupported("disabled")` under
+/// [`RENDER_NO_PRIORITY_ENV`]). For diagnostics and tests.
+pub fn render_worker_promotions() -> [Option<soundcraft_rt::Promotion>; MAX_RENDER_WORKERS] {
+    #[cfg(not(target_arch = "wasm32"))]
+    return std::array::from_fn(|i| WORKER_PROMOTION.get(i).and_then(|slot| slot.get().copied()));
+    #[cfg(target_arch = "wasm32")]
+    return [None; MAX_RENDER_WORKERS];
+}
 
 /// The realtime render pool: strips rendered for the audio thread run here, never on Rayon's
 /// global pool, which offline bounces and video decode/encode share and which runs at normal
@@ -1455,11 +1504,18 @@ static RENDER_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::
 
 /// Spawn the render pool, once per process. [`MixEngine::new`] calls this, so the pool exists
 /// before the first callback; it never spawns from the audio thread (a `MixEngine` built there,
-/// on a sample-rate change, reuses the pool an earlier engine built).
+/// on a sample-rate change, reuses the pool an earlier engine built). The switches
+/// [`RENDER_SERIAL_ENV`] and [`RENDER_NO_PRIORITY_ENV`] are read here, once.
 #[cfg(not(target_arch = "wasm32"))]
 fn init_render_pool() {
     if !on_audio_thread() {
-        RENDER_POOL.get_or_init(build_render_pool);
+        RENDER_POOL.get_or_init(|| {
+            if env_flag(RENDER_SERIAL_ENV) {
+                log::info!("mix: {RENDER_SERIAL_ENV} is set; audio-thread strips render serially");
+                FORCE_SERIAL.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            build_render_pool(!env_flag(RENDER_NO_PRIORITY_ENV))
+        });
     }
 }
 
@@ -1470,12 +1526,14 @@ fn init_render_pool() {}
 /// Fewer than two workers is no pool: one worker plus a waiting callback is slower than the
 /// callback alone.
 ///
-/// Priority: the workers run at the OS default priority. Raising them (`SetThreadPriority` or
-/// MMCSS "Pro Audio" on Windows, `SCHED_FIFO` on Linux) needs FFI, which this crate's
-/// `unsafe_code = "forbid"` rules out; the pool is still dedicated, so nothing queued by a bounce
-/// or a video job runs ahead of a strip.
+/// Priority: each worker promotes itself at start with [`soundcraft_rt::promote_audio_thread`]
+/// (MMCSS "Pro Audio" on Windows, `SCHED_FIFO` on Linux, the Mach time-constraint policy on
+/// macOS; ADR 0013 keeps that `unsafe` out of this crate), unless `promote` is false. The result
+/// lands in [`render_worker_promotions`] and is logged once per worker at debug level. A refused
+/// promotion leaves the worker at the default priority; the pool is still dedicated, so nothing
+/// queued by a bounce or a video job runs ahead of a strip.
 #[cfg(not(target_arch = "wasm32"))]
-fn build_render_pool() -> Option<rayon::ThreadPool> {
+fn build_render_pool(promote: bool) -> Option<rayon::ThreadPool> {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let workers = cores.saturating_sub(1).min(MAX_RENDER_WORKERS);
     if workers < 2 {
@@ -1484,8 +1542,16 @@ fn build_render_pool() -> Option<rayon::ThreadPool> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(workers)
         .thread_name(|i| format!("mix-render-{i}"))
-        // A worker only ever renders for the audio thread, so it is the audio thread for good.
-        .start_handler(|_| mark_audio_thread())
+        .start_handler(move |i| {
+            let p = if promote { soundcraft_rt::promote_audio_thread() } else { soundcraft_rt::Promotion::Unsupported("disabled") };
+            if let Some(slot) = WORKER_PROMOTION.get(i) {
+                let _ = slot.set(p);
+            }
+            // Before the mark: the logger treats the audio thread as never-block.
+            log::debug!("mix: render worker {i} priority: {p:?}");
+            // A worker only ever renders for the audio thread, so it is the audio thread for good.
+            mark_audio_thread();
+        })
         .build()
         .map_err(|e| log::warn!("mix: no render pool ({e}); the audio thread renders strips itself"))
         .ok()
@@ -1494,9 +1560,10 @@ fn build_render_pool() -> Option<rayon::ThreadPool> {
 /// Process strips, in parallel on native targets when there are enough of them.
 ///
 /// On the audio thread the strips go to the dedicated render pool (or run right here when there
-/// is none); they never wait behind Rayon's global pool. Elsewhere (offline bounces) they use the
-/// global pool as before. The strips are independent and are summed afterwards in a fixed order,
-/// so the result is the same whichever way they ran.
+/// is none, or while [`MixEngine::force_serial`] is on); they never wait behind Rayon's global
+/// pool. Elsewhere (offline bounces) they use the global pool as before. The strips are
+/// independent and are summed afterwards in a fixed order, so the result is the same whichever
+/// way they ran.
 ///
 /// Known residual, as before this pool existed: each parallel dispatch pushes one job onto Rayon's
 /// injector queue, which allocates a 1.5 KB block on the caller every 63 pushes.
@@ -1506,7 +1573,8 @@ fn run_strips<T: Send>(work: &mut [T], parallel: bool, f: impl Fn(&mut T) + Sync
     if !parallel || work.len() < PARALLEL_STRIPS {
         work.iter_mut().for_each(f);
     } else if on_audio_thread() {
-        match RENDER_POOL.get().and_then(Option::as_ref) {
+        let pool = if MixEngine::serial_forced() { None } else { RENDER_POOL.get().and_then(Option::as_ref) };
+        match pool {
             // The pool's workers are marked as the audio thread (`build_render_pool`).
             Some(pool) => pool.install(|| work.par_iter_mut().for_each(f)),
             None => work.iter_mut().for_each(f),
@@ -2552,6 +2620,7 @@ mod audio_thread_tests {
     /// ADR 0012 gate G1: a render on the audio thread dispatches no job to the global pool.
     #[test]
     fn audio_thread_strips_never_reach_the_global_rayon_pool() {
+        let _switch = SERIAL_SWITCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let audio = jobs(true);
         assert!(audio.iter().all(|j| !j.global), "an audio-thread strip ran on the global pool");
         if RENDER_POOL.get().is_some_and(Option::is_some) {
@@ -2559,6 +2628,25 @@ mod audio_thread_tests {
         }
         let offline = jobs(false);
         assert!(offline.iter().all(|j| !j.render), "an offline render never takes the render pool");
+    }
+
+    /// Serializes the tests that depend on the process-wide serial switch.
+    static SERIAL_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The F01 safety valve: with the switch on, the audio thread renders every strip itself;
+    /// off again, the pool takes them back.
+    #[test]
+    fn force_serial_keeps_audio_thread_strips_on_the_audio_thread() {
+        let _switch = SERIAL_SWITCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        MixEngine::force_serial(true);
+        let forced = jobs(true);
+        let was_forced = MixEngine::serial_forced();
+        MixEngine::force_serial(false);
+        assert!(was_forced);
+        assert!(forced.iter().all(|j| j.audio && !j.render && !j.global), "a strip left the audio thread while forced serial");
+        if RENDER_POOL.get().is_some_and(Option::is_some) {
+            assert!(jobs(true).iter().any(|j| j.render), "the pool is used again once the switch is off");
+        }
     }
 
     /// Sixteen strips of distinct deterministic material, levels, pans and built-in inserts.
