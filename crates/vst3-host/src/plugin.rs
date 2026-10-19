@@ -174,6 +174,18 @@ impl Vst3Plugin {
         self.curves.curves_total()
     }
 
+    /// Samples every unsampled or invalidated curve now, on the calling thread (no budget).
+    ///
+    /// For renders that never run an editor handle's `idle` (bounces, freezes, CLI renders): without
+    /// it plain-mapped parameters convert linearly until `idle` gets to them. Calls the edit
+    /// controller (257 times per plain-mapped parameter), so it must run on the thread that may
+    /// use the controller (the UI/main thread, or the thread creating the instance), never on a
+    /// thread that is rendering this instance. Not real-time. Hosts that render offline get it for
+    /// free on every instance created inside an [`crate::offline_scope`].
+    pub fn sample_all_curves_now(&self) {
+        self.curves.step(usize::MAX, Duration::MAX, |id, n| self.inst.to_plain(id, n));
+    }
+
     /// Plain → normalized without calling the controller (safe on the audio thread).
     fn normalized_from_plain(&self, i: usize, v: f32) -> Option<f64> {
         let pi = self.info.params.get(i)?;

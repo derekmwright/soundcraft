@@ -65,6 +65,7 @@ fn process(e: &mut Engine, p: &Value) -> Result<Value> {
         }
         let channels = e.session().track(track).map_or(1, |t| t.channels());
         crate::io::refuse_longer(e.session(), "audiosuite.process", &clip.name, "process", clip.length, most.min(crate::io::render_limit(channels)))?;
+        let _offline = crate::io::offline();
         let mut audio = soundcraft_mix::render_clips(e.session(), track, clip.range());
         // Render without the clip's own fades: re-render a copy without fades so they stay editable.
         let mut tmp = e.session().clone();
@@ -163,6 +164,7 @@ fn generate(e: &mut Engine, p: &Value, name: &str, params: &[(String, f32)], r: 
 
 /// Run plugin `id` with `params` over `audio`, in place.
 fn apply(id: &str, params: &[(String, f32)], audio: &mut [Vec<f32>], srf: f32) -> Result<()> {
+    let _offline = crate::io::offline();
     let Some(mut pl) = soundcraft_dsp::create(id) else { return Err(bad("audiosuite.process", format!("cannot create `{id}`"))) };
     pl.prepare(srf, 1024, audio.len().max(1));
     for (k, v) in params {

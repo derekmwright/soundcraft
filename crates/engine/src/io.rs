@@ -374,6 +374,9 @@ pub fn export_midi(e: &Engine, only: Option<&[TrackId]>) -> Result<Vec<u8>> {
 /// progress. The file appears at its path only once complete; a bounce that fails, or is dropped
 /// unfinished, leaves any older file there alone.
 pub struct Bounce {
+    /// Offline mode for hosted plugins: they sample their parameter curves at creation, since no
+    /// editor `idle` runs during a render.
+    _offline: soundcraft_vst3_host::OfflineScope,
     session: Arc<Session>,
     path: PathBuf,
     part: PathBuf,
@@ -434,6 +437,7 @@ impl Bounce {
         let render = soundcraft_mix::RangeRender::new(&s, bus, r, 1024);
         let meter = soundcraft_dsp::meter::LoudnessMeter::new(s.sample_rate.as_f64() as f32, channels);
         Ok(Bounce {
+            _offline: soundcraft_vst3_host::offline_scope(),
             session: s,
             path: path.to_path_buf(),
             part,
@@ -675,6 +679,7 @@ pub fn bounded_to_track(s: &Session, t: TrackId, r: Range) -> Range {
 pub fn transients_in(s: &Session, t: TrackId, r: Range, sens: f32) -> Vec<Samples> {
     let r = if r.is_empty() { Range::new(0, s.content_end()) } else { r };
     let r = bounded_to_track(s, t, r);
+    let _offline = offline();
     let audio = soundcraft_mix::render_clips(s, t, r);
     soundcraft_dsp::offline::detect_transients(&audio, s.sample_rate.as_f64() as f32, sens).into_iter().map(|i| r.start + i as i64).collect()
 }
@@ -739,6 +744,7 @@ fn non_silent(s: &Session, t: TrackId, r: Range, thr: f32, min_len: Samples, pre
         at = x.start;
         while at < x.end {
             let end = at.saturating_add(window).min(x.end);
+            let _offline = offline();
             scan.push(&soundcraft_mix::render_clips(s, t, Range::new(at, end)));
             at = end;
         }
@@ -763,6 +769,7 @@ pub fn consolidate(e: &mut Engine, cmd: &str, t: TrackId, r: Range) -> Result<bo
         return Err(crate::cmd::bad(cmd, format!("selection is too long to consolidate on `{}` (at most {secs:.0} s)", tr.name)));
     }
     let r = Range::new(start, start + len);
+    let _offline = offline();
     let audio = soundcraft_mix::render_clips(s, t, r);
     if audio.iter().any(|ch| ch.len() as i64 != len) {
         return Err(EngineError::Internal(cmd.to_string(), "consolidate rendered the wrong length".into()));
@@ -783,6 +790,12 @@ pub fn render_limit(channels: usize) -> usize {
 }
 
 /// Refuses `len` frames of `name` past `max`, where a render would cut the audio short.
+/// Offline mode for hosted plugins while the guard lives: every plugin made for an offline render
+/// samples its parameter curves at creation (see `soundcraft_vst3_host::offline_scope`).
+pub(crate) fn offline() -> soundcraft_vst3_host::OfflineScope {
+    soundcraft_vst3_host::offline_scope()
+}
+
 pub fn refuse_longer(s: &Session, cmd: &str, name: &str, verb: &str, len: Samples, max: usize) -> Result<()> {
     if len <= Samples::try_from(max).unwrap_or(Samples::MAX) {
         return Ok(());
@@ -806,6 +819,7 @@ pub fn render_clip_gain(e: &mut Engine, cmd: &str, id: soundcraft_model::ClipId)
     if let Some(pl) = tmp.track_mut(t).and_then(|x| x.playlist_mut()) {
         pl.clips = vec![c2];
     }
+    let _offline = offline();
     let audio = soundcraft_mix::render_clips(&tmp, t, c.range());
     let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: audio };
     let s = e.session_mut();
@@ -835,6 +849,7 @@ pub fn commit_track(e: &mut Engine, t: TrackId) -> Result<Option<TrackId>> {
     let range = Range::new(0, end + s.sample_rate.samples(2.0));
     // The track renders through a main mix of at least two channels.
     refuse_longer(s, "track.commit", &tr.name, "commit", range.len(), render_limit(tr.channels().max(2)))?;
+    let _offline = offline();
     let audio = soundcraft_mix::render_track_pre_fader(s, t, range);
     let name = format!("{}.cm", tr.name);
     let fmt = ChannelFormat::for_channels(audio.len().clamp(1, 2));
@@ -869,6 +884,7 @@ pub fn export_clips(e: &Engine, ids: &[soundcraft_model::ClipId], dir: &str) -> 
     let mut n = 0;
     for id in ids {
         let Some((t, c)) = s.find_clip(*id) else { continue };
+        let _offline = offline();
         let audio = soundcraft_mix::render_clips(s, t, c.range());
         let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: audio };
         let bytes = soundcraft_audio_io::encode(&buf, &EncodeOptions::default()).map_err(|err| EngineError::Io(err.to_string()))?;

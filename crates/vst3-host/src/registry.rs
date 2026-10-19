@@ -409,6 +409,10 @@ pub fn instantiate_plugin(id: &str) -> Result<Vst3Plugin, Vst3Error> {
     let (inst, info) = instantiate_raw(id)?;
     let mut p = Vst3Plugin::new(inst, info);
     p.prepare(48_000.0, 1024, 2);
+    // An offline render never runs an editor handle's idle, which is what samples the curves.
+    if crate::offline_active() {
+        p.sample_all_curves_now();
+    }
     Ok(p)
 }
 

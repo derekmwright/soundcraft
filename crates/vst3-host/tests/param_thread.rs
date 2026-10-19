@@ -165,6 +165,47 @@ fn an_unsampled_curve_is_linear_until_sampled_then_re_sent() {
     drop(p);
 }
 
+/// An offline render (bounce, freeze, CLI) runs no editor `idle`. Instances created inside an
+/// `offline_scope` have every curve sampled at creation, so automating the log-curve Freq
+/// during the render converts through the controller's curve, not linearly; `sample_all_curves_now`
+/// does the same for an instance made outside the scope.
+fn an_offline_render_converts_through_the_curve_without_idle() {
+    let id = gain_id();
+    let render = |p: soundcraft_vst3_host::Vst3Plugin| {
+        std::thread::spawn(move || {
+            let mut p: Box<dyn soundcraft_dsp::Plugin> = Box::new(p);
+            let mut io = vec![vec![0.0f32; BLOCK]; 2];
+            block(&mut p, &mut io);
+            let mut worst = 0.0f64;
+            for plain in [20.0f32, 100.0, 1_000.0, 5_000.0, 20_000.0] {
+                assert!(p.set_param("12", plain));
+                let (_, freq) = block(&mut p, &mut io);
+                worst = worst.max((f64::from(freq) - freq_log(f64::from(plain))).abs());
+            }
+            // Dropped on the calling thread: tearing down touches the controller.
+            (worst, p)
+        })
+        .join()
+        .expect("render thread")
+    };
+    // Created in the scope, as the mix engine does for a bounce; no editor, no idle.
+    let scope = soundcraft_vst3_host::offline_scope();
+    let p = soundcraft_vst3_host::instantiate_plugin(&id).expect("instantiate");
+    drop(scope);
+    assert_eq!(p.curves_sampled(), p.curves_total(), "sampled at creation");
+    let (worst, p) = render(p);
+    drop(p);
+    assert!(worst < 1e-4, "offline render off the controller's curve by {worst}");
+    // Outside the scope nothing is sampled until asked.
+    let p = soundcraft_vst3_host::instantiate_plugin(&id).expect("instantiate");
+    assert_eq!(p.curves_sampled(), 0);
+    p.sample_all_curves_now();
+    assert_eq!(p.curves_sampled(), p.curves_total());
+    let (worst, p) = render(p);
+    drop(p);
+    assert!(worst < 1e-4, "after sample_all_curves_now: off by {worst}");
+}
+
 /// A large plug-in (`VST3_FIXTURE_PARAMS`): how many extra continuous parameters it exposes.
 const MANY: usize = 2_500;
 /// Most curves one editor idle may sample.
@@ -323,6 +364,8 @@ fn main() {
             println!("a_restart_re_samples_the_curve_on_the_ui_thread: ok");
             an_unsampled_curve_is_linear_until_sampled_then_re_sent();
             println!("an_unsampled_curve_is_linear_until_sampled_then_re_sent: ok");
+            an_offline_render_converts_through_the_curve_without_idle();
+            println!("an_offline_render_converts_through_the_curve_without_idle: ok");
         }
     }
 }

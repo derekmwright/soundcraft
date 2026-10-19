@@ -366,6 +366,34 @@ pub fn instantiate_plugin(id: &str) -> Result<Vst3Plugin, Vst3Error> {
     registry::instantiate_plugin(id)
 }
 
+static OFFLINE_SCOPES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Keeps offline mode on while it lives (see [`offline_scope`]).
+#[must_use = "offline mode ends when the scope is dropped"]
+pub struct OfflineScope(());
+
+impl Drop for OfflineScope {
+    fn drop(&mut self) {
+        OFFLINE_SCOPES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Starts offline mode: every plugin created while any [`OfflineScope`] lives samples all its
+/// parameter curves at creation (on the creating thread; not real-time, 257 controller calls per
+/// plain-mapped parameter), because an offline render never runs the editor handle's `idle` that
+/// samples them lazily. Hold it across the whole render, since the render builds its instances as it
+/// starts. The mode is process-wide: a plugin made for live playback meanwhile is merely sampled
+/// early.
+pub fn offline_scope() -> OfflineScope {
+    OFFLINE_SCOPES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    OfflineScope(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn offline_active() -> bool {
+    OFFLINE_SCOPES.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
 /// Creates a plugin by `vst3:<class id>`; `None` if unknown or it fails to load.
 pub fn create(id: &str) -> Option<Box<dyn Plugin>> {
     parse_id(id)?;
