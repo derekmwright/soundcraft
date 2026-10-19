@@ -426,3 +426,157 @@ fn the_track_menu_groups_and_ungroups() {
     assert!(t.groups().is_empty());
     assert_eq!(t.order(), ["A", "B", "C"]);
 }
+
+/// Every group's members sit directly after its header, as the mixer's link bars assume.
+fn assert_contiguous(t: &T) {
+    let s = t.app.engine.session();
+    for (i, g) in s.tracks.iter().enumerate().filter(|(_, g)| g.kind == TrackKind::Folder) {
+        let n = s.tracks.iter().filter(|x| x.folder == Some(g.id)).count();
+        for k in 1..=n {
+            assert_eq!(s.tracks[i + k].folder, Some(g.id), "{} members not contiguous: {:?}", g.name, t.order());
+        }
+        assert!(s.tracks.iter().all(|x| x.folder != Some(x.id)), "no track inside itself");
+    }
+}
+
+#[test]
+fn delete_on_a_group_header_asks_then_ungroups_with_one_undo_step() {
+    let mut t = T::new();
+    let g = t.group_ab();
+    let bus = match t.app.engine.session().track(g).unwrap().mixer.input {
+        soundcraft_model::Route::Bus(b) => b,
+        _ => panic!("a group listens to its bus"),
+    };
+    t.click(t.header(g, 0.5), json!({}));
+    let u0 = t.undo_len();
+    t.key("Delete", json!({}));
+    assert!(matches!(t.app.dialog, Some(crate::Dialog::DeleteTracks { .. })), "a group always asks");
+    assert_eq!(t.groups().len(), 1, "nothing before the answer");
+    t.key("Escape", json!({}));
+    assert!(t.app.dialog.is_none());
+    assert_eq!(t.groups().len(), 1, "Escape leaves everything");
+    assert_eq!(t.undo_len(), u0);
+    t.key("Delete", json!({}));
+    t.key("Enter", json!({}));
+    assert!(t.app.dialog.is_none());
+    assert!(t.groups().is_empty(), "no folder");
+    let s = t.app.engine.session();
+    assert!(s.bus(bus).is_none(), "no bus");
+    assert!(s.tracks.iter().all(|x| x.folder.is_none() && x.mixer.output == soundcraft_model::Route::Main));
+    assert_eq!(t.order(), ["A", "B", "C"], "members stay, top level");
+    assert_eq!(t.undo_len(), u0 + 1, "one undo entry: {:?}", t.app.engine.undo_history());
+    t.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(t.order(), ["Group 1", "A", "B", "C"]);
+}
+
+#[test]
+fn the_header_menu_delete_on_a_group_asks_the_same_question() {
+    let mut t = T::new();
+    let g = t.group_ab();
+    t.right_click(t.header(g, 0.5));
+    let item = t.app.arrange.menu.iter().find(|m| m.label == "Delete Track").cloned().expect("Delete Track in the header menu");
+    t.click(mid(item.rect), json!({}));
+    assert!(matches!(t.app.dialog, Some(crate::Dialog::DeleteTracks { ref tracks, .. }) if *tracks == vec![g]));
+    t.key("Enter", json!({}));
+    assert!(t.groups().is_empty());
+    assert_eq!(t.order(), ["A", "B", "C"]);
+}
+
+#[test]
+fn collapsing_drops_the_hidden_members_from_the_selection_and_focus_follows() {
+    let mut t = T::new();
+    let g = t.group_ab();
+    t.click(t.header(t.b, 0.5), json!({}));
+    assert_eq!(t.app.mixer.devices.track, Some(t.b.0));
+    let at = mid(t.row(g).disclosure);
+    t.click(at, json!({}));
+    assert!(t.app.collapsed(g));
+    assert!(!t.app.engine.session().edit.selected_tracks.contains(&t.b), "hidden B left the selection");
+    assert_eq!(t.app.mixer.devices.track, Some(g.0), "the device chain follows to the group");
+    let u0 = t.undo_len();
+    t.key("Delete", json!({}));
+    assert!(t.app.dialog.is_none());
+    assert!(t.app.engine.session().track(t.b).is_some(), "B is intact");
+    assert_eq!(t.undo_len(), u0);
+    assert!(t.app.status.contains("Select a track header"), "status: {}", t.app.status);
+}
+
+#[test]
+fn ctrl_g_with_a_group_header_adds_to_that_group_and_never_nests() {
+    let mut t = T::new();
+    let g = t.group_ab();
+    t.click(t.header(g, 0.5), json!({}));
+    t.click(t.header(t.c, 0.5), json!({"cmd": true}));
+    let u0 = t.undo_len();
+    t.key("G", json!({"cmd": true}));
+    assert_eq!(t.groups(), vec![g], "no second group");
+    assert_eq!(t.folder_of(t.c), Some(g), "C joined Group 1");
+    assert_eq!(t.folder_of(g), None, "the group is not nested");
+    assert_eq!(t.order(), ["Group 1", "A", "B", "C"]);
+    assert_eq!(t.undo_len(), u0 + 1);
+    assert_contiguous(&t);
+}
+
+#[test]
+fn two_group_headers_are_refused_and_grouping_keeps_every_group_contiguous() {
+    let mut t = T::new();
+    let g1 = t.group_ab();
+    // A group of C alone, then both headers: no nesting.
+    t.click(t.header(t.c, 0.5), json!({}));
+    t.key("G", json!({"cmd": true}));
+    assert_eq!(t.groups().len(), 2);
+    let g2 = t.groups().into_iter().find(|g| *g != g1).unwrap();
+    assert_contiguous(&t);
+    t.click(t.header(g1, 0.5), json!({}));
+    t.click(t.header(g2, 0.5), json!({"cmd": true}));
+    t.key("G", json!({"cmd": true}));
+    assert_eq!(t.groups().len(), 2, "no nesting");
+    assert_eq!(t.app.status, "Groups are one level deep");
+    assert!(t.app.engine.session().tracks.iter().filter(|x| x.kind == TrackKind::Folder).all(|x| x.folder.is_none()));
+    // A member of Group 1 and Group 2's member go into a new group: Group 1 keeps its other
+    // member right after it, and nothing ends up in the middle of another block.
+    t.click(t.header(t.b, 0.5), json!({}));
+    t.click(t.header(t.c, 0.5), json!({"cmd": true}));
+    t.key("G", json!({"cmd": true}));
+    assert_eq!(t.groups().len(), 3, "{:?} {}", t.order(), t.app.status);
+    assert!(
+        t.app.engine.session().tracks.iter().all(|x| x.folder.is_none_or(|f| t.app.engine.session().track(f).is_some_and(|f| f.folder.is_none())))
+    );
+    assert_contiguous(&t);
+    t.frames(3);
+    assert_eq!(t.strips().len(), t.order().len());
+}
+
+#[test]
+fn reordering_sets_a_moved_status() {
+    let mut t = T::new();
+    t.group_ab();
+    assert!(t.app.status.starts_with("Grouped"));
+    t.drag(t.header(t.c, 0.5), t.header(t.a, 0.1));
+    let moved = t.app.status.clone();
+    assert_eq!(moved, "Moved C", "after a drag");
+    t.click(t.header(t.c, 0.5), json!({}));
+    t.app.status = "Grouped 2 tracks".into();
+    t.key("ArrowDown", json!({"alt": true}));
+    assert!(t.app.status.starts_with("Moved"), "after Alt+Down: {}", t.app.status);
+}
+
+#[test]
+fn ungroup_reroutes_an_outside_track_that_fed_the_group_bus() {
+    let mut t = T::new();
+    let g = t.group_ab();
+    let bus = match t.app.engine.session().track(g).unwrap().mixer.input {
+        soundcraft_model::Route::Bus(b) => b,
+        _ => panic!("a group listens to its bus"),
+    };
+    let bus_name = t.app.engine.session().bus(bus).unwrap().name.clone();
+    t.app.run("track.output", json!({"tracks": [t.c.0], "output": bus_name})).unwrap();
+    assert_eq!(t.app.engine.session().track(t.c).unwrap().mixer.output, soundcraft_model::Route::Bus(bus));
+    t.click(t.header(g, 0.5), json!({}));
+    let u0 = t.undo_len();
+    t.key("G", json!({"cmd": true, "shift": true}));
+    assert!(t.groups().is_empty());
+    assert_eq!(t.app.engine.session().track(t.c).unwrap().mixer.output, soundcraft_model::Route::Main, "C is not silent");
+    assert_eq!(t.app.status, "Ungrouped Group 1; C now outputs to Main");
+    assert_eq!(t.undo_len(), u0 + 1);
+}

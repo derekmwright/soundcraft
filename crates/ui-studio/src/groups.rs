@@ -130,8 +130,31 @@ impl StudioApp {
     pub fn toggle_group(&mut self, f: TrackId) {
         if let Some(i) = self.ui.collapsed.iter().position(|x| *x == f) {
             self.ui.collapsed.remove(i);
-        } else {
-            self.ui.collapsed.push(f);
+            return;
+        }
+        self.ui.collapsed.push(f);
+        // The members just tucked away leave the selection, so Delete and the arrow keys can't
+        // reach what the user can't see; focus follows to the group when it was on one of them.
+        let s = self.engine.session_arc();
+        let hidden = |t: TrackId| t != f && within(&s, t, f);
+        let sel: Vec<TrackId> = s.edit.selected_tracks.clone();
+        let keep: Vec<u64> = sel.iter().filter(|t| !hidden(**t)).map(|t| t.0).collect();
+        let focus = self.focus_track();
+        let focus_hidden = focus.is_some_and(hidden);
+        if keep.len() != sel.len() || focus_hidden {
+            self.tracks_selected_by_header = false;
+            let visible = focus.filter(|t| !hidden(*t)).unwrap_or(f);
+            if keep.is_empty() {
+                self.focus(visible);
+            } else {
+                let _ = self.run("edit.select", json!({"tracks": keep, "exact": true}));
+                if focus_hidden {
+                    self.ui.focus_track = Some(f);
+                }
+            }
+        }
+        if self.ui.cursor_track.is_some_and(hidden) {
+            self.ui.cursor_track = Some(f);
         }
     }
 
@@ -179,13 +202,37 @@ impl StudioApp {
     }
 
     /// Make a group ("Group n") of `tracks`, placed where the first of them was, as one undo step.
-    /// Members of another group leave it first (groups are one level deep here).
+    /// Groups are one level deep: members of another group leave it first. When the selection
+    /// holds a group's header, the other tracks join that group instead of nesting it; two
+    /// headers are refused ("Groups are one level deep"). Afterwards every group's members sit
+    /// directly after its header.
     pub fn group_tracks(&mut self, tracks: &[TrackId]) -> Result<TrackId, String> {
         let s = self.engine.session_arc();
         let ids: Vec<TrackId> = s.tracks.iter().filter(|t| tracks.contains(&t.id) && t.kind != TrackKind::Master).map(|t| t.id).collect();
         if ids.is_empty() {
             self.status = "Group Tracks: select the tracks to group first".into();
             return Err(self.status.clone());
+        }
+        let headers: Vec<TrackId> = ids.iter().copied().filter(|t| s.track(*t).is_some_and(Track::is_folder)).collect();
+        if headers.len() > 1 {
+            self.status = "Groups are one level deep".into();
+            return Err(self.status.clone());
+        }
+        if let Some(&g) = headers.first() {
+            let join: Vec<u64> = ids.iter().filter(|t| **t != g && s.track(**t).is_some_and(|x| parent_of(&s, x) != Some(g))).map(|t| t.0).collect();
+            let name = s.track(g).map_or_else(String::new, |t| t.name.clone());
+            if join.is_empty() {
+                self.status = format!("{name}: select the tracks to add first");
+                return Err(self.status.clone());
+            }
+            let n = join.len();
+            self.composite("Group Tracks", |app, key| {
+                app.engine.execute_merged("track.move_to_folder", &json!({"tracks": join, "folder": g.0}), key)?;
+                app.normalize(key)
+            })?;
+            self.focus(g);
+            self.status = format!("Added {n} track{} to {name}", if n == 1 { "" } else { "s" });
+            return Ok(g);
         }
         let nested: Vec<u64> = ids.iter().filter(|t| s.track(**t).and_then(|t| parent_of(&s, t)).is_some()).map(|t| t.0).collect();
         let name = (1..).map(|i| format!("Group {i}")).find(|n| s.track_by_name(n).is_none()).unwrap_or_else(|| "Group".into());
@@ -196,12 +243,21 @@ impl StudioApp {
                 app.engine.execute_merged("track.remove_from_folder", &json!({"tracks": nested}), key)?;
             }
             let r = app.engine.execute_merged("track.move_to_new_folder", &json!({"tracks": list, "name": name}), key)?;
+            app.normalize(key)?;
             Ok(TrackId(r.get("folder").and_then(Value::as_u64).unwrap_or(0)))
         })?;
         self.ui.collapsed.retain(|x| *x != folder);
         self.focus(folder);
         self.status = format!("Grouped {n} track{} as {name}", if n == 1 { "" } else { "s" });
         Ok(folder)
+    }
+
+    /// Put every group's members directly after its header (the session order the tree stands
+    /// for), keeping the order within each level.
+    fn normalize(&mut self, key: &str) -> Result<usize, EngineError> {
+        let s = self.engine.session_arc();
+        let order = flatten(&s, &tree(&s));
+        self.reorder(&order, key)
     }
 
     /// The groups Ungroup dissolves: the selected groups, or the group of a selected member;
@@ -235,50 +291,62 @@ impl StudioApp {
     /// (`mix.remove_bus`). The members end up selected.
     pub fn ungroup(&mut self, groups: &[TrackId]) -> Result<Value, String> {
         let s = self.engine.session_arc();
-        let groups: Vec<&Track> = groups.iter().filter_map(|g| s.track(*g)).filter(|t| t.is_folder()).collect();
+        let groups: Vec<TrackId> = groups.iter().copied().filter(|g| s.track(*g).is_some_and(Track::is_folder)).collect();
         if groups.is_empty() {
             return Err("Ungroup: not a group".into());
         }
-        let ids: Vec<TrackId> = groups.iter().map(|g| g.id).collect();
-        let members: Vec<TrackId> = s.tracks.iter().filter(|t| parent_of(&s, t).is_some_and(|p| ids.contains(&p))).map(|t| t.id).collect();
-        let busses: Vec<u64> = groups
-            .iter()
-            .filter_map(|g| match g.mixer.input {
-                Route::Bus(b) => Some(b.0),
-                _ => None,
-            })
-            .collect();
-        // Members stay where they were: the session order without the group tracks.
-        let order: Vec<TrackId> = s.tracks.iter().map(|t| t.id).filter(|t| !ids.contains(t)).collect();
-        let name = if groups.len() == 1 { groups[0].name.clone() } else { format!("{} groups", groups.len()) };
-        let out = self.composite("Ungroup", |app, key| {
-            let e = &mut app.engine;
-            if !members.is_empty() {
-                let list: Vec<u64> = members.iter().rev().map(|t| t.0).collect();
-                e.execute_merged("track.remove_from_folder", &json!({"tracks": list}), key)?;
-            }
-            let ids: Vec<u64> = ids.iter().map(|t| t.0).collect();
-            let r = e.execute_merged("track.delete", &json!({"tracks": ids}), key)?;
-            for b in &busses {
-                let unused = {
-                    let (l, f, n) = e.session().bus_usage(soundcraft_model::BusId(*b));
-                    l.is_empty() && f.is_empty() && n.is_empty()
-                };
-                if unused {
-                    e.execute_merged("mix.remove_bus", &json!({"bus": b}), key)?;
-                }
-            }
-            app.reorder(&order, key)?;
-            Ok(r)
-        })?;
-        self.ui.collapsed.retain(|x| !ids.contains(x));
+        let members: Vec<TrackId> = s.tracks.iter().filter(|t| parent_of(&s, t).is_some_and(|p| groups.contains(&p))).map(|t| t.id).collect();
+        let name =
+            if groups.len() == 1 { s.track(groups[0]).map_or_else(String::new, |g| g.name.clone()) } else { format!("{} groups", groups.len()) };
+        let (out, rerouted) = self.composite("Ungroup", |app, key| app.dissolve(&groups, key))?;
+        self.ui.collapsed.retain(|x| !groups.contains(x));
         if let Some(first) = members.first() {
             let list: Vec<u64> = members.iter().map(|t| t.0).collect();
             let _ = self.run("edit.select", json!({"tracks": list}));
             self.ui.focus_track = Some(*first);
         }
-        self.status = format!("Ungrouped {name}");
+        self.status = format!("Ungrouped {name}{}", reroute_note(&rerouted));
         Ok(out)
+    }
+
+    /// The engine steps of dissolving `groups` under merge `key`: the members leave
+    /// (`track.remove_from_folder`, which routes them back to where the group went), the group
+    /// tracks go (`track.delete`), a bus nobody uses goes (`mix.remove_bus`), and the order is
+    /// restored. A bus that outside tracks still feed is kept, and they are rerouted to Main so
+    /// nothing goes silent. Returns the delete result and the names of the rerouted tracks.
+    pub(crate) fn dissolve(&mut self, groups: &[TrackId], key: &str) -> Result<(Value, Vec<String>), EngineError> {
+        let s = self.engine.session_arc();
+        let members: Vec<TrackId> = s.tracks.iter().filter(|t| parent_of(&s, t).is_some_and(|p| groups.contains(&p))).map(|t| t.id).collect();
+        let busses: Vec<soundcraft_model::BusId> = groups
+            .iter()
+            .filter_map(|g| s.track(*g))
+            .filter_map(|g| match g.mixer.input {
+                Route::Bus(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        // Members stay where they were: the session order without the group tracks.
+        let order: Vec<TrackId> = s.tracks.iter().map(|t| t.id).filter(|t| !groups.contains(t)).collect();
+        let e = &mut self.engine;
+        if !members.is_empty() {
+            let list: Vec<u64> = members.iter().rev().map(|t| t.0).collect();
+            e.execute_merged("track.remove_from_folder", &json!({"tracks": list}), key)?;
+        }
+        let ids: Vec<u64> = groups.iter().map(|t| t.0).collect();
+        let r = e.execute_merged("track.delete", &json!({"tracks": ids}), key)?;
+        let mut rerouted = Vec::new();
+        for b in &busses {
+            let (l, f, n) = e.session().bus_usage(*b);
+            if l.is_empty() && f.is_empty() && n.is_empty() {
+                e.execute_merged("mix.remove_bus", &json!({"bus": b.0}), key)?;
+            } else if !f.is_empty() {
+                let list: Vec<u64> = f.iter().map(|t| t.0).collect();
+                e.execute_merged("track.output", &json!({"tracks": list, "output": "main"}), key)?;
+                rerouted.extend(f.iter().filter_map(|t| e.session().track(*t).map(|t| t.name.clone())));
+            }
+        }
+        self.reorder(&order, key)?;
+        Ok((r, rerouted))
     }
 
     /// Alt+Up/Down: move the chosen tracks one place among their siblings (a group moves with its
@@ -306,6 +374,10 @@ impl StudioApp {
             return Ok(false);
         }
         self.composite("Move Track", |app, key| app.reorder(&order, key))?;
+        self.status = match chosen.as_slice() {
+            [one] => format!("Moved {}", s.track(*one).map_or("track", |t| t.name.as_str())),
+            many => format!("Moved {} tracks", many.len()),
+        };
         Ok(true)
     }
 
@@ -366,6 +438,7 @@ impl StudioApp {
             }
             app.reorder(&order, key)
         })?;
+        self.status = format!("Moved {}", tr.name);
         Ok(true)
     }
 
@@ -402,6 +475,15 @@ impl StudioApp {
         }
         self.arrange.anchor = Some(t);
         self.focus_header(t, false);
+    }
+}
+
+/// The status tail naming the tracks rerouted to Main ("; X now outputs to Main").
+pub(crate) fn reroute_note(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => format!("; {one} now outputs to Main"),
+        many => format!("; {} now output to Main", many.join(", ")),
     }
 }
 

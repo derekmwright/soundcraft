@@ -161,7 +161,8 @@ impl StudioApp {
             return Err(self.status.clone());
         }
         let clips = tracks.iter().any(|t| s.track(*t).is_some_and(|t| !t.clips().is_empty()));
-        if tracks.len() > 1 || clips {
+        let group = tracks.iter().any(|t| s.track(*t).is_some_and(|t| t.is_folder()));
+        if tracks.len() > 1 || clips || group {
             self.dialog = Some(crate::Dialog::DeleteTracks { tracks, clips });
             return Ok(json!({"confirm": true}));
         }
@@ -187,7 +188,27 @@ impl StudioApp {
         let mut names: Vec<String> = Vec::new();
         let mut last = json!({});
         let mut failed: Option<String> = None;
-        for t in tracks {
+        // Groups take the Ungroup path: members stay, the bus goes when nothing else uses it.
+        let groups: Vec<TrackId> = tracks.iter().copied().filter(|t| before.track(*t).is_some_and(|t| t.is_folder())).collect();
+        if !groups.is_empty() {
+            match self.dissolve(&groups, &key) {
+                Ok((v, rerouted)) => {
+                    last = v;
+                    for g in &groups {
+                        names.push(before.track(*g).map_or_else(String::new, |t| t.name.clone()));
+                    }
+                    if groups.len() == 1 && !rerouted.is_empty() {
+                        notes.push(format!("Deleted {}{}", names[0], crate::groups::reroute_note(&rerouted)));
+                    }
+                    self.ui.collapsed.retain(|x| !groups.contains(x));
+                }
+                Err(e) => failed = Some(format!("Delete group: {e}")),
+            }
+        }
+        for t in tracks.iter().filter(|t| !groups.contains(t)) {
+            if failed.is_some() {
+                break;
+            }
             match self.delete_track_in(*t, &key) {
                 Ok((v, name, note)) => {
                     last = v;

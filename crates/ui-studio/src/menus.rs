@@ -328,7 +328,14 @@ fn delete_tracks_dialog(app: &mut StudioApp, ctx: &egui::Context, tracks: &[Trac
     let mut choice = None;
     egui::Modal::new(egui::Id::new("delete_tracks")).show(ctx, |ui| {
         ui.set_width(340.0);
+        let group = tracks.first().filter(|_| tracks.len() == 1).and_then(|t| app.engine.session().track(*t)).filter(|t| t.is_folder());
+        let kept = group.map(|g| {
+            let s = app.engine.session();
+            let n = s.tracks.iter().filter(|t| crate::groups::parent_of(s, t) == Some(g.id)).count();
+            format!("Delete {}? Its {n} track{} stay{}.", g.name, if n == 1 { "" } else { "s" }, if n == 1 { "s" } else { "" })
+        });
         let what = match (tracks.len(), clips) {
+            _ if kept.is_some() => kept.clone().unwrap_or_default(),
             (1, true) => {
                 let name = app.engine.session().track(tracks[0]).map_or("the track".to_string(), |t| format!("“{}”", t.name));
                 format!("Delete {name} and its clips?")
