@@ -13,7 +13,7 @@ use crate::{Level, Promotion};
 use std::cell::Cell;
 
 /// The `SCHED_FIFO` priority: moderate, below the kernel's threaded IRQ handlers (50 on
-/// PREEMPT_RT) and below JACK/PipeWire's driver threads, so the audio device's own thread wins.
+/// `PREEMPT_RT`) and below JACK/PipeWire's driver threads, so the audio device's own thread wins.
 pub(crate) const FIFO_PRIORITY: i32 = 40;
 
 /// What this crate changed on the calling thread.

@@ -56,8 +56,8 @@ pub(crate) fn promote() -> Promotion {
         // default priority when this fails.
         // SAFETY: `handle` is the non-null MMCSS handle just returned for this thread, not yet
         // reverted.
-        let _ = unsafe { AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL) };
-        let p = Promotion::Mmcss { task_index };
+        let critical = unsafe { AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL) } != 0;
+        let p = Promotion::Mmcss { task_index, critical };
         SAVED.set(Saved { promotion: Some(p), mmcss: handle, previous_priority: None });
         return p;
     }

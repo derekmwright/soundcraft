@@ -43,10 +43,12 @@ fn this_thread() -> libc::thread_t {
 }
 
 /// Nanoseconds to Mach absolute time units, saturating; `None` if the timebase is unavailable.
+///
+/// `libc` deprecates `mach_timebase_info` (the struct and the function) in favor of `mach2`,
+/// which would be a second binding crate for one call; hence the allow on the whole function.
+#[allow(deprecated)]
 fn ns_to_abs(ns: u32) -> Option<u32> {
     let mut tb = libc::mach_timebase_info { numer: 0, denom: 0 };
-    // `libc` deprecates this in favor of `mach2`, which would be a second binding crate for one call.
-    #[allow(deprecated)]
     // SAFETY: `tb` is a live, writable `mach_timebase_info` the call fills in.
     let rc = unsafe { libc::mach_timebase_info(&raw mut tb) };
     if rc != libc::KERN_SUCCESS || tb.numer == 0 {
