@@ -114,19 +114,31 @@ impl Icon {
 }
 
 /// Textures by (icon, pixel size), and how many rasterizations ran (tests check it stays flat).
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct Cache {
     textures: HashMap<(Icon, u32), egui::TextureHandle>,
     rasterized: usize,
 }
 
+/// The cache lives behind an `Arc`, so reading it from the context's data store clones a pointer,
+/// never the map (a paint per icon per frame).
+type Shared = std::sync::Arc<std::sync::Mutex<Cache>>;
+
 fn cache_id() -> egui::Id {
     egui::Id::new("transit-icon-cache")
 }
 
+fn shared(ctx: &egui::Context) -> Shared {
+    if let Some(c) = ctx.data(|d| d.get_temp::<Shared>(cache_id())) {
+        return c;
+    }
+    ctx.data_mut(|d| d.get_temp_mut_or_insert_with::<Shared>(cache_id(), Shared::default).clone())
+}
+
 /// The icon's texture at `px` pixels, rasterized on first use only.
 fn texture(ctx: &egui::Context, icon: Icon, px: u32) -> Option<egui::TextureHandle> {
-    if let Some(t) = ctx.data(|d| d.get_temp::<Cache>(cache_id()).and_then(|c| c.textures.get(&(icon, px)).cloned())) {
+    let cache = shared(ctx);
+    if let Some(t) = cache.lock().ok().and_then(|c| c.textures.get(&(icon, px)).cloned()) {
         return Some(t);
     }
     let hint = egui::SizeHint::Size { width: px, height: px, maintain_aspect_ratio: true };
@@ -138,17 +150,16 @@ fn texture(ctx: &egui::Context, icon: Icon, px: u32) -> Option<egui::TextureHand
         }
     };
     let tex = ctx.load_texture(format!("icon-{}-{px}", icon.name()), image, egui::TextureOptions::LINEAR);
-    ctx.data_mut(|d| {
-        let c = d.get_temp_mut_or_default::<Cache>(cache_id());
+    if let Ok(mut c) = cache.lock() {
         c.textures.insert((icon, px), tex.clone());
         c.rasterized += 1;
-    });
+    }
     Some(tex)
 }
 
 /// How many icon rasterizations have run on this context.
 pub fn rasterized(ctx: &egui::Context) -> usize {
-    ctx.data(|d| d.get_temp::<Cache>(cache_id()).map_or(0, |c| c.rasterized))
+    shared(ctx).lock().map_or(0, |c| c.rasterized)
 }
 
 /// Paint `icon` centered on `center`, `size` points square, in `color`, snapped to the pixel grid.

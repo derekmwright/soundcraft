@@ -91,7 +91,7 @@ pub const DARK: Tokens = Tokens {
     grid_beat: Color32::from_rgb(0x2a, 0x2b, 0x2f),
     text: Color32::from_rgb(0xdc, 0xdd, 0xe0),
     // Lifted from 0x8c8e94 (slice 5) so secondary labels keep 4.5:1 on the raised panels.
-    text_dim: Color32::from_rgb(0xa2, 0xa4, 0xaa),
+    text_dim: Color32::from_rgb(0xb6, 0xb8, 0xbe),
     accent: Color32::from_rgb(0x4c, 0xb1, 0xf0),
     cursor: Color32::from_rgb(0xe8, 0xe8, 0xea),
     record: Color32::from_rgb(0xe5, 0x48, 0x48),
@@ -121,7 +121,7 @@ pub const LIGHT: Tokens = Tokens {
     grid_bar: Color32::from_rgb(0xc6, 0xc7, 0xcc),
     grid_beat: Color32::from_rgb(0xe2, 0xe3, 0xe6),
     text: Color32::from_rgb(0x1c, 0x1d, 0x20),
-    text_dim: Color32::from_rgb(0x5d, 0x60, 0x68),
+    text_dim: Color32::from_rgb(0x50, 0x53, 0x5b),
     accent: Color32::from_rgb(0x18, 0x73, 0xb8),
     cursor: Color32::from_rgb(0x1c, 0x1d, 0x20),
     record: Color32::from_rgb(0xc6, 0x2f, 0x2f),

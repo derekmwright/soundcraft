@@ -438,7 +438,9 @@ fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, ha
     ui.menu_button("Color", |ui| {
         for (i, c) in PALETTE.iter().enumerate() {
             let (r, resp) = ui.allocate_exact_size(vec2(120.0, 16.0), Sense::click());
+            // The outline carries the 3:1 boundary where a pale swatch meets the light popup.
             ui.painter().rect_filled(r.shrink(1.0), crate::theme::RADIUS_SM, theme::rgb(*c));
+            ui.painter().rect_stroke(r.shrink(1.0), crate::theme::RADIUS_SM, Stroke::new(1.0, TOKENS.text_dim), StrokeKind::Inside);
             if resp.clicked() {
                 let _ = app.run("track.color", json!({"tracks": [id.0], "color": c}));
                 ui.close();
@@ -456,7 +458,7 @@ fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, ha
 }
 
 /// Track colors offered in the track menu (muted, distinguishable on the dark lanes).
-const PALETTE: [[u8; 3]; 10] = [
+pub(crate) const PALETTE: [[u8; 3]; 10] = [
     [0xd9, 0x5f, 0x5f],
     [0xe0, 0x8c, 0x4a],
     [0xd6, 0xbe, 0x4f],

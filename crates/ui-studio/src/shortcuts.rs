@@ -285,7 +285,9 @@ pub fn text(s: &Shortcut) -> String {
     if s.mods.shift {
         out.push_str("Shift+");
     }
-    out.push_str(key_name(s.key));
+    // A bare "+" reads fine, but "Shift++" does not: with a modifier the key is spelled out.
+    let any_mod = s.mods.command || s.mods.ctrl || s.mods.mac_cmd || s.mods.alt || s.mods.shift;
+    out.push_str(if any_mod && s.key == Key::Plus { "Plus" } else { key_name(s.key) });
     out
 }
 
@@ -304,7 +306,10 @@ pub fn filtered(query: &str) -> Vec<(Scope, Vec<&'static Shortcut>)> {
                 .iter()
                 .filter(|s| s.scope == *sc)
                 .filter(|s| {
-                    q.is_empty() || [s.label.to_lowercase(), text(s).to_lowercase(), sc.label().to_lowercase()].iter().any(|t| t.contains(&q))
+                    q.is_empty()
+                        || [s.label.to_lowercase(), text(s).to_lowercase(), sc.label().to_lowercase(), s.note.to_lowercase()]
+                            .iter()
+                            .any(|t| t.contains(&q))
                 })
                 .collect::<Vec<_>>();
             (*sc, rows)

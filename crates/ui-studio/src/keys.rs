@@ -789,7 +789,7 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
     let p = ui.painter();
     p.rect_filled(
         b,
-        3.0,
+        crate::theme::RADIUS_SM,
         if on {
             TOKENS.accent
         } else if resp.hovered() {

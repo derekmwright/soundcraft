@@ -144,6 +144,19 @@ fn both_themes_keep_text_meters_and_accent_legible() {
             assert!(contrast(t.text_dim, bg) >= 4.5, "{name}: dim text on {bg_name}: {}", contrast(t.text_dim, bg));
         }
         assert!(contrast(t.text, t.header_selected) >= 7.0, "{name}: text on a selected header");
+        assert!(contrast(t.text_dim, t.header_selected) >= 4.5, "{name}: dim text on a selected header: {}", contrast(t.text_dim, t.header_selected));
+        assert!(contrast(t.text, t.button_hover) >= 7.0, "{name}: text on a hovered button");
+        assert!(contrast(t.text_dim, t.button_hover) >= 4.5, "{name}: dim text on a hovered button: {}", contrast(t.text_dim, t.button_hover));
+        // The track menu's color swatches are UI components on the popup's panel: each is either
+        // 3:1 on its own or bounded by the dim-text outline the menu draws, which is.
+        for c in crate::arrange::PALETTE {
+            let c = crate::theme::rgb(c);
+            assert!(
+                contrast(c, t.panel) >= 3.0 || contrast(t.text_dim, t.panel) >= 3.0,
+                "{name}: menu swatch {c:?} on the panel: {}",
+                contrast(c, t.panel)
+            );
+        }
         for bg in [t.bg, t.panel, t.panel_raised, t.lane] {
             assert!(contrast(t.accent, bg) >= 3.0, "{name}: accent {}", contrast(t.accent, bg));
             assert!(contrast(t.focus_ring, bg) >= 3.0, "{name}: focus ring");
@@ -290,7 +303,7 @@ fn help_keyboard_shortcuts_opens_groups_by_scope_and_filters() {
     t.app.ui.shortcuts_filter = "zoom".into();
     t.frames(2);
     let rows: Vec<String> = serde_json::from_value(t.inspect()["shortcuts"]["rows"].clone()).unwrap();
-    assert_eq!(rows, ["Arrangement · Zoom In · +", "Arrangement · Zoom In · =", "Arrangement · Zoom In · Shift++", "Arrangement · Zoom Out · -"]);
+    assert_eq!(rows, ["Arrangement · Zoom In · +", "Arrangement · Zoom In · =", "Arrangement · Zoom In · Shift+Plus", "Arrangement · Zoom Out · -"]);
     t.app.ui.shortcuts_filter.clear();
     t.click(mid(filter));
     t.input("ui.text", json!({"text": "ctrl+e"}));
@@ -326,30 +339,75 @@ fn both_themes_are_flat_on_the_spacing_grid() {
     }
 }
 
+// The argument list of the call opening at `open` (just after its `(`), split at top-level
+// commas, however many lines it spans.
+fn args(src: &str, open: usize) -> Vec<String> {
+    let (mut depth, mut cur, mut out) = (0usize, String::new(), Vec::new());
+    for ch in src[open..].chars() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth == 0 => break,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(ch);
+    }
+    out.push(cur);
+    out.into_iter().map(|a| a.split_whitespace().collect::<Vec<_>>().join(" ")).collect()
+}
+// A bare number (other than 0) or `CornerRadius::same(<number>)` is a literal radius.
+fn literal(arg: &str) -> bool {
+    let a = arg.trim();
+    let a = a.strip_prefix("egui::CornerRadius::same(").or_else(|| a.strip_prefix("CornerRadius::same(")).map_or(a, |r| r.trim_end_matches(')'));
+    let a = a.trim_end_matches("u8").trim_end_matches("f32").trim_end_matches('_');
+    a.parse::<f32>().is_ok_and(|v| v != 0.0)
+}
 #[test]
 fn painted_corners_use_the_radius_tokens() {
-    for src in [
-        include_str!("arrange.rs"),
-        include_str!("browser.rs"),
-        include_str!("devices.rs"),
-        include_str!("keys.rs"),
-        include_str!("menus.rs"),
-        include_str!("mixer.rs"),
-        include_str!("transport.rs"),
+    let mut checked = 0;
+    for (file, src) in [
+        ("arrange.rs", include_str!("arrange.rs")),
+        ("browser.rs", include_str!("browser.rs")),
+        ("devices.rs", include_str!("devices.rs")),
+        ("keys.rs", include_str!("keys.rs")),
+        ("menus.rs", include_str!("menus.rs")),
+        ("mixer.rs", include_str!("mixer.rs")),
+        ("transport.rs", include_str!("transport.rs")),
     ] {
-        for line in src.lines().filter(|l| l.contains("rect_filled(") || l.contains("rect_stroke(")) {
-            for n in ["1.0, ", "2.0, ", "3.0, ", "4.0, ", "6.0, "] {
-                let lit = format!(", {n}");
-                if let Some(at) = line.find(&lit) {
-                    // Only the radius argument counts: the second top-level argument.
-                    let head = &line[..at];
-                    let depth = head.matches('(').count() - head.matches(')').count();
-                    assert!(depth != 1, "literal corner radius: {line}");
+        // (call, index of the radius argument)
+        for (call, at) in
+            [("rect_filled(", 1), ("rect_stroke(", 1), (".rect(", 1), ("CornerRadius::same(", 0), (".corner_radius(", 0), (".rounding(", 0)]
+        {
+            for (i, _) in src.match_indices(call) {
+                let a = args(src, i + call.len());
+                checked += 1;
+                if let Some(radius) = a.get(at) {
+                    assert!(!literal(radius), "{file}: literal corner radius in {call}{}", a.join(", "));
                 }
             }
         }
         assert!(!src.contains("CornerRadius { nw"), "top corners go through theme::top_corners");
     }
+    assert!(checked > 20, "the scan found the calls: {checked}");
+}
+
+#[test]
+fn the_radius_scan_catches_multi_line_literals() {
+    let src = "p.rect_filled(
+    b,
+    3.0,
+    if on { a } else { c },
+);";
+    let a = args(src, src.find('(').unwrap() + 1);
+    assert_eq!(a, ["b", "3.0", "if on { a } else { c }", ""]);
+    assert!(literal(&a[1]));
+    assert!(literal("egui::CornerRadius::same(4)"));
+    assert!(!literal("crate::theme::RADIUS_SM"));
+    assert!(!literal("0.0"));
 }
 
 #[test]
@@ -411,4 +469,15 @@ fn the_help_window_lists_the_new_rows() {
         assert!(rows.iter().any(|r| r == want), "{want} missing from {rows:?}");
     }
     assert!(!rows.iter().any(|r| r.contains("Split at Cursor · Ctrl+T")));
+}
+
+#[test]
+fn the_shortcut_filter_searches_notes_and_spells_out_shift_plus() {
+    use crate::shortcuts::{TABLE, filtered, text};
+    for s in TABLE {
+        let hit = filtered(s.note).into_iter().flat_map(|(_, r)| r).any(|r| r.action == s.action && r.key == s.key && r.mods == s.mods);
+        assert!(hit, "{}: its own note finds it", s.label);
+    }
+    assert!(TABLE.iter().any(|s| text(s) == "Shift+Plus"));
+    assert!(!TABLE.iter().any(|s| text(s).ends_with("++")));
 }
