@@ -144,8 +144,11 @@ impl Shared {
 
     /// Control thread only, after closing admission. Also needed if no writer was spawned or
     /// its thread panicked: joining that thread alone would not prove producer quiescence.
+    /// Total wait time depends on producer progress; the polling interval is not a timeout.
     fn wait_for_capture(&self) {
         while !self.quiescent() {
+            #[cfg(test)]
+            tests::on_capture_wait();
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -590,6 +593,19 @@ impl TakeWriter {
 mod tests {
     use super::*;
 
+    thread_local! {
+        // Deterministic control-thread scheduling point. Never runs in the input callback;
+        // absent from production builds and private to each test's control thread.
+        static CAPTURE_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn on_capture_wait() {
+        let hook = CAPTURE_WAIT_HOOK.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     fn decode(path: &PathBuf) -> Vec<Vec<f32>> {
         soundcraft_audio_io::decode(&std::fs::read(path).unwrap(), None).unwrap().1.channels
     }
@@ -713,6 +729,60 @@ mod tests {
         assert!(problem.is_some_and(|e| e.contains("writer stopped unexpectedly")));
         assert!(shared.quiescent());
         assert!(shared.begin_capture().is_none());
+    }
+
+    #[test]
+    fn writer_panic_waits_for_admitted_capture_and_discards_old_debt_before_rearm() {
+        use std::sync::mpsc::channel;
+        let dir = std::env::temp_dir().join(format!("soundcraft-panic-rearm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("new.wav");
+        let shared = Arc::new(Shared::new(CaptureRing::new(8)));
+        shared.start_capture();
+        let mut r = recorder(&shared);
+        let (admitted_tx, admitted_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        let producer_shared = Arc::clone(&shared);
+        let producer = std::thread::spawn(move || {
+            let _lease = producer_shared.begin_capture().unwrap();
+            // No healthy writer drains this take. Overflow must not become silence in the next.
+            producer_shared.capture(&[0.5; 12]);
+            admitted_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            producer_shared.capture(&[0.75; 2]);
+        });
+        admitted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        r.writer = Some((std::thread::spawn(|| std::panic::panic_any("writer failure with capture in flight")), Vec::new()));
+        let hook_resume = resume_tx.clone();
+        CAPTURE_WAIT_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let _ = hook_resume.send(());
+            }))
+        });
+        let (old_takes, problem) = r.finish();
+        let quiescent_at_return = shared.quiescent();
+        CAPTURE_WAIT_HOOK.with(|h| h.borrow_mut().take());
+        // If a mutation bypasses the wait, still release/join the producer and clean up, then
+        // fail on the observed state. No elapsed quiet-time window determines correctness.
+        let _ = resume_tx.send(());
+        producer.join().unwrap();
+        let old_debt = shared.pending_silence.load(Ordering::Relaxed);
+
+        r.arm(vec![(TrackId(1), vec![0], path.clone())]).unwrap();
+        {
+            let _lease = shared.begin_capture().unwrap();
+            shared.capture(&[0.25, -0.25]);
+        }
+        let (new_takes, new_problem) = r.finish();
+        let audio = decode(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(quiescent_at_return, "finish returned while the old callback still held its lease");
+        assert!(old_takes.is_empty());
+        assert!(problem.is_some_and(|e| e.contains("writer stopped unexpectedly")));
+        assert_eq!(old_debt, 6, "the panicked writer could not perform its final silence drain");
+        assert_eq!((new_takes.len(), new_problem), (1, None));
+        assert_eq!(audio, [vec![0.25, -0.25]], "old-take silence debt entered the new WAV");
     }
 
     #[test]
