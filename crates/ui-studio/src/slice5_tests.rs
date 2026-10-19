@@ -81,3 +81,120 @@ fn icons_are_rasterized_once_not_every_frame() {
     t.frames(30);
     assert_eq!(crate::icons::rasterized(&t.ctx), first, "no per-frame parsing");
 }
+
+/// The View menu's entry `label` (open the View menu first).
+fn view_item(t: &T, label: &str) -> [f32; 4] {
+    t.app.arrange.bar_menu.iter().find(|m| m.label == label).unwrap_or_else(|| panic!("no {label}: {:?}", t.app.arrange.bar_menu)).rect
+}
+
+/// View > Appearance > `label`, by clicks.
+fn pick_appearance(t: &mut T, label: &str) {
+    t.click(mid(view_item(t, "View")));
+    t.click(mid(view_item(t, "Appearance")));
+    t.click(mid(view_item(t, label)));
+}
+
+#[test]
+fn view_appearance_switches_the_theme_by_clicks_and_never_dirties() {
+    let mut t = T::new();
+    assert_eq!(t.app.ui.appearance, crate::theme::Appearance::System);
+    assert_eq!(t.inspect()["theme"], "dark", "no OS theme in a test: egui falls back to dark");
+    let dirty = t.app.engine.is_dirty();
+    let rev = t.app.engine.revision;
+    pick_appearance(&mut t, "Light");
+    assert_eq!(t.app.ui.appearance, crate::theme::Appearance::Light);
+    assert_eq!(t.inspect()["theme"], "light");
+    assert_eq!(t.inspect()["ui"]["appearance"], "light", "kept in UiState");
+    assert_eq!(t.ctx.theme(), egui::Theme::Light, "egui's own widgets follow");
+    assert_eq!(t.ctx.global_style().visuals.panel_fill, crate::theme::LIGHT.panel);
+    pick_appearance(&mut t, "Dark");
+    assert_eq!(t.inspect()["theme"], "dark");
+    assert_eq!(t.ctx.global_style().visuals.panel_fill, crate::theme::DARK.panel);
+    assert_eq!((t.app.engine.is_dirty(), t.app.engine.revision), (dirty, rev), "appearance is view state, not the document");
+}
+
+#[test]
+fn system_appearance_follows_the_os_theme() {
+    let mut t = T::new();
+    t.ctx.options_mut(|o| o.fallback_theme = egui::Theme::Light);
+    t.frames(2);
+    assert_eq!(t.inspect()["theme"], "light", "System follows what egui resolves for the OS");
+    pick_appearance(&mut t, "Dark");
+    assert_eq!(t.inspect()["theme"], "dark", "a pinned theme ignores the OS");
+}
+
+#[test]
+fn appearance_round_trips_through_ui_state_json() {
+    let ui = crate::UiState { appearance: crate::theme::Appearance::Light, ..Default::default() };
+    let back: crate::UiState = serde_json::from_value(serde_json::to_value(&ui).unwrap()).unwrap();
+    assert_eq!(back.appearance, crate::theme::Appearance::Light);
+    let old: crate::UiState = serde_json::from_value(json!({"track_height": 50.0})).unwrap();
+    assert_eq!(old.appearance, crate::theme::Appearance::System, "an older ui.json follows the OS");
+}
+
+#[test]
+fn both_themes_keep_text_meters_and_accent_legible() {
+    use crate::theme::{DARK, LIGHT, Tokens, contrast};
+    for (name, t) in [("dark", &DARK), ("light", &LIGHT)] {
+        let t: &Tokens = t;
+        for (bg_name, bg) in
+            [("bg", t.bg), ("panel", t.panel), ("raised", t.panel_raised), ("header", t.header), ("lane", t.lane), ("button", t.button)]
+        {
+            assert!(contrast(t.text, bg) >= 7.0, "{name}: text on {bg_name}");
+            assert!(contrast(t.text_dim, bg) >= 4.5, "{name}: dim text on {bg_name}: {}", contrast(t.text_dim, bg));
+        }
+        assert!(contrast(t.text, t.header_selected) >= 7.0, "{name}: text on a selected header");
+        for bg in [t.bg, t.panel, t.panel_raised, t.lane] {
+            assert!(contrast(t.accent, bg) >= 3.0, "{name}: accent {}", contrast(t.accent, bg));
+            assert!(contrast(t.focus_ring, bg) >= 3.0, "{name}: focus ring");
+            assert!(contrast(t.cursor, bg) >= 3.0, "{name}: playhead");
+        }
+        // Meters: level and clip cap on the meter's background.
+        assert!(contrast(t.monitor, t.bg) >= 3.0, "{name}: meter level");
+        assert!(contrast(t.record, t.bg) >= 3.0, "{name}: clip cap");
+        // State fills carry their letter at 4.5:1.
+        crate::theme::set_current(if t.light_clips { egui::Theme::Light } else { egui::Theme::Dark });
+        for c in [t.mute, t.solo, t.record, t.monitor, t.accent] {
+            assert!(contrast(crate::theme::text_on(c), c) >= 4.5, "{name}: letter on {c:?}");
+        }
+    }
+    crate::theme::set_current(egui::Theme::Dark);
+}
+
+#[test]
+fn clip_names_read_on_every_track_color_in_both_themes() {
+    use crate::theme::{clip_colors, contrast, rgb, set_current};
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        set_current(theme);
+        for c in soundcraft_model::TRACK_COLORS {
+            for selected in [false, true] {
+                for base in [rgb(c), crate::theme::darken(rgb(c), 0.5)] {
+                    let (_, strip, ink) = clip_colors(base, selected);
+                    assert!(contrast(ink, strip) >= 4.5, "{theme:?} {c:?} selected={selected}: {}", contrast(ink, strip));
+                }
+            }
+        }
+    }
+    set_current(egui::Theme::Dark);
+}
+
+#[test]
+fn tokens_are_the_only_colors() {
+    // Every literal color lives in theme.rs (transparent mesh fringes aside).
+    for (file, src) in [
+        ("arrange.rs", include_str!("arrange.rs")),
+        ("browser.rs", include_str!("browser.rs")),
+        ("devices.rs", include_str!("devices.rs")),
+        ("groups.rs", include_str!("groups.rs")),
+        ("keys.rs", include_str!("keys.rs")),
+        ("menus.rs", include_str!("menus.rs")),
+        ("mixer.rs", include_str!("mixer.rs")),
+        ("transport.rs", include_str!("transport.rs")),
+        ("waveform.rs", include_str!("waveform.rs")),
+        ("icons.rs", include_str!("icons.rs")),
+    ] {
+        for pat in ["Color32::from_", "Color32::WHITE", "Color32::BLACK", "Color32::RED", "Color32::GRAY", "Color32::LIGHT", "Color32::DARK"] {
+            assert!(!src.contains(pat), "{file} paints a literal color ({pat})");
+        }
+    }
+}

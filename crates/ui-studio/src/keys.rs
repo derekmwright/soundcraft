@@ -15,7 +15,7 @@ use crate::StudioApp;
 use crate::arrange::R4;
 use crate::mixer::MenuItem;
 use crate::theme::{self, TOKENS};
-use egui::{Align2, Color32, CursorIcon, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{Align2, CursorIcon, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::{Value, json};
 use soundcraft_midi::Note;
 use soundcraft_model::{ClipContent, ClipId, Session, TrackId};
@@ -925,7 +925,7 @@ fn paint_grid(ui: &Ui, s: &Session, map: &Map, grid: Rect, ruler: Rect, cv: &Cli
         }
     }
     // Outside the clip: dimmed.
-    let dim = Color32::from_black_alpha(70);
+    let dim = TOKENS.overlay;
     if map.x(0) > grid.min.x {
         p.rect_filled(Rect::from_min_max(grid.min, pos2(map.x(0), grid.max.y)), 0.0, dim);
     }

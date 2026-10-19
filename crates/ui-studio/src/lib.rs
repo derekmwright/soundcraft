@@ -80,6 +80,8 @@ pub struct UiState {
     pub collapsed: Vec<TrackId>,
     /// The browser's view preferences (slice 4): shown, width, tab, locations, favorites.
     pub browser: browser::BrowserPrefs,
+    /// View > Appearance (slice 5): System follows the OS; Dark and Light pin the theme.
+    pub appearance: theme::Appearance,
 }
 
 impl Default for UiState {
@@ -102,6 +104,7 @@ impl Default for UiState {
             keys: keys::KeysPrefs::default(),
             collapsed: Vec::new(),
             browser: browser::BrowserPrefs::default(),
+            appearance: theme::Appearance::System,
         }
     }
 }
@@ -184,7 +187,8 @@ pub struct StudioApp {
     synthetic_grace: u32,
     /// Modifiers held by the synthetic gesture being played (`ui.drag {alt: true}`).
     synthetic_mods: Option<egui::Modifiers>,
-    theme_applied: bool,
+    /// The appearance last given to egui (re-applied when `ui.appearance` changes).
+    theme_applied: Option<theme::Appearance>,
     pub dialog: Option<Dialog>,
     /// The selected tracks were picked by clicking their headers (arrangement header or mixer
     /// strip): only then does Delete take the tracks (Ableton). Any other selection change, such
@@ -238,7 +242,7 @@ impl StudioApp {
             synthetic: Vec::new(),
             synthetic_grace: 0,
             synthetic_mods: None,
-            theme_applied: false,
+            theme_applied: None,
             dialog: None,
             tracks_selected_by_header: false,
             editors: Vec::new(),
@@ -443,10 +447,11 @@ impl StudioApp {
         if ctx.current_pass_index() > 0 {
             return;
         }
-        if !self.theme_applied {
-            theme::apply(ctx);
-            self.theme_applied = true;
+        if self.theme_applied != Some(self.ui.appearance) {
+            theme::apply(ctx, self.ui.appearance);
+            self.theme_applied = Some(self.ui.appearance);
         }
+        theme::follow(ctx);
         let now = ctx.input(|i| i.time);
         let dt = self.last_frame.replace(now).map_or(1.0 / 60.0, |t| (now - t) as f32).clamp(0.0, 0.25);
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
@@ -545,6 +550,7 @@ impl StudioApp {
     /// Lay out the whole window.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        theme::follow(&ctx);
         ui.set_style(ctx.global_style());
         keys::shortcuts(self, &ctx); // slice 3: before the arrangement's keys
         groups::shortcuts(self, &ctx);
@@ -614,6 +620,7 @@ impl StudioApp {
             "plugin_scan": plugin_scan::inspect(),
             "keys": self.keys.layout,
             "browser": self.browser.layout,
+            "theme": if theme::current() == egui::Theme::Light { "light" } else { "dark" },
         })
     }
 }

@@ -135,6 +135,21 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                             ui.close();
                         }
                     }
+                    ui.separator();
+                    // Appearance: System follows the OS; kept in `UiState` (slice 5).
+                    let sub = ui.menu_button("Appearance", |ui| {
+                        for a in crate::theme::Appearance::ALL {
+                            let on = app.ui.appearance == a;
+                            let text = if on { format!("✓ {}", a.label()) } else { format!("   {}", a.label()) };
+                            let b = ui.button(text);
+                            view_items.push(crate::mixer::MenuItem::at(ui, a.label().into(), "appearance".into(), b.rect));
+                            if b.clicked() {
+                                app.ui.appearance = a;
+                                ui.close();
+                            }
+                        }
+                    });
+                    view_items.push(crate::mixer::MenuItem::at(ui, "Appearance".into(), String::new(), sub.response.rect));
                 });
                 // Where the View menu and its entries sit, for `ui.inspect` and tests (slice 4).
                 app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "View".into(), String::new(), view_menu.response.rect));

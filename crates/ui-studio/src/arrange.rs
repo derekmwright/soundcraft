@@ -577,19 +577,13 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
 fn draw_clip(p: &egui::Painter, s: &Session, map: Map, tl: Rect, t: &Track, c: &Clip, rect: Rect, selected: bool, alpha: f32) {
     let base = theme::rgb(c.color.unwrap_or(t.color));
     let base = if c.muted { theme::darken(base, 0.5) } else { base };
-    let body_col = if selected { theme::lighten(base, 0.12) } else { base };
+    let (body_col, strip_col, name_col) = theme::clip_colors(base, selected);
     let p = p.with_clip_rect(rect.intersect(tl));
     p.rect_filled(rect, 3.0, body_col.gamma_multiply(alpha));
     let strip = Rect::from_min_max(rect.min, pos2(rect.max.x, (rect.min.y + CLIP_NAME_H).min(rect.max.y)));
-    p.rect_filled(strip, egui::CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 }, theme::darken(body_col, 0.22).gamma_multiply(alpha));
+    p.rect_filled(strip, egui::CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 }, strip_col.gamma_multiply(alpha));
     let name_x = rect.min.x.max(tl.min.x) + 4.0;
-    p.with_clip_rect(strip.intersect(tl)).text(
-        pos2(name_x, strip.center().y),
-        Align2::LEFT_CENTER,
-        &c.name,
-        FontId::proportional(11.0),
-        theme::text_on(theme::darken(body_col, 0.22)),
-    );
+    p.with_clip_rect(strip.intersect(tl)).text(pos2(name_x, strip.center().y), Align2::LEFT_CENTER, &c.name, FontId::proportional(11.0), name_col);
     let body = Rect::from_min_max(pos2(rect.min.x, strip.max.y), rect.max).shrink2(vec2(0.0, 2.0));
     let ink = theme::darken(body_col, 0.62).gamma_multiply(alpha);
     if body.height() > 4.0 {
