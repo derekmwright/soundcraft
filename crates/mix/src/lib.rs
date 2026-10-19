@@ -448,14 +448,16 @@ impl SlotCtx<'_> {
 
 impl MixEngine {
     /// Force (or stop forcing) every engine in the process to render its audio-thread strips
-    /// serially on the audio thread, never on the render pool: the realtime baseline (audit F01,
-    /// "serial until the pool beats it in measured headroom"). Takes effect at the next block.
-    /// [`RENDER_SERIAL_ENV`]`=1` sets it at startup. Offline renders are not affected.
+    /// serially on the audio thread, never on the render pool. Serial is the default (see
+    /// [`RENDER_POOL_ENV`]); `force_serial(false)` hands the strips to the pool. Takes effect at
+    /// the next block. Offline renders are not affected.
     pub fn force_serial(on: bool) {
         FORCE_SERIAL.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// True while [`MixEngine::force_serial`] (or [`RENDER_SERIAL_ENV`]) is in effect.
+    /// True while serial rendering is in effect: the default, until [`MixEngine::force_serial`]`(false)`
+    /// or [`RENDER_POOL_ENV`] turns the render pool on.
+    #[must_use]
     pub fn serial_forced() -> bool {
         FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -724,6 +726,7 @@ impl MixEngine {
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
     pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
         let frames = frames.min(self.max_block);
+        promote_callback_thread();
         // Stopped, the position stands still: not a seek (it would cut auditioned notes).
         if pos != self.last_end && !self.monitor_only {
             // Seek: silence held notes and ringing plugins.
@@ -1454,24 +1457,72 @@ fn as_audio_thread(audio: bool, f: impl FnOnce()) {
 }
 
 /// Strips render in parallel from this many on; below it the fan-out costs more than it saves.
+#[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_STRIPS: usize = 4;
 
 /// The render pool never has more workers than this, whatever the core count.
 pub const MAX_RENDER_WORKERS: usize = 8;
 
-/// Environment variable: `1` forces audio-thread strips to render serially on the audio thread
-/// (the realtime baseline), as [`MixEngine::force_serial`]`(true)` does. Read once, when the
-/// render pool is built.
-pub const RENDER_SERIAL_ENV: &str = "SOUNDCRAFT_RENDER_SERIAL";
+/// Environment variable: `1` opts in to the render pool for audio-thread strips, as
+/// [`MixEngine::force_serial`]`(false)` does. Read once, when the render pool is built.
+///
+/// Serial is the realtime default until the bounded render plan (notes/10) lands; measured
+/// 2026-10-18: promoted serial 0 late blocks vs promoted pool 1-5 per 2000 under load.
+pub const RENDER_POOL_ENV: &str = "SOUNDCRAFT_RENDER_POOL";
 
 /// Environment variable: `1` leaves the render pool's workers at the OS default priority instead
-/// of promoting them with [`soundcraft_rt::promote_audio_thread`]. Read once, when the render
-/// pool is built (the only place the workers are promoted).
+/// of promoting them with [`soundcraft_rt::promote_audio_thread`], and likewise the audio
+/// callback thread. Read once, when the render pool is built.
 pub const RENDER_NO_PRIORITY_ENV: &str = "SOUNDCRAFT_RENDER_NO_PRIORITY";
 
-/// Audio-thread strips render serially when set ([`MixEngine::force_serial`],
-/// [`RENDER_SERIAL_ENV`]).
-static FORCE_SERIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Audio-thread strips render serially when set ([`MixEngine::force_serial`]). On by default;
+/// [`RENDER_POOL_ENV`] clears it at startup.
+static FORCE_SERIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// False under [`RENDER_NO_PRIORITY_ENV`]: the audio callback thread is then left alone.
+#[cfg(not(target_arch = "wasm32"))]
+static PROMOTE_CALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// What the first audio callback thread's promotion achieved (see [`promote_callback_thread`]).
+#[cfg(not(target_arch = "wasm32"))]
+static CALLBACK_PROMOTION: std::sync::OnceLock<soundcraft_rt::Promotion> = std::sync::OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+std::thread_local! {
+    /// Whether this thread has had its one promotion attempt as the audio callback thread.
+    static CALLBACK_TRIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Promote the calling thread once if it is the audio callback thread (marked with
+/// [`mark_audio_thread`]); every later call is one thread-local read. Serial rendering runs the
+/// strips on the callback thread, so it needs the realtime class the pool workers get at start.
+///
+/// Allocation: the repeat path allocates nothing (a `const` thread-local `Cell`). The first call
+/// on a thread makes the OS call, which may allocate inside the OS (MMCSS registration), once
+/// per thread, in that thread's first block. A thread that is not marked (an offline render) is
+/// never promoted.
+#[cfg(not(target_arch = "wasm32"))]
+fn promote_callback_thread() {
+    if !on_audio_thread() || CALLBACK_TRIED.replace(true) {
+        return;
+    }
+    if PROMOTE_CALLBACK.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = CALLBACK_PROMOTION.set(soundcraft_rt::promote_audio_thread());
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn promote_callback_thread() {}
+
+/// The first audio callback thread's promotion (`None` before its first block, or under
+/// [`RENDER_NO_PRIORITY_ENV`]). For diagnostics and tests.
+#[must_use]
+pub fn callback_promotion() -> Option<soundcraft_rt::Promotion> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return CALLBACK_PROMOTION.get().copied();
+    #[cfg(target_arch = "wasm32")]
+    return None;
+}
 
 /// What each render pool worker's [`soundcraft_rt::promote_audio_thread`] achieved, by worker
 /// index; written once by the worker's start handler, never on the render path.
@@ -1488,6 +1539,7 @@ fn env_flag(name: &str) -> bool {
 /// What each render pool worker's promotion achieved, by worker index (`None` for a worker that
 /// does not exist or has not started yet; `Unsupported("disabled")` under
 /// [`RENDER_NO_PRIORITY_ENV`]). For diagnostics and tests.
+#[must_use]
 pub fn render_worker_promotions() -> [Option<soundcraft_rt::Promotion>; MAX_RENDER_WORKERS] {
     #[cfg(not(target_arch = "wasm32"))]
     return std::array::from_fn(|i| WORKER_PROMOTION.get(i).and_then(|slot| slot.get().copied()));
@@ -1499,22 +1551,29 @@ pub fn render_worker_promotions() -> [Option<soundcraft_rt::Promotion>; MAX_REND
 /// global pool, which offline bounces and video decode/encode share and which runs at normal
 /// priority behind whatever they queued. `None` when the machine has too few cores for a pool to
 /// pay (or the threads could not be spawned): the audio thread then renders its strips itself.
+///
+/// Serial is the realtime default until the bounded render plan (notes/10) lands; measured
+/// 2026-10-18: promoted serial 0 late blocks vs promoted pool 1-5 per 2000 under load. The pool
+/// is still built (and its workers promoted) so [`MixEngine::force_serial`]`(false)` and
+/// [`RENDER_POOL_ENV`] can opt in.
 #[cfg(not(target_arch = "wasm32"))]
 static RENDER_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
 
 /// Spawn the render pool, once per process. [`MixEngine::new`] calls this, so the pool exists
 /// before the first callback; it never spawns from the audio thread (a `MixEngine` built there,
 /// on a sample-rate change, reuses the pool an earlier engine built). The switches
-/// [`RENDER_SERIAL_ENV`] and [`RENDER_NO_PRIORITY_ENV`] are read here, once.
+/// [`RENDER_POOL_ENV`] and [`RENDER_NO_PRIORITY_ENV`] are read here, once.
 #[cfg(not(target_arch = "wasm32"))]
 fn init_render_pool() {
     if !on_audio_thread() {
         RENDER_POOL.get_or_init(|| {
-            if env_flag(RENDER_SERIAL_ENV) {
-                log::info!("mix: {RENDER_SERIAL_ENV} is set; audio-thread strips render serially");
-                FORCE_SERIAL.store(true, std::sync::atomic::Ordering::Relaxed);
+            if env_flag(RENDER_POOL_ENV) {
+                log::info!("mix: {RENDER_POOL_ENV} is set; audio-thread strips render on the pool");
+                FORCE_SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
             }
-            build_render_pool(!env_flag(RENDER_NO_PRIORITY_ENV))
+            let promote = !env_flag(RENDER_NO_PRIORITY_ENV);
+            PROMOTE_CALLBACK.store(promote, std::sync::atomic::Ordering::Relaxed);
+            build_render_pool(promote)
         });
     }
 }
@@ -1560,7 +1619,7 @@ fn build_render_pool(promote: bool) -> Option<rayon::ThreadPool> {
 /// Process strips, in parallel on native targets when there are enough of them.
 ///
 /// On the audio thread the strips go to the dedicated render pool (or run right here when there
-/// is none, or while [`MixEngine::force_serial`] is on); they never wait behind Rayon's global
+/// is none, or while [`MixEngine::force_serial`] is on, the default); they never wait behind Rayon's global
 /// pool. Elsewhere (offline bounces) they use the global pool as before. The strips are
 /// independent and are summed afterwards in a fixed order, so the result is the same whichever
 /// way they ran.
@@ -2621,12 +2680,14 @@ mod audio_thread_tests {
     #[test]
     fn audio_thread_strips_never_reach_the_global_rayon_pool() {
         let _switch = SERIAL_SWITCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        MixEngine::force_serial(false); // the pool is opt-in; this tests where it runs
         let audio = jobs(true);
         assert!(audio.iter().all(|j| !j.global), "an audio-thread strip ran on the global pool");
         if RENDER_POOL.get().is_some_and(Option::is_some) {
             assert!(audio.iter().any(|j| j.render), "with a render pool, the strips fan out to it");
         }
         let offline = jobs(false);
+        MixEngine::force_serial(true); // back to the default
         assert!(offline.iter().all(|j| !j.render), "an offline render never takes the render pool");
     }
 
@@ -2647,6 +2708,7 @@ mod audio_thread_tests {
         if RENDER_POOL.get().is_some_and(Option::is_some) {
             assert!(jobs(true).iter().any(|j| j.render), "the pool is used again once the switch is off");
         }
+        MixEngine::force_serial(true); // back to the default
     }
 
     /// Sixteen strips of distinct deterministic material, levels, pans and built-in inserts.

@@ -107,7 +107,7 @@ fn run(s: &Session, serial: bool, promote: bool) -> Stats {
     })
     .join()
     .unwrap();
-    MixEngine::force_serial(false);
+    MixEngine::force_serial(true); // the default
     times.sort();
     Stats {
         worst: times[times.len() - 1],

@@ -65,6 +65,7 @@ impl Drop for Saturated {
 
 #[test]
 fn audio_thread_render_does_not_wait_for_a_saturated_global_pool() {
+    MixEngine::force_serial(false); // the pool is opt-in; this test is about the pool path
     let s = sixteen_strips();
     let mut eng = MixEngine::new(48_000.0, FRAMES);
     let mut out = vec![vec![0.0f32; FRAMES]; 2];
@@ -96,6 +97,7 @@ fn audio_thread_render_does_not_wait_for_a_saturated_global_pool() {
 /// there every worker must be promoted.
 #[test]
 fn render_pool_workers_promote_themselves_at_start() {
+    MixEngine::force_serial(false); // the pool is opt-in; this test is about its workers
     let _eng = MixEngine::new(48_000.0, FRAMES);
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let workers = cores.saturating_sub(1).min(soundcraft_mix::MAX_RENDER_WORKERS);
