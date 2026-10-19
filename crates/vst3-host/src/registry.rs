@@ -110,6 +110,11 @@ fn merge(files: Vec<scan_cache::Entry<Vst3Descriptor>>) -> Vec<Vst3Descriptor> {
 fn scan_now(reuse: bool) -> Vec<Vst3Descriptor> {
     let (dirs, cache_file, scanner) = {
         let r = lock();
+        // Unit tests never scan the machine's plug-in folders: that loads every installed plug-in
+        // in-process, and some never unload, which hangs the test binary at exit (CI has none).
+        #[cfg(test)]
+        let mut dirs = Vec::new();
+        #[cfg(not(test))]
         let mut dirs = paths::default_search_paths();
         dirs.extend(r.extra_dirs.iter().cloned());
         (dirs, r.cache_file.clone(), r.scanner.clone())

@@ -15,12 +15,19 @@ pub fn specs() -> Vec<CommandSpec> {
         "{rescan?: bool} → [{id: \"vst3:<class id hex>\", class_id, name, vendor, version, sdk_version, sub_categories, category, is_instrument, path}]",
         always,
         |_, p| {
+            // Unit tests never scan the machine's plug-in folders: that loads every installed
+            // plug-in in-process, and some never unload, which hangs the test binary at exit.
+            #[cfg(test)]
+            return Ok(json!([]));
+            #[cfg(not(test))]
+            {
             let list = if p.get("rescan").and_then(Value::as_bool).unwrap_or(false) {
                 soundcraft_vst3_host::rescan()
             } else {
                 soundcraft_vst3_host::scan()
             };
             Ok(json!(list))
+            }
         }
     )]
 }

@@ -15,12 +15,19 @@ pub fn specs() -> Vec<CommandSpec> {
         "{rescan?: bool} → [{id: \"clap:…\", plugin_id, name, vendor, version, description, features, category, is_instrument, path}]",
         always,
         |_, p| {
+            // Unit tests never scan the machine's plug-in folders: that loads every installed
+            // plug-in in-process, and some never unload, which hangs the test binary at exit.
+            #[cfg(test)]
+            return Ok(json!([]));
+            #[cfg(not(test))]
+            {
             let list = if p.get("rescan").and_then(Value::as_bool).unwrap_or(false) {
                 soundcraft_clap_host::rescan()
             } else {
                 soundcraft_clap_host::scan()
             };
             Ok(json!(list))
+            }
         }
     )]
 }
@@ -28,6 +35,12 @@ pub fn specs() -> Vec<CommandSpec> {
 /// A built-in plugin's description, else a hosted CLAP (`clap:<id>`), VST3 (`vst3:<class id>`) or
 /// Audio Units (`au:<type>:<subtype>:<manufacturer>`) plugin's.
 pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
+    // Tests never reach the real hosts (see `soundcraft_mix::create_plugin`): a lookup scans the
+    // machine's plug-in folders, and some plug-ins never unload.
+    #[cfg(test)]
+    if soundcraft_mix::is_third_party(id) {
+        return None;
+    }
     soundcraft_dsp::plugin_info(id)
         .or_else(|| soundcraft_clap_host::plugin_info(id))
         .or_else(|| soundcraft_vst3_host::plugin_info(id))
