@@ -8,7 +8,7 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,9 @@ const RING_SECONDS: usize = 4;
 const STALL: Duration = Duration::from_secs(2);
 const GONE: u8 = 1;
 const BROKEN: u8 = 2;
+const ARMED: u64 = 1;
+const CAPTURING: u64 = 2;
+const CAPTURE_FLAGS: u64 = ARMED | CAPTURING;
 
 /// Why the input can't go on.
 #[derive(Debug, Clone, PartialEq)]
@@ -85,8 +88,11 @@ fn finite(x: f32) -> f32 {
 }
 
 struct Shared {
-    armed: AtomicBool,
+    /// Generation in the high bits; admission and in-flight producer in the low bits.
+    capture_state: AtomicU64,
     ring: CaptureRing,
+    /// Producer-owned while admitted; reset only when quiescent, drained by the writer at stop.
+    pending_silence: AtomicUsize,
     /// Samples lost while the ring was full.
     dropped: AtomicUsize,
     /// Input callbacks so far, to tell a device that stopped sending.
@@ -100,7 +106,56 @@ struct Shared {
 impl Shared {
     fn new(ring: CaptureRing) -> Shared {
         let (beats, fault, failed) = (AtomicU64::new(0), AtomicU8::new(0), Mutex::new(None));
-        Shared { armed: AtomicBool::new(false), ring, dropped: AtomicUsize::new(0), beats, fault, failed }
+        Shared { capture_state: AtomicU64::new(0), ring, pending_silence: AtomicUsize::new(0), dropped: AtomicUsize::new(0), beats, fault, failed }
+    }
+
+    /// Control thread, after the preceding writer has joined (or failed startup quiesced).
+    fn start_capture(&self) {
+        let generation = (self.capture_state.load(Ordering::Relaxed) & !CAPTURE_FLAGS).wrapping_add(CAPTURE_FLAGS + 1);
+        self.pending_silence.store(0, Ordering::Relaxed);
+        self.capture_state.store(generation | ARMED, Ordering::Release);
+    }
+
+    fn stop_capture(&self) {
+        self.capture_state.fetch_and(!ARMED, Ordering::AcqRel);
+    }
+
+    fn armed(&self) -> bool {
+        self.capture_state.load(Ordering::Relaxed) & ARMED != 0
+    }
+
+    /// Single bounded admission attempt. Stop and admission are ordered by the same atomic;
+    /// generation prevents an attempt delayed across stop/rearm from joining the next take.
+    fn admit_capture(&self, observed: u64) -> Option<CaptureLease<'_>> {
+        if observed & CAPTURE_FLAGS != ARMED {
+            return None;
+        }
+        self.capture_state.compare_exchange(observed, observed | CAPTURING, Ordering::AcqRel, Ordering::Relaxed).ok()?;
+        Some(CaptureLease(self))
+    }
+
+    fn begin_capture(&self) -> Option<CaptureLease<'_>> {
+        self.admit_capture(self.capture_state.load(Ordering::Acquire))
+    }
+
+    fn quiescent(&self) -> bool {
+        self.capture_state.load(Ordering::Acquire) & CAPTURE_FLAGS == 0
+    }
+
+    /// Control thread only, after closing admission. Also needed if no writer was spawned or
+    /// its thread panicked: joining that thread alone would not prove producer quiescence.
+    fn wait_for_capture(&self) {
+        while !self.quiescent() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Writer only. Observe quiescence before the final pop, so it covers every admitted push.
+    /// Once true no producer can enter until the control thread has joined this writer.
+    fn drain_capture(&self, block: &mut Vec<f32>) -> bool {
+        let finished = self.quiescent();
+        self.ring.pop_all(block);
+        finished
     }
 
     /// Run the input callback's `work`. After a panic in it, the input is broken and does
@@ -112,13 +167,23 @@ impl Shared {
         }
     }
 
-    /// The input callback's work while armed. Samples that don't fit are owed (`owed`) and queued
+    /// The input callback's work under a CaptureLease. Samples that don't fit are owed and queued
     /// as silence before the next block, so the take keeps its timing.
-    fn capture(&self, data: &[f32], owed: &mut usize) {
-        *owed -= self.ring.push(*owed, |_| 0.0);
-        let kept = if *owed == 0 { self.ring.push(data.len(), |i| data.get(i).copied().map_or(0.0, finite)) } else { 0 };
-        *owed = owed.saturating_add(data.len() - kept);
+    fn capture(&self, data: &[f32]) {
+        let owed = self.pending_silence.load(Ordering::Relaxed);
+        let owed = owed - self.ring.push(owed, |_| 0.0);
+        let kept = if owed == 0 { self.ring.push(data.len(), |i| data.get(i).copied().map_or(0.0, finite)) } else { 0 };
+        self.pending_silence.store(owed.saturating_add(data.len() - kept), Ordering::Relaxed);
         self.dropped.fetch_add(data.len() - kept, Ordering::Relaxed);
+    }
+}
+
+/// Release on normal return and unwind. No callback must arrive after Stop to acknowledge it.
+struct CaptureLease<'a>(&'a Shared);
+
+impl Drop for CaptureLease<'_> {
+    fn drop(&mut self) {
+        self.0.capture_state.fetch_and(!CAPTURING, Ordering::Release);
     }
 }
 
@@ -156,22 +221,21 @@ where
     let mon = Arc::clone(monitor);
     let mut scratch = vec![0.0f32; 8192 * usize::from(config.channels).max(1)];
     let chunk = scratch.len();
-    let mut owed = 0;
     device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
             crate::mark_audio_thread();
             sh.guarded(|| {
+                // One admission covers the entire device callback, including scratch chunks.
+                let capture = sh.begin_capture();
                 for part in data.chunks(chunk) {
                     let Some(s) = scratch.get_mut(..part.len()) else { return };
                     for (o, x) in s.iter_mut().zip(part) {
                         *o = f32::from_sample(*x);
                     }
                     mon.push(s);
-                    if sh.armed.load(Ordering::Acquire) {
-                        sh.capture(s, &mut owed);
-                    } else {
-                        owed = 0;
+                    if capture.is_some() {
+                        sh.capture(s);
                     }
                 }
             });
@@ -337,12 +401,15 @@ impl Recorder {
         let ring = &self.shared.ring;
         ring.tail.store(ring.head.load(Ordering::Acquire), Ordering::Release);
         *self.shared.failed.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        self.shared.armed.store(true, Ordering::Release);
+        self.shared.start_capture();
         let (shared, channels) = (Arc::clone(&self.shared), self.channels);
         match std::thread::Builder::new().name("take writer".into()).spawn(move || write_takes(&shared, takes, channels)) {
             Ok(w) => self.writer = Some((w, live)),
             Err(e) => {
-                self.shared.armed.store(false, Ordering::Release);
+                self.shared.stop_capture();
+                // No writer exists to join. Quiesce any admitted callback before a later arm
+                // resets the ring/debt. This waits on the control thread, never the callback.
+                self.shared.wait_for_capture();
                 return Err(e.to_string());
             }
         }
@@ -368,7 +435,7 @@ impl Recorder {
             _ => {}
         }
         let beats = self.shared.beats.load(Ordering::Relaxed);
-        if beats != self.seen.0 || !self.shared.armed.load(Ordering::Relaxed) {
+        if beats != self.seen.0 || !self.shared.armed() {
             self.seen = (beats, Instant::now());
         }
         (self.seen.1.elapsed() >= STALL).then(|| Trouble::Device(format!("“{name}” stopped sending audio")))
@@ -381,8 +448,11 @@ impl Recorder {
     }
 
     pub fn finish(&mut self) -> Takes {
-        self.shared.armed.store(false, Ordering::Release);
-        let (takes, problem) = self.writer.take().and_then(|(w, _)| w.join().ok()).unwrap_or_default();
+        self.shared.stop_capture();
+        self.shared.wait_for_capture();
+        let (takes, problem) = self.writer.take().map_or_else(Takes::default, |(w, _)| {
+            w.join().unwrap_or_else(|_| (Vec::new(), Some("the recording writer stopped unexpectedly; check the take files".into())))
+        });
         let lost = self.shared.dropped.swap(0, Ordering::Relaxed) / self.channels.max(1);
         let slow =
             (lost > 0).then(|| format!("{} ms of input lost: the disk was too slow", lost.saturating_mul(1000) / self.sample_rate.max(1) as usize));
@@ -399,10 +469,9 @@ impl Drop for Recorder {
 fn write_takes(shared: &Shared, mut takes: Vec<TakeWriter>, channels: usize) -> Takes {
     let (mut block, mut header_written, mut reported) = (Vec::new(), Instant::now(), false);
     loop {
-        let stopping = !shared.armed.load(Ordering::Acquire);
+        let stopping = shared.drain_capture(&mut block);
         // The ring holds interleaved samples and a pop can end mid-frame: write whole frames and
         // keep the remainder for the next pop, so channels never shift.
-        shared.ring.pop_all(&mut block);
         let whole = block.len() - block.len() % channels.max(1);
         takes.iter_mut().for_each(|t| t.write(&block[..whole], channels));
         block.drain(..whole);
@@ -411,6 +480,18 @@ fn write_takes(shared: &Shared, mut takes: Vec<TakeWriter>, channels: usize) -> 
             reported = true;
         }
         if stopping {
+            // No producer remains. Preserve the final overflow duration even if the device
+            // never calls us again. Bound writer scratch instead of allocating the entire debt.
+            let mut owed = shared.pending_silence.swap(0, Ordering::Relaxed);
+            let chunk = 8192 * channels.max(1);
+            while owed > 0 && takes.iter().any(|t| t.error.is_none()) {
+                let n = owed.min(chunk);
+                block.resize(block.len() + n, 0.0);
+                let whole = block.len() - block.len() % channels.max(1);
+                takes.iter_mut().for_each(|t| t.write(&block[..whole], channels));
+                block.drain(..whole);
+                owed -= n;
+            }
             break;
         }
         if header_written.elapsed() >= Duration::from_secs(1) {
@@ -516,21 +597,21 @@ mod tests {
     #[test]
     fn a_full_ring_owes_the_lost_samples_as_silence() {
         let shared = Shared::new(CaptureRing::new(8));
-        let (mut owed, mut out) = (0, Vec::new());
-        shared.capture(&[1.0; 6], &mut owed);
-        shared.capture(&[2.0; 4], &mut owed);
+        let mut out = Vec::new();
+        shared.capture(&[1.0; 6]);
+        shared.capture(&[2.0; 4]);
         shared.ring.pop_all(&mut out);
-        shared.capture(&[3.0; 2], &mut owed);
+        shared.capture(&[3.0; 2]);
         shared.ring.pop_all(&mut out);
         assert_eq!(out, [vec![1.0; 6], vec![2.0; 2], vec![0.0; 2], vec![3.0; 2]].concat());
-        assert_eq!((owed, shared.dropped.load(Ordering::Relaxed)), (0, 2));
+        assert_eq!((shared.pending_silence.load(Ordering::Relaxed), shared.dropped.load(Ordering::Relaxed)), (0, 2));
     }
 
     #[test]
     fn nan_and_infinite_input_records_as_silence() {
         let shared = Shared::new(CaptureRing::new(8));
-        let (mut owed, mut out) = (0, Vec::new());
-        shared.capture(&[0.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.5], &mut owed);
+        let mut out = Vec::new();
+        shared.capture(&[0.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.5]);
         shared.ring.pop_all(&mut out);
         assert_eq!(out, [0.5, 0.0, 0.0, 0.0, -0.5]);
     }
@@ -550,16 +631,135 @@ mod tests {
     }
 
     #[test]
+    fn stop_waits_for_an_admitted_push_before_the_final_drain() {
+        use std::sync::mpsc::channel;
+        let shared = Arc::new(Shared::new(CaptureRing::new(8)));
+        shared.start_capture();
+        let (entered_tx, entered_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        let producer = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || {
+            let _lease = producer.begin_capture().unwrap();
+            producer.ring.push(4, |i| {
+                if i == 0 {
+                    entered_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }
+                (i + 1) as f32
+            });
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        shared.stop_capture();
+        let mut block = Vec::new();
+        let premature_exit = shared.drain_capture(&mut block);
+        // Release and join even if the assertion fails, so a negative-control run leaves no
+        // parked producer. This is the writer's production exit predicate, not a timing sleep.
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(!premature_exit, "writer exited before the admitted producer published its head");
+        assert!(shared.drain_capture(&mut block));
+        assert_eq!(block, [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn stop_closes_admission_and_rearm_rejects_an_old_generation() {
+        let shared = Shared::new(CaptureRing::new(8));
+        shared.start_capture();
+        let before_stop = shared.capture_state.load(Ordering::Acquire);
+        shared.stop_capture();
+        assert!(shared.admit_capture(before_stop).is_none());
+        assert!(shared.begin_capture().is_none());
+        assert!(shared.quiescent(), "no future device callback is needed");
+        shared.start_capture();
+        assert!(shared.admit_capture(before_stop).is_none(), "an old callback must not enter the new take");
+        let lease = shared.begin_capture().unwrap();
+        assert!(shared.begin_capture().is_none(), "there can only be one producer");
+        shared.stop_capture();
+        assert!(!shared.quiescent());
+        drop(lease);
+        assert!(shared.quiescent());
+    }
+
+    #[test]
+    fn a_panicking_producer_releases_its_capture_lease() {
+        let shared = Shared::new(CaptureRing::new(8));
+        shared.start_capture();
+        shared.guarded(|| {
+            let _lease = shared.begin_capture().unwrap();
+            std::panic::panic_any("input failure after admission");
+        });
+        shared.stop_capture();
+        assert!(shared.quiescent());
+        assert_eq!(shared.fault.load(Ordering::Relaxed), BROKEN);
+    }
+
+    #[test]
+    fn stop_before_any_input_callback_does_not_need_an_ack_callback() {
+        let shared = Arc::new(Shared::new(CaptureRing::new(8)));
+        let mut r = recorder(&shared);
+        r.arm(Vec::new()).unwrap();
+        assert_eq!(r.finish(), (Vec::new(), None));
+        assert!(shared.quiescent());
+    }
+
+    #[test]
+    fn a_writer_panic_is_reported_with_capture_closed() {
+        let shared = Arc::new(Shared::new(CaptureRing::new(8)));
+        shared.start_capture();
+        let mut r = recorder(&shared);
+        r.writer = Some((std::thread::spawn(|| std::panic::panic_any("writer failure")), Vec::new()));
+        let (takes, problem) = r.finish();
+        assert!(takes.is_empty());
+        assert!(problem.is_some_and(|e| e.contains("writer stopped unexpectedly")));
+        assert!(shared.quiescent());
+        assert!(shared.begin_capture().is_none());
+    }
+
+    #[test]
+    fn final_overflow_silence_preserves_multichannel_length_and_does_not_leak_on_rearm() {
+        let dir = std::env::temp_dir().join(format!("soundcraft-final-capture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = Arc::new(Shared::new(CaptureRing::new(8)));
+        let mut r = recorder(&shared);
+        r.channels = 3;
+        let first_path = dir.join("first.wav");
+        // Hold the producer lease through Stop: an admitted callback must finish as part of
+        // this take. Pre-fill before starting the writer to force the overflow deterministically.
+        shared.start_capture();
+        {
+            let _lease = shared.begin_capture().unwrap();
+            shared.stop_capture();
+            shared.capture(&(1..=12).map(|i| i as f32 / 16.0).collect::<Vec<_>>());
+        }
+        let take = TakeWriter::create(TrackId(1), vec![0, 1, 2], first_path.clone(), 48_000).unwrap();
+        let (done, problem) = write_takes(&shared, vec![take], 3);
+        assert_eq!((done.len(), problem), (1, None));
+        assert_eq!(decode(&first_path), [vec![0.0625, 0.25, 0.4375, 0.0], vec![0.125, 0.3125, 0.5, 0.0], vec![0.1875, 0.375, 0.0, 0.0]]);
+        assert_eq!(shared.pending_silence.load(Ordering::Relaxed), 0);
+        r.finish();
+        // No idle input callback between takes: the next take still starts with no silence debt.
+        let second_path = dir.join("second.wav");
+        r.arm(vec![(TrackId(2), vec![0, 1, 2], second_path.clone())]).unwrap();
+        {
+            let _lease = shared.begin_capture().unwrap();
+            shared.capture(&[0.25, 0.5, 0.75]);
+        }
+        assert!(r.finish().1.is_none());
+        assert_eq!(decode(&second_path), [vec![0.25], vec![0.5], vec![0.75]]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_bug_a_stall_or_a_lost_device_is_trouble() {
         let shared = Arc::new(Shared::new(CaptureRing::new(64)));
         let mut r = recorder(&shared);
-        shared.armed.store(true, Ordering::Release);
+        shared.start_capture();
         assert_eq!(r.trouble(), None);
         r.seen.1 = Instant::now().checked_sub(STALL).unwrap();
         assert_eq!(r.trouble(), Some(Trouble::Device("“Mic In” stopped sending audio".into())));
         shared.guarded(|| {});
         assert_eq!(r.trouble(), None, "it sent again");
-        shared.armed.store(false, Ordering::Release);
+        shared.stop_capture();
         r.seen.1 = Instant::now().checked_sub(STALL).unwrap();
         assert_eq!(r.trouble(), None, "a quiet input that isn't recording is fine");
         shared.guarded(|| std::panic::panic_any("a bug in the input"));
@@ -579,18 +779,18 @@ mod tests {
         let mut take = TakeWriter::create(TrackId(1), vec![0], dir.join("Vox_01.wav"), 48_000).unwrap();
         take.file = File::open(&take.path).unwrap();
         let shared = Arc::new(Shared::new(CaptureRing::new(1 << 12)));
-        shared.armed.store(true, Ordering::Release);
+        shared.start_capture();
         let mut r = recorder(&shared);
         let sh = Arc::clone(&shared);
         let writer = std::thread::spawn(move || write_takes(&sh, vec![take], 1));
-        shared.capture(&[0.5; 480], &mut 0);
+        shared.capture(&[0.5; 480]);
         let trouble = (0..300).find_map(|_| {
             std::thread::sleep(Duration::from_millis(10));
             r.trouble()
         });
         assert!(matches!(&trouble, Some(Trouble::Disk(e)) if e.contains("Vox_01.wav")), "{trouble:?}");
         assert_eq!(r.trouble(), None, "reported once");
-        shared.armed.store(false, Ordering::Release);
+        shared.stop_capture();
         assert!(writer.join().unwrap().1.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -608,13 +808,12 @@ mod tests {
         assert_eq!(decode(&dir.join("Vox_01.wav"))[0].len(), 100, "the header covers what it has seen");
 
         let shared = Arc::new(Shared::new(CaptureRing::new(1 << 16)));
-        shared.armed.store(true, Ordering::Release);
+        shared.start_capture();
         let sh = Arc::clone(&shared);
         let writer = std::thread::spawn(move || write_takes(&sh, vec![gtr, vox], 3));
         let input: Vec<f32> = (0..3 * 4_800).map(|i| i as f32 / 20_000.0).collect();
-        let mut owed = 0;
-        input.chunks(3 * 480).for_each(|block| shared.capture(block, &mut owed));
-        shared.armed.store(false, Ordering::Release);
+        input.chunks(3 * 480).for_each(|block| shared.capture(block));
+        shared.stop_capture();
         let (done, problem) = writer.join().unwrap();
         let channel = |c: usize| input.iter().skip(c).step_by(3).copied().collect::<Vec<f32>>();
         assert_eq!((done.len(), problem), (2, None));
