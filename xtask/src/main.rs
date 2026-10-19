@@ -1,4 +1,4 @@
-//! `cargo xtask <ci|layers|assets|parity|wasm>` — repository gates.
+//! `cargo xtask <ci|layers|assets|parity|wasm|rt-targets>` — repository gates.
 
 mod ico;
 mod version;
@@ -147,6 +147,24 @@ fn wasm() -> Result<(), String> {
     cargo(&args)
 }
 
+/// `soundcraft-rt` type-checks and lints clean on every platform it has code for (ADR 0013, 5),
+/// with and without the portable fallback. Needs `rustup target add` for each; no linker needed.
+const RT_TARGETS: &[&str] = &["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin"];
+
+fn rt_targets() -> Result<(), String> {
+    for t in RT_TARGETS {
+        for features in [None, Some("force-fallback")] {
+            let mut args = vec!["clippy", "--target", t, "-p", "soundcraft-rt", "--all-targets"];
+            if let Some(f) = features {
+                args.extend(["--features", f]);
+            }
+            args.extend(["--", "-D", "warnings"]);
+            cargo(&args)?;
+        }
+    }
+    Ok(())
+}
+
 fn ci() -> Result<(), String> {
     let steps: Vec<(&str, Box<dyn Fn() -> Result<(), String>>)> = vec![
         ("fmt", Box::new(|| cargo(&["fmt", "--all", "--", "--check"]))),
@@ -155,6 +173,7 @@ fn ci() -> Result<(), String> {
         ("assets", Box::new(assets)),
         ("layers", Box::new(layers)),
         ("wasm", Box::new(wasm)),
+        ("rt-targets", Box::new(rt_targets)),
     ];
     let mut summary = Vec::new();
     for (name, f) in &steps {
@@ -179,9 +198,10 @@ fn main() -> ExitCode {
         Some("assets") => assets(),
         Some("parity") => parity(),
         Some("wasm") => wasm(),
+        Some("rt-targets") => rt_targets(),
         Some("version") => version::run(args.get(1..).unwrap_or(&[])),
         Some("ico") => ico::run(args.get(1..).unwrap_or(&[])),
-        _ => Err("usage: cargo xtask <ci|layers|assets|parity|wasm|version>".into()),
+        _ => Err("usage: cargo xtask <ci|layers|assets|parity|wasm|rt-targets|version>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
