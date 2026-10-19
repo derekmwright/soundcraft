@@ -1749,7 +1749,10 @@ fn edit_field(app: &mut StudioApp, ui: &mut Ui, draw: Rect, id: egui::Id, font: 
     let Some(mut e) = app.mixer.edit.take() else { return };
     let rect = Rect::from_center_size(draw.center(), vec2(draw.width().max(46.0), draw.height().max(16.0)));
     app.mixer.edit_rect = r4(rect);
-    let (esc, enter) = ui.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Enter)));
+    let (esc, enter) = ui.input(|i| {
+        use crate::shortcuts::{Action, hit};
+        (hit(i, Action::ReadoutCancel), hit(i, Action::ReadoutApply))
+    });
     if e.fresh {
         e.fresh = false;
         // Focused with the whole text selected, so typing replaces it.

@@ -31,7 +31,7 @@ pub enum Gesture {
 /// Rects as `[x0, y0, x1, y1]`, for `ui.inspect` (scripts drive the UI with them).
 pub type R4 = [f32; 4];
 
-fn r4(r: Rect) -> R4 {
+pub fn r4(r: Rect) -> R4 {
     [r.min.x, r.min.y, r.max.x, r.max.y]
 }
 

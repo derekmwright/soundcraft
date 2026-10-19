@@ -535,8 +535,10 @@ pub fn menu_items(app: &mut StudioApp, ui: &mut egui::Ui, on: Option<TrackId>) {
         }
         _ => app.ungroup_targets(),
     };
-    let group = ui.add_enabled(!tracks.is_empty(), egui::Button::new("Group Tracks").shortcut_text("Ctrl+G"));
-    let ungroup = ui.add_enabled(!groups.is_empty(), egui::Button::new("Ungroup").shortcut_text("Ctrl+Shift+G"));
+    let group =
+        ui.add_enabled(!tracks.is_empty(), egui::Button::new("Group Tracks").shortcut_text(crate::shortcuts::label(crate::shortcuts::Action::Group)));
+    let ungroup =
+        ui.add_enabled(!groups.is_empty(), egui::Button::new("Ungroup").shortcut_text(crate::shortcuts::label(crate::shortcuts::Action::Ungroup)));
     let list = if on.is_some() { &mut app.arrange.menu } else { &mut app.arrange.bar_menu };
     list.retain(|m| m.label != "Group Tracks" && m.label != "Ungroup");
     list.push(crate::mixer::MenuItem::at(ui, "Group Tracks".into(), String::new(), group.rect));
@@ -553,22 +555,21 @@ pub fn menu_items(app: &mut StudioApp, ui: &mut egui::Ui, on: Option<TrackId>) {
 
 /// Ctrl+G, Ctrl+Shift+G, Alt+Up, Alt+Down (unless a text field has the keyboard).
 pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
-    use egui::{Key, Modifiers};
+    use crate::shortcuts::{Action as A, pressed};
     if ctx.egui_wants_keyboard_input() || app.dialog.is_some() {
         return;
     }
-    let pressed = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
-    // Shift first: Ctrl+G also matches Ctrl+Shift+G.
-    if pressed(Modifiers::COMMAND | Modifiers::SHIFT, Key::G) {
+    // Ungroup first: Ctrl+G also matches Ctrl+Shift+G.
+    if pressed(ctx, A::Ungroup) {
         let _ = app.ungroup_selected();
     }
-    if pressed(Modifiers::COMMAND, Key::G) {
+    if pressed(ctx, A::Group) {
         let _ = app.group_selected();
     }
-    if pressed(Modifiers::ALT, Key::ArrowUp) {
+    if pressed(ctx, A::TrackUp) {
         let _ = app.nudge_tracks(true);
     }
-    if pressed(Modifiers::ALT, Key::ArrowDown) {
+    if pressed(ctx, A::TrackDown) {
         let _ = app.nudge_tracks(false);
     }
 }

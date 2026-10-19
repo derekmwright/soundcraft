@@ -15,7 +15,7 @@ use crate::StudioApp;
 use crate::arrange::R4;
 use crate::mixer::MenuItem;
 use crate::theme::{self, TOKENS};
-use egui::{Align2, CursorIcon, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{Align2, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::{Value, json};
 use soundcraft_midi::Note;
 use soundcraft_model::{ClipContent, ClipId, Session, TrackId};
@@ -545,59 +545,55 @@ fn clamp_move(sel: &[Note], dt: i64, ds: i64) -> (i64, i64) {
     (dt.max(-min_start), ds.clamp(-lo, 127 - hi))
 }
 
-fn pressed(ctx: &egui::Context, mods: Modifiers, key: Key) -> bool {
-    ctx.input_mut(|i| i.consume_key(mods, key))
-}
-
 /// The piano roll's keys. Runs before the arrangement's shortcuts, so Delete, Ctrl+A/D, the
 /// arrows and Escape go to the notes while the pane has the keyboard.
 pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
+    use crate::shortcuts::{Action as A, pressed};
     if ctx.egui_wants_keyboard_input() || app.dialog.is_some() {
         return;
     }
-    let cmd = Modifiers::COMMAND;
-    if pressed(ctx, cmd | Modifiers::ALT, Key::K) {
+    if pressed(ctx, A::TogglePianoRoll) {
         app.toggle_keys();
     }
     if !app.keys_shown() || !app.keys.active {
         return;
     }
-    if pressed(ctx, Modifiers::NONE, Key::Escape) {
+    if pressed(ctx, A::NotesClose) {
         if app.keys.gesture.take().is_none() {
             app.close_keys();
         }
         return;
     }
-    if pressed(ctx, cmd, Key::A) {
+    if pressed(ctx, A::NotesSelectAll) {
         app.keys.selection = app.keys_notes();
     }
-    if pressed(ctx, cmd, Key::D) {
+    if pressed(ctx, A::NotesDuplicate) {
         let _ = app.keys_duplicate();
     }
-    if pressed(ctx, cmd, Key::U) {
+    if pressed(ctx, A::NotesQuantize) {
         let _ = app.keys_quantize();
     }
-    if pressed(ctx, cmd, Key::ArrowUp) {
+    if pressed(ctx, A::NotesTransposeUp) {
         let _ = app.keys_transpose(12);
     }
-    if pressed(ctx, cmd, Key::ArrowDown) {
+    if pressed(ctx, A::NotesTransposeDown) {
         let _ = app.keys_transpose(-12);
     }
     let step = app.ui.keys.snap.step();
     let nudges = [
-        (Modifiers::SHIFT, Key::ArrowUp, 0, 12),
-        (Modifiers::SHIFT, Key::ArrowDown, 0, -12),
-        (Modifiers::NONE, Key::ArrowUp, 0, 1),
-        (Modifiers::NONE, Key::ArrowDown, 0, -1),
-        (Modifiers::NONE, Key::ArrowLeft, -step, 0),
-        (Modifiers::NONE, Key::ArrowRight, step, 0),
+        (A::NotesOctaveUp, 0, 12),
+        (A::NotesOctaveDown, 0, -12),
+        (A::NotesUp, 0, 1),
+        (A::NotesDown, 0, -1),
+        (A::NotesEarlier, -step, 0),
+        (A::NotesLater, step, 0),
     ];
-    for (m, k, dt, ds) in nudges {
-        if pressed(ctx, m, k) {
+    for (action, dt, ds) in nudges {
+        if pressed(ctx, action) {
             let _ = app.keys_move(dt, ds);
         }
     }
-    if pressed(ctx, Modifiers::NONE, Key::Delete) || pressed(ctx, Modifiers::NONE, Key::Backspace) {
+    if pressed(ctx, A::NotesDelete) {
         let _ = app.keys_delete();
     }
 }
@@ -813,7 +809,10 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
     p.rect_filled(b, 3.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
     p.text(b.center(), Align2::CENTER_CENTER, "Quantize", small.clone(), TOKENS.text);
     layout.quantize = r4(b);
-    if resp.on_hover_text("Quantize the selection to the grid (Ctrl+U)").clicked() {
+    if resp
+        .on_hover_text(format!("Quantize the selection to the grid ({})", crate::shortcuts::label(crate::shortcuts::Action::NotesQuantize)))
+        .clicked()
+    {
         let _ = app.keys_quantize();
     }
     let (b, resp) = button(ui, 84.0, "snap");

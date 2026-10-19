@@ -19,6 +19,7 @@ pub mod keys;
 pub mod menus;
 pub mod mixer;
 pub mod plugin_scan;
+pub mod shortcuts;
 pub mod theme;
 pub mod transport;
 pub mod waveform;
@@ -82,6 +83,11 @@ pub struct UiState {
     pub browser: browser::BrowserPrefs,
     /// View > Appearance (slice 5): System follows the OS; Dark and Light pin the theme.
     pub appearance: theme::Appearance,
+    /// Help > Keyboard Shortcuts is open, and its filter (view state, not saved).
+    #[serde(skip)]
+    pub show_shortcuts: bool,
+    #[serde(skip)]
+    pub shortcuts_filter: String,
 }
 
 impl Default for UiState {
@@ -105,6 +111,8 @@ impl Default for UiState {
             collapsed: Vec::new(),
             browser: browser::BrowserPrefs::default(),
             appearance: theme::Appearance::System,
+            show_shortcuts: false,
+            shortcuts_filter: String::new(),
         }
     }
 }
@@ -205,6 +213,8 @@ pub struct StudioApp {
     pub keys: keys::KeysState,
     /// The browser (slice 4): listings, selection, drag, last frame's layout.
     pub browser: browser::BrowserState,
+    /// Help > Keyboard Shortcuts as last drawn (slice 5).
+    pub shortcuts_window: menus::ShortcutsLayout,
 }
 
 impl StudioApp {
@@ -251,6 +261,7 @@ impl StudioApp {
             mixer: mixer::MixerState::default(),
             keys: keys::KeysState::default(),
             browser: browser::BrowserState::default(),
+            shortcuts_window: menus::ShortcutsLayout::default(),
         }
     }
 
@@ -571,6 +582,7 @@ impl StudioApp {
         }
         menus::dialogs(self, &ctx);
         menus::recovery(self, &ctx);
+        menus::shortcuts_window(self, &ctx);
         if self.is_playing() || self.engine.transport.recording {
             ctx.request_repaint_after(std::time::Duration::from_millis(1000 / 30));
         } else if self.main_meter.level[0] > 0.0001 {
@@ -620,6 +632,7 @@ impl StudioApp {
             "plugin_scan": plugin_scan::inspect(),
             "keys": self.keys.layout,
             "browser": self.browser.layout,
+            "shortcuts": self.shortcuts_window,
             "theme": if theme::current() == egui::Theme::Light { "light" } else { "dark" },
         })
     }

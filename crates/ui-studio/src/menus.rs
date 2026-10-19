@@ -1,12 +1,11 @@
 //! The minimal menus (File, Edit, Track, Transport, Audio), keyboard shortcuts, the status bar,
 //! the save-changes question and the recovery offer.
 //!
-//! Shortcuts are our own map (plan 06, section 6), not the engine's Pro Tools strings: Ableton
-//! where Ableton and Cubase/Logic differ.
+//! Shortcuts come from one table, [`crate::shortcuts`] (Ableton where Ableton and Cubase differ).
 
+use crate::shortcuts::{Action as A, label, pressed};
 use crate::theme::{STATUS_H, TOKENS};
 use crate::{Dialog, StudioApp};
-use egui::{Key, Modifiers};
 use serde_json::{Value, json};
 use soundcraft_model::TrackId;
 
@@ -73,18 +72,18 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                     }
                 });
                 ui.menu_button("Edit", |ui| {
-                    let items: [(&str, &str, fn(&mut StudioApp)); 8] = [
-                        ("Undo", "Ctrl+Z", |a| drop(a.run("edit.undo", json!({})))),
-                        ("Redo", "Ctrl+Shift+Z", |a| drop(a.run("edit.redo", json!({})))),
-                        ("Cut", "Ctrl+X", |a| drop(a.copy_selected(true))),
-                        ("Copy", "Ctrl+C", |a| drop(a.copy_selected(false))),
-                        ("Paste at Cursor", "Ctrl+V", |a| drop(a.paste_at_cursor())),
-                        ("Duplicate", "Ctrl+D", |a| drop(a.duplicate_selected())),
-                        ("Split at Cursor", "Ctrl+E", |a| drop(a.split_at_cursor())),
-                        ("Delete", "Del", |a| drop(a.delete_selected())),
+                    let items: [(&str, A, fn(&mut StudioApp)); 8] = [
+                        ("Undo", A::Undo, |a| drop(a.run("edit.undo", json!({})))),
+                        ("Redo", A::Redo, |a| drop(a.run("edit.redo", json!({})))),
+                        ("Cut", A::Cut, |a| drop(a.copy_selected(true))),
+                        ("Copy", A::Copy, |a| drop(a.copy_selected(false))),
+                        ("Paste at Cursor", A::Paste, |a| drop(a.paste_at_cursor())),
+                        ("Duplicate", A::Duplicate, |a| drop(a.duplicate_selected())),
+                        ("Split at Cursor", A::Split, |a| drop(a.split_at_cursor())),
+                        ("Delete", A::Delete, |a| drop(a.delete_selected())),
                     ];
-                    for (label, key, f) in items {
-                        if ui.add(egui::Button::new(label).shortcut_text(key)).clicked() {
+                    for (text, action, f) in items {
+                        if ui.add(egui::Button::new(text).shortcut_text(label(action))).clicked() {
                             f(app);
                             ui.close();
                         }
@@ -121,15 +120,15 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                 let mut view_items = Vec::new();
                 let view_menu = ui.menu_button("View", |ui| {
                     let u = &mut app.ui;
-                    for (label, key, flag) in [
-                        ("Browser", "Ctrl+Alt+B", &mut u.browser.show),
-                        ("Mixer", "Ctrl+Alt+M", &mut u.show_mixer),
-                        ("Devices", "Ctrl+Alt+L", &mut u.show_devices),
-                        ("Full Mixer Window", "F3", &mut u.mixer_full),
+                    for (name, action, flag) in [
+                        ("Browser", A::ToggleBrowser, &mut u.browser.show),
+                        ("Mixer", A::ToggleMixer, &mut u.show_mixer),
+                        ("Devices", A::ToggleDevices, &mut u.show_devices),
+                        ("Full Mixer Window", A::FullMixer, &mut u.mixer_full),
                     ] {
-                        let text = if *flag { format!("✓ {label}") } else { format!("   {label}") };
-                        let b = ui.add(egui::Button::new(text).shortcut_text(key));
-                        view_items.push(crate::mixer::MenuItem::at(ui, label.into(), String::new(), b.rect));
+                        let text = if *flag { format!("✓ {name}") } else { format!("   {name}") };
+                        let b = ui.add(egui::Button::new(text).shortcut_text(label(action)));
+                        view_items.push(crate::mixer::MenuItem::at(ui, name.into(), String::new(), b.rect));
                         if b.clicked() {
                             *flag = !*flag;
                             ui.close();
@@ -156,14 +155,14 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                 app.arrange.bar_menu.extend(view_items);
                 ui.menu_button("Transport", |ui| {
                     let cycle = app.engine.session().edit.loop_playback;
-                    let items: [(&str, &str, &str, Value); 4] = [
-                        ("Play / Stop", "Space", "transport.toggle", json!({})),
-                        ("Record", "R", "transport.record", json!({})),
-                        ("Return to Zero", "Home", "transport.rtz", json!({})),
-                        (if cycle { "Cycle Off" } else { "Cycle On" }, "C", "options.loop_playback", json!({"value": !cycle})),
+                    let items: [(&str, A, &str, Value); 4] = [
+                        ("Play / Stop", A::PlayStop, "transport.toggle", json!({})),
+                        ("Record", A::Record, "transport.record", json!({})),
+                        ("Return to Zero", A::ReturnToZero, "transport.rtz", json!({})),
+                        (if cycle { "Cycle Off" } else { "Cycle On" }, A::Cycle, "options.loop_playback", json!({"value": !cycle})),
                     ];
-                    for (label, key, id, p) in items {
-                        if ui.add(egui::Button::new(label).shortcut_text(key)).clicked() {
+                    for (text, action, id, p) in items {
+                        if ui.add(egui::Button::new(text).shortcut_text(label(action))).clicked() {
                             let _ = app.run(id, p);
                             ui.close();
                         }
@@ -181,6 +180,15 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         ui.close();
                     }
                 });
+                let help = ui.menu_button("Help", |ui| {
+                    let b = ui.button("Keyboard Shortcuts");
+                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Keyboard Shortcuts".into(), String::new(), b.rect));
+                    if b.clicked() {
+                        app.ui.show_shortcuts = true;
+                        ui.close();
+                    }
+                });
+                app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Help".into(), String::new(), help.response.rect));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let s = app.engine.session();
                     let dirty = if app.engine.is_dirty() { " •" } else { "" };
@@ -207,100 +215,97 @@ pub fn status_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
     );
 }
 
-fn pressed(ctx: &egui::Context, mods: Modifiers, key: Key) -> bool {
-    ctx.input_mut(|i| i.consume_key(mods, key))
-}
-
-/// Keyboard shortcuts, unless a text field has the keyboard.
+/// Keyboard shortcuts, unless a text field has the keyboard. Keys come from [`crate::shortcuts`].
 pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
     if ctx.egui_wants_keyboard_input() || app.dialog.is_some() {
         return;
     }
-    // Alt+C: clear every clip latch (`track.clear_clip_indicators`).
-    if pressed(ctx, Modifiers::ALT, Key::C) {
+    // Alt+C before C: clear every clip latch (`track.clear_clip_indicators`).
+    if pressed(ctx, A::ClearClipIndicators) {
         let _ = app.run("track.clear_clip_indicators", json!({}));
     }
-    let cmd = Modifiers::COMMAND;
-    let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
     // egui turns the platform's copy/cut/paste keys into these events.
     let (copy, cut, paste) = ctx.input(|i| {
         let has = |f: fn(&egui::Event) -> bool| i.events.iter().any(f);
         (has(|e| matches!(e, egui::Event::Copy)), has(|e| matches!(e, egui::Event::Cut)), has(|e| matches!(e, egui::Event::Paste(_))))
     });
-    if copy || pressed(ctx, cmd, Key::C) {
+    if copy || pressed(ctx, A::Copy) {
         let _ = app.copy_selected(false);
     }
-    if cut || pressed(ctx, cmd, Key::X) {
+    if cut || pressed(ctx, A::Cut) {
         let _ = app.copy_selected(true);
     }
-    if paste || pressed(ctx, cmd, Key::V) {
+    if paste || pressed(ctx, A::Paste) {
         let _ = app.paste_at_cursor();
     }
-    if pressed(ctx, cmd_shift, Key::Z) || pressed(ctx, cmd, Key::Y) {
+    if pressed(ctx, A::Redo) {
         let _ = app.run("edit.redo", json!({}));
     }
-    if pressed(ctx, cmd, Key::Z) {
+    if pressed(ctx, A::Undo) {
         let _ = app.run("edit.undo", json!({}));
     }
-    if pressed(ctx, cmd, Key::D) {
+    if pressed(ctx, A::Duplicate) {
         let _ = app.duplicate_selected();
     }
-    if pressed(ctx, cmd, Key::E) || pressed(ctx, cmd, Key::T) {
+    if pressed(ctx, A::Split) {
         let _ = app.split_at_cursor();
     }
-    if pressed(ctx, cmd_shift, Key::S) {
+    if pressed(ctx, A::SaveAs) {
         app.save_as();
     }
-    if pressed(ctx, cmd, Key::S) {
+    if pressed(ctx, A::Save) {
         app.save();
     }
-    if pressed(ctx, cmd, Key::O) {
+    if pressed(ctx, A::Open) {
         app.open_dialog();
     }
-    if pressed(ctx, cmd, Key::N) {
+    if pressed(ctx, A::New) {
         app.run_or_ask("session.new", json!({}));
     }
-    if pressed(ctx, cmd, Key::R) || pressed(ctx, Modifiers::NONE, Key::R) || pressed(ctx, Modifiers::NONE, Key::F9) {
+    if pressed(ctx, A::Record) {
         let _ = app.run("transport.record", json!({}));
     }
-    if pressed(ctx, Modifiers::NONE, Key::Space) {
+    if pressed(ctx, A::PlayStop) {
         let _ = app.run("transport.toggle", json!({}));
     }
-    if pressed(ctx, Modifiers::NONE, Key::Home) || pressed(ctx, Modifiers::NONE, Key::Enter) {
+    if pressed(ctx, A::ReturnToZero) {
         let _ = app.run("transport.rtz", json!({}));
     }
-    if pressed(ctx, Modifiers::NONE, Key::C) {
+    if pressed(ctx, A::Cycle) {
         let on = app.engine.session().edit.loop_playback;
         let _ = app.run("options.loop_playback", json!({"value": !on}));
     }
     // Delete over a fader, knob or send level resets it (Ableton); anywhere else it deletes.
     // Backspace does the same. (A readout being edited has the keyboard, so both edit text.)
-    let del = pressed(ctx, Modifiers::NONE, Key::Delete);
-    if pressed(ctx, Modifiers::NONE, Key::Backspace) || del {
-        match app.mixer.hover {
-            Some(t) => app.reset_control(t),
-            None => drop(app.delete_selected()),
+    match app.mixer.hover {
+        Some(t) => {
+            if pressed(ctx, A::ResetControl) {
+                app.reset_control(t);
+            }
+        }
+        None => {
+            if pressed(ctx, A::Delete) {
+                let _ = app.delete_selected();
+            }
         }
     }
-    // Views (Ableton where it has a key: Ctrl+Alt+M mixer, Ctrl+Alt+L detail view; Cubase's F3
-    // MixConsole for the full mixer, which Ableton has no key for).
-    let cmd_alt = Modifiers::COMMAND | Modifiers::ALT;
-    if pressed(ctx, cmd_alt, Key::M) {
+    // Views (Ableton where it has a key; Cubase's F3 for the full mixer).
+    if pressed(ctx, A::ToggleMixer) {
         app.ui.show_mixer = !app.ui.show_mixer;
     }
-    if pressed(ctx, cmd_alt, Key::L) {
+    if pressed(ctx, A::ToggleDevices) {
         app.ui.show_devices = !app.ui.show_devices;
     }
-    if pressed(ctx, Modifiers::NONE, Key::F3) {
+    if pressed(ctx, A::FullMixer) {
         app.ui.mixer_full = !app.ui.mixer_full;
     }
-    if pressed(ctx, Modifiers::NONE, Key::Escape) {
+    if pressed(ctx, A::SelectNone) {
         let _ = app.run("edit.select_none", json!({}));
     }
-    if pressed(ctx, Modifiers::NONE, Key::Plus) || pressed(ctx, Modifiers::NONE, Key::Equals) {
+    if pressed(ctx, A::ZoomIn) {
         let _ = app.engine.execute("view.zoom_in", &json!({}));
     }
-    if pressed(ctx, Modifiers::NONE, Key::Minus) {
+    if pressed(ctx, A::ZoomOut) {
         let _ = app.engine.execute("view.zoom_out", &json!({}));
     }
 }
@@ -324,7 +329,7 @@ pub fn dialogs(app: &mut StudioApp, ctx: &egui::Context) {
             if ui.button("Don't Save").clicked() {
                 choice = Some(2);
             }
-            if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+            if ui.button("Cancel").clicked() || ui.input(|i| crate::shortcuts::hit(i, A::DialogCancel)) {
                 choice = Some(0);
             }
         });
@@ -369,10 +374,10 @@ fn delete_tracks_dialog(app: &mut StudioApp, ctx: &egui::Context, tracks: &[Trac
         ui.label(egui::RichText::new(what).strong());
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.button("Delete").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+            if ui.button("Delete").clicked() || ui.input(|i| crate::shortcuts::hit(i, A::DialogConfirm)) {
                 choice = Some(true);
             }
-            if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+            if ui.button("Cancel").clicked() || ui.input(|i| crate::shortcuts::hit(i, A::DialogCancel)) {
                 choice = Some(false);
             }
         });
@@ -422,4 +427,71 @@ pub fn recovery(app: &mut StudioApp, ctx: &egui::Context) {
     if later {
         app.leftovers.clear();
     }
+}
+
+/// Help > Keyboard Shortcuts as last drawn, for `ui.inspect` and tests.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ShortcutsLayout {
+    pub open: bool,
+    pub window: crate::arrange::R4,
+    pub filter: crate::arrange::R4,
+    /// The scopes shown, in order.
+    pub scopes: Vec<String>,
+    /// The rows shown: `Scope · Action · Keys`.
+    pub rows: Vec<String>,
+}
+
+/// Help > Keyboard Shortcuts: the shortcut table grouped by scope, with a filter (read-only).
+pub fn shortcuts_window(app: &mut StudioApp, ctx: &egui::Context) {
+    let mut layout = ShortcutsLayout { open: app.ui.show_shortcuts, ..ShortcutsLayout::default() };
+    if !app.ui.show_shortcuts {
+        app.shortcuts_window = layout;
+        return;
+    }
+    let mut open = true;
+    let r = egui::Window::new("Keyboard Shortcuts")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size([560.0, 520.0])
+        .default_pos(ctx.content_rect().center() - egui::vec2(280.0, 260.0))
+        .show(ctx, |ui| {
+            let resp = ui
+                .horizontal(|ui| {
+                    crate::icons::icon(ui, crate::icons::Icon::Filter);
+                    ui.add(egui::TextEdit::singleline(&mut app.ui.shortcuts_filter).hint_text("Filter by action or key").desired_width(f32::INFINITY))
+                })
+                .inner;
+            layout.filter = crate::arrange::r4(resp.rect);
+            ui.add_space(8.0);
+            let groups = crate::shortcuts::filtered(&app.ui.shortcuts_filter);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                if groups.is_empty() {
+                    ui.label(egui::RichText::new("No shortcut matches.").color(TOKENS.text_dim));
+                }
+                for (scope, rows) in &groups {
+                    layout.scopes.push(scope.label().into());
+                    ui.label(egui::RichText::new(scope.label()).strong().color(TOKENS.text));
+                    egui::Grid::new(("shortcut_grid", scope.label())).num_columns(3).spacing([16.0, 4.0]).show(ui, |ui| {
+                        for s in rows {
+                            let keys = crate::shortcuts::text(s);
+                            ui.label(egui::RichText::new(s.label).color(TOKENS.text));
+                            ui.label(egui::RichText::new(&keys).font(crate::theme::mono(ui.ctx(), 12.0)).color(TOKENS.accent));
+                            ui.label(egui::RichText::new(s.note).color(TOKENS.text_dim).size(11.0));
+                            ui.end_row();
+                            layout.rows.push(format!("{} · {} · {keys}", scope.label(), s.label));
+                        }
+                    });
+                    ui.add_space(8.0);
+                }
+            });
+        });
+    if let Some(r) = r {
+        layout.window = crate::arrange::r4(r.response.rect);
+    }
+    if !open {
+        app.ui.show_shortcuts = false;
+    }
+    layout.open = app.ui.show_shortcuts;
+    app.shortcuts_window = layout;
 }

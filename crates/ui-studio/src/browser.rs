@@ -20,8 +20,9 @@
 use crate::StudioApp;
 use crate::arrange::R4;
 use crate::icons::Icon;
+use crate::shortcuts::{Action as A, pressed};
 use crate::theme::TOKENS;
-use egui::{Align2, CursorIcon, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{Align2, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::{Value, json};
 use soundcraft_model::{TrackId, TrackKind};
 use soundcraft_time::Samples;
@@ -944,20 +945,20 @@ pub fn bbs(app: &StudioApp, at: Samples) -> String {
 /// Ctrl+Alt+B shows and hides the browser; Escape closes the Add Folder field it is typing in.
 pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
     // egui drops the field's focus on Escape before the frame runs, so this goes first.
-    if app.browser.adding.is_some() && app.browser.add_focused && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+    if app.browser.adding.is_some() && app.browser.add_focused && pressed(ctx, A::BrowserCancel) {
         app.browser.adding = None;
         app.browser.add_focused = false;
         return;
     }
     // Escape during a drag cancels it: no drop, no message (and no other Escape action).
-    if app.browser.drag.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+    if app.browser.drag.is_some() && pressed(ctx, A::BrowserCancel) {
         app.browser.drag = None;
         return;
     }
     if ctx.egui_wants_keyboard_input() || app.dialog.is_some() {
         return;
     }
-    if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::ALT, Key::B)) {
+    if pressed(ctx, A::ToggleBrowser) {
         app.toggle_browser();
     }
 }
@@ -1155,7 +1156,7 @@ fn locations_bar(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, area: Rect
         let id = ui.id().with("browser_add_field");
         let mut text = app.browser.adding.take().unwrap_or_default();
         let fresp = ui.put(field, egui::TextEdit::singleline(&mut text).id(id).hint_text("Folder path, e.g. D:\\").desired_width(field.width()));
-        let enter = fresp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        let enter = fresp.lost_focus() && ui.input(|i| crate::shortcuts::hit(i, A::BrowserAddFolder));
         let oresp = ui.interact(ok, ui.id().with("browser_add_ok"), Sense::click());
         p.rect_filled(ok, 3.0, if oresp.hovered() { TOKENS.button_hover } else { TOKENS.button });
         p.text(ok.center(), Align2::CENTER_CENTER, "Add", FontId::proportional(11.5), TOKENS.text);
