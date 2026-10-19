@@ -727,3 +727,143 @@ fn the_star_keeps_favorites_in_ui_state_and_the_filter_narrows_the_list() {
     assert_eq!((t.undo_len(), t.app.engine.is_dirty()), (u0, dirty), "view state only");
     assert_eq!(serde_json::to_value(&t.app.ui).unwrap()["browser"]["favorites"], json!([]));
 }
+
+#[test]
+fn a_pending_listing_dies_with_its_location_and_never_spins_the_frame_loop() {
+    let mut t = T::new();
+    t.add_and_expand();
+    let root = t.dir.s();
+    // A listing that never answers (a dead network share).
+    let dead = t.dir.0.join("Dead");
+    t.app.browser.listings.insert(dead.clone(), crate::browser::Listing::Pending { since: std::time::Instant::now() });
+    t.app.browser.expanded.insert(dead);
+    t.frames(3);
+    let l = &t.app.browser.layout;
+    assert_eq!(l.pending, 1);
+    assert!(!l.per_frame_repaint, "polls, does not repaint every frame");
+    assert_eq!(l.repaint_after_ms, Some(100));
+    // Hide the panel: still no per-frame repaint.
+    t.app.ui.browser.show = false;
+    t.frames(3);
+    assert!(!t.app.browser.layout.per_frame_repaint);
+    t.app.ui.browser.show = true;
+    t.frames(3);
+    let c = mid(t.row(&root).rect.unwrap());
+    t.input("ui.move", json!({"x": c.0, "y": c.1}));
+    t.click(mid(t.row(&root).remove.unwrap()));
+    assert_eq!(t.app.browser.layout.pending, 0);
+    assert_eq!(t.app.browser.layout.repaint_after_ms, None);
+    assert!(t.app.browser.listings.is_empty() && t.app.browser.expanded.is_empty());
+}
+
+#[test]
+fn collapse_and_remove_forget_the_subtree_so_nothing_stale_shows_again() {
+    let mut t = T::new();
+    t.add_and_expand();
+    let root = t.dir.s();
+    t.click(mid(t.row(&t.path("Kicks")).rect.unwrap()));
+    t.settle();
+    assert!(t.names().contains(&"Kick 02.wav".to_string()));
+    // Collapse the location: the nested Kicks listing and expansion go with it.
+    t.click(mid(t.row(&root).rect.unwrap()));
+    assert!(t.app.browser.listings.is_empty(), "{:?}", t.app.browser.listings.keys());
+    assert!(t.app.browser.expanded.is_empty());
+    // A file added meanwhile shows on the next expand (no stale listing).
+    t.dir.file("Kicks/Kick 03.wav", &wav(1, t.rate, 100));
+    t.click(mid(t.row(&root).rect.unwrap()));
+    t.settle();
+    t.click(mid(t.row(&t.path("Kicks")).rect.unwrap()));
+    t.settle();
+    assert!(t.names().contains(&"Kick 03.wav".to_string()), "{:?}", t.names());
+    // Remove the location and add it back: a fresh read, not the old listing.
+    let c = mid(t.row(&root).rect.unwrap());
+    t.input("ui.move", json!({"x": c.0, "y": c.1}));
+    t.click(mid(t.row(&root).remove.unwrap()));
+    assert!(t.app.browser.listings.is_empty() && t.app.browser.expanded.is_empty());
+    assert!(t.app.add_location(&root));
+    t.frames(3);
+    assert_eq!(t.app.browser.layout.rows.len(), 1, "collapsed, with nothing cached");
+}
+
+#[test]
+fn a_drop_on_no_target_says_where_drops_go_and_escape_cancels_a_drag() {
+    let mut t = T::new();
+    t.add_and_expand();
+    let u0 = t.undo_len();
+    let from = mid(t.row_named("loop 90.wav").rect.unwrap());
+    // Released over the transport: no target.
+    t.drag(from, (700.0, 8.0), json!({}));
+    assert_eq!(t.app.status, "Drop onto a track lane, header, strip or the device chain");
+    assert_eq!(t.undo_len(), u0);
+    // Escape mid-drag: no action, no message.
+    t.app.status.clear();
+    let l = t.lane(t.track(TrackKind::Audio));
+    let over = mid(l);
+    let mut ev = |e| t.app.synthetic.push(e);
+    ev(egui::Event::PointerMoved(egui::pos2(from.0, from.1)));
+    ev(egui::Event::PointerButton {
+        pos: egui::pos2(from.0, from.1),
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Default::default(),
+    });
+    for k in 1..=10 {
+        let f = k as f32 / 10.0;
+        ev(egui::Event::PointerMoved(egui::pos2(from.0 + (over.0 - from.0) * f, from.1 + (over.1 - from.1) * f)));
+    }
+    t.frames(5);
+    assert!(t.app.browser.drag.is_some() && t.app.browser.layout.drop.is_some());
+    t.key("escape", json!({}));
+    assert!(t.app.browser.drag.is_none());
+    let up = egui::pos2(over.0, over.1);
+    t.app.synthetic.push(egui::Event::PointerButton { pos: up, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    t.frames(5);
+    assert_eq!(t.undo_len(), u0, "nothing imported");
+    assert!(t.app.status.is_empty(), "{}", t.app.status);
+}
+
+/// A WAV with `pad` bytes of LIST chunk before `fmt `.
+fn wav_with_list(pad: usize) -> Vec<u8> {
+    let plain = wav(2, 48_000, 24_000);
+    let mut b = plain[..12].to_vec();
+    b.extend_from_slice(b"LIST");
+    b.extend_from_slice(&(pad as u32).to_le_bytes());
+    b.extend(std::iter::repeat_n(7u8, pad));
+    b.extend_from_slice(&plain[12..]);
+    b
+}
+
+#[test]
+fn a_wav_with_a_200_kb_chunk_before_fmt_still_shows_its_length() {
+    let mut t = T::new();
+    t.dir.file("Big Header.wav", &wav_with_list(200 * 1024));
+    t.dir.file("Huge Header.wav", &wav_with_list(5 * 1024 * 1024));
+    t.dir.file("Cut.wav", &wav_with_list(200 * 1024)[..1000]);
+    t.add_and_expand();
+    assert_eq!(t.row_named("Big Header.wav").info.as_deref(), Some("0.5 s · stereo"));
+    assert_eq!(t.row_named("Huge Header.wav").info.as_deref(), Some("–"), "beyond the 4 MB walk bound");
+    assert_eq!(t.row_named("Cut.wav").info.as_deref(), Some("–"), "truncated files are safe");
+    assert_eq!(t.row_named("loop 90.wav").info.as_deref(), Some("2.0 s · stereo"));
+}
+
+#[test]
+fn a_long_name_is_elided_with_the_extension_kept() {
+    let mut t = T::new();
+    t.dir.file("Kick Automation Take Seven Final Mix.wav", &wav(1, t.rate, 100));
+    t.add_and_expand();
+    let long = t.row_named("Kick Automation Take Seven Final Mix.wav");
+    assert!(long.shown.contains('…') && long.shown.ends_with(".wav") && long.shown.len() < long.name.len(), "{}", long.shown);
+    assert!(long.shown.starts_with("Kick"), "{}", long.shown);
+    let short = t.row_named("loop 90.wav");
+    assert_eq!(short.shown, "loop 90.wav");
+}
+
+#[test]
+fn importing_announces_itself_before_the_synchronous_import() {
+    let mut t = T::new();
+    t.add_and_expand();
+    let track = t.track(TrackKind::Audio);
+    t.app.import_files(&[t.dir.0.join("loop 90.wav")], Some(track), 0).unwrap();
+    assert_eq!(t.app.browser.import_notice, "Importing loop 90.wav…");
+    assert!(t.app.status.starts_with("Imported loop 90.wav"), "{}", t.app.status);
+}

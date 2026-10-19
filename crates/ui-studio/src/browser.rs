@@ -184,6 +184,8 @@ pub struct Drag {
 pub struct RowLayout {
     pub path: String,
     pub name: String,
+    /// The name as drawn: elided with "…" (extension kept) when the row is too narrow.
+    pub shown: String,
     pub kind: Option<Kind>,
     pub depth: usize,
     pub root: bool,
@@ -248,6 +250,10 @@ pub struct BrowserLayout {
     /// The browser's own work per frame, and the gap between frames, at most, while a listing ran.
     pub max_panel_ms_while_listing: f32,
     pub max_frame_gap_ms_while_listing: f32,
+    /// The panel asked for a repaint every frame (only while a drag is held).
+    pub per_frame_repaint: bool,
+    /// The panel asked for a repaint in 100 ms (a listing is still pending).
+    pub repaint_after_ms: Option<u64>,
     pub dragging: Option<String>,
     pub drop: Option<R4>,
     pub drop_target: Option<Target>,
@@ -301,6 +307,9 @@ pub struct BrowserState {
     max_gap_ms: f32,
     gap_armed: bool,
     serial: u64,
+    ctx: Option<egui::Context>,
+    /// The last "Importing …" notice, set just before the synchronous import call.
+    pub import_notice: String,
 }
 
 impl Default for BrowserState {
@@ -332,6 +341,8 @@ impl Default for BrowserState {
             max_gap_ms: 0.0,
             gap_armed: false,
             serial: 0,
+            ctx: None,
+            import_notice: String::new(),
         }
     }
 }
@@ -411,6 +422,19 @@ impl BrowserState {
         }
     }
 
+    /// Forget the listings (a pending one included: its late result is discarded), expansion and
+    /// selection under `dir`. With `include_dir` the folder's own entries go too. The header
+    /// cache stays: it is keyed by file path and never goes stale the way a listing does.
+    fn forget_subtree(&mut self, dir: &Path, include_dir: bool) {
+        let under = |p: &Path| p.starts_with(dir) && (include_dir || p != dir);
+        self.listings.retain(|p, _| !under(p));
+        self.expanded.retain(|p| !under(p));
+        self.selected.retain(|p| !under(p));
+        if self.anchor.as_ref().is_some_and(|a| under(a)) {
+            self.anchor = None;
+        }
+    }
+
     fn pending(&self) -> usize {
         self.listings.values().filter(|l| matches!(l, Listing::Pending { .. })).count()
     }
@@ -457,12 +481,61 @@ fn hidden(_: &std::fs::DirEntry) -> bool {
     false
 }
 
-/// The first [`HEADER_BYTES`] of a file, parsed.
+/// The most RIFF chunk headers walked, and the furthest file offset looked at, for one WAV.
+const MAX_CHUNKS: usize = 32;
+const MAX_WALK_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A file's header, parsed. A WAV is walked chunk by chunk (headers read, bodies skipped by
+/// seeking, bounded in count and offset) so a large bext, iXML or artwork chunk before `fmt `
+/// does not hide the format; anything else is parsed from its first [`HEADER_BYTES`].
 fn read_info(p: &Path) -> Option<FileInfo> {
-    let f = std::fs::File::open(p).ok()?;
-    let mut b = Vec::with_capacity(HEADER_BYTES as usize);
-    f.take(HEADER_BYTES).read_to_end(&mut b).ok()?;
+    let mut f = std::fs::File::open(p).ok()?;
+    let mut head = [0u8; 12];
+    f.read_exact(&mut head).ok()?;
+    if matches!(&head[..4], b"RIFF" | b"RF64") && &head[8..12] == b"WAVE" {
+        return read_wav_info(&mut f, head);
+    }
+    let mut b = head.to_vec();
+    f.take(HEADER_BYTES - 12).read_to_end(&mut b).ok()?;
     parse_header(&b)
+}
+
+/// Collect `fmt `, `ds64` and the `data` header of a WAV into a small synthetic header and parse
+/// that, so the format rules live in [`parse_header`] only.
+fn read_wav_info<F: Read + std::io::Seek>(f: &mut F, head: [u8; 12]) -> Option<FileInfo> {
+    let mut b = head.to_vec();
+    let mut off = 12u64;
+    for _ in 0..MAX_CHUNKS {
+        if off > MAX_WALK_BYTES {
+            return None;
+        }
+        let mut h = [0u8; 8];
+        f.read_exact(&mut h).ok()?;
+        let size = u64::from(u32::from_le_bytes([h[4], h[5], h[6], h[7]]));
+        let keep = match &h[..4] {
+            b"fmt " | b"ds64" => size.min(64) as usize,
+            b"data" => {
+                b.extend_from_slice(&h);
+                return parse_header(&b);
+            }
+            _ => 0,
+        };
+        if keep > 0 {
+            b.extend_from_slice(&h[..4]);
+            b.extend_from_slice(&(keep as u32).to_le_bytes());
+            let at = b.len();
+            b.resize(at + keep, 0);
+            f.read_exact(&mut b[at..]).ok()?;
+        }
+        let next = off.checked_add(8)?.checked_add(size)?.checked_add(size & 1)?;
+        f.seek(std::io::SeekFrom::Start(next)).ok()?;
+        // The synthetic chunk is `keep` bytes long (padded to even), whatever the real one was.
+        if keep & 1 == 1 {
+            b.push(0);
+        }
+        off = next;
+    }
+    None
 }
 
 fn u16le(b: &[u8], at: usize) -> Option<u16> {
@@ -559,6 +632,27 @@ fn rect(r: R4) -> Rect {
     Rect::from_min_max(pos2(r[0], r[1]), pos2(r[2], r[3]))
 }
 
+/// `name` fitted to `width`: when too wide, the stem is cut and "…" put before the extension
+/// ("Kick Automa….wav"), so the file type stays visible.
+fn elide(p: &egui::Painter, name: &str, font: &FontId, width: f32) -> String {
+    let w = |s: &str| p.layout_no_wrap(s.to_string(), font.clone(), TOKENS.text).size().x;
+    if w(name) <= width {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    };
+    let chars: Vec<char> = stem.chars().collect();
+    for n in (0..chars.len()).rev() {
+        let cand = format!("{}…{ext}", chars[..n].iter().collect::<String>().trim_end());
+        if w(&cand) <= width {
+            return cand;
+        }
+    }
+    format!("…{ext}")
+}
+
 fn file_name(p: &Path) -> String {
     p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned())
 }
@@ -604,7 +698,7 @@ impl StudioApp {
         if i < self.ui.browser.locations.len() {
             let loc = self.ui.browser.locations.remove(i);
             let p = PathBuf::from(&loc);
-            self.browser.expanded.retain(|e| !e.starts_with(&p));
+            self.browser.forget_subtree(&p, true);
             self.status = format!("Removed {loc} from Locations");
         }
     }
@@ -612,8 +706,8 @@ impl StudioApp {
     /// Expand or collapse a folder. Expanding reads it on a background thread; collapsing
     /// forgets its entries, so the next expand reads it fresh.
     pub fn toggle_folder(&mut self, dir: &Path, ctx: &egui::Context) {
-        if self.browser.expanded.remove(dir) {
-            self.browser.listings.remove(dir);
+        if self.browser.expanded.contains(dir) {
+            self.browser.forget_subtree(dir, true);
         } else {
             self.browser.expanded.insert(dir.to_path_buf());
             self.browser.request_listing(dir, ctx);
@@ -638,6 +732,13 @@ impl StudioApp {
             }
         }
         let before = self.engine.session_arc();
+        // The import below runs on this thread (engine path); say so and ask for a frame first.
+        let what = if ok.len() == 1 { file_name(ok[0]) } else { format!("{} files", ok.len()) };
+        self.status = format!("Importing {what}…");
+        self.browser.import_notice = self.status.clone();
+        if let Some(ctx) = &self.browser.ctx {
+            ctx.request_repaint();
+        }
         self.browser.serial += 1;
         let key = format!("browser:import:{}", self.browser.serial);
         self.engine.end_merge();
@@ -665,7 +766,6 @@ impl StudioApp {
         }
         self.engine.end_merge();
         let name = target.and_then(|t| self.engine.session().track(t)).map_or_else(String::new, |t| t.name.clone());
-        let what = if ok.len() == 1 { file_name(ok[0]) } else { format!("{} files", ok.len()) };
         let mut msg = format!("Imported {what} to {name} at {}", bbs(self, at.max(0)));
         if !closed.is_empty() {
             msg.push_str(&format!(" ({} Maschine/Kontakt file{} skipped: not supported)", closed.len(), if closed.len() == 1 { "" } else { "s" }));
@@ -846,6 +946,11 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
         app.browser.add_focused = false;
         return;
     }
+    // Escape during a drag cancels it: no drop, no message (and no other Escape action).
+    if app.browser.drag.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        app.browser.drag = None;
+        return;
+    }
     if ctx.egui_wants_keyboard_input() || app.dialog.is_some() {
         return;
     }
@@ -869,7 +974,8 @@ pub fn panel(app: &mut StudioApp, ui: &mut Ui) {
             app.browser.max_gap_ms = app.browser.max_gap_ms.max(gap);
         }
         app.browser.gap_armed = true;
-        ctx.request_repaint();
+        // Poll, don't spin: the lister wakes the UI itself when it answers.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     } else {
         app.browser.gap_armed = false;
     }
@@ -882,6 +988,9 @@ pub fn panel(app: &mut StudioApp, ui: &mut Ui) {
         app.browser.layout.plugins.clear();
     }
     let b = &mut app.browser;
+    b.ctx = Some(ctx.clone());
+    b.layout.per_frame_repaint = b.drag.is_some();
+    b.layout.repaint_after_ms = listing.then_some(100);
     let mut listings = BTreeMap::new();
     for (p, l) in &b.listings {
         let info = match l {
@@ -951,6 +1060,8 @@ fn drive_drag(app: &mut StudioApp, ctx: &egui::Context) {
     app.browser.drag = None;
     if let Some((t, _)) = target {
         app.drop_payload(drag.payload, t);
+    } else {
+        app.status = "Drop onto a track lane, header, strip or the device chain".to_string();
     }
 }
 
@@ -1168,6 +1279,7 @@ fn tree(app: &mut StudioApp, ui: &mut Ui, area: Rect, layout: &mut BrowserLayout
         let mut out = RowLayout {
             path: row.path.to_string_lossy().into_owned(),
             name: row.name.clone(),
+            shown: row.name.clone(),
             kind: Some(row.kind),
             depth: row.depth,
             root: row.root.is_some(),
@@ -1218,7 +1330,10 @@ fn tree(app: &mut StudioApp, ui: &mut Ui, area: Rect, layout: &mut BrowserLayout
         let right_w = if right.is_empty() { 0.0 } else { (right.chars().count() as f32 * 5.6).min(r.width() * 0.55) };
         let name_r = Rect::from_min_max(pos2(x + 14.0, r.min.y), pos2(r.max.x - 10.0 - right_w, r.max.y));
         let size = if row.root.is_some() { 12.5 } else { 12.0 };
-        p.with_clip_rect(name_r.intersect(area)).text(name_r.left_center(), Align2::LEFT_CENTER, &row.name, FontId::proportional(size), ink);
+        let font = FontId::proportional(size);
+        let shown = elide(&p, &row.name, &font, name_r.width());
+        p.with_clip_rect(name_r.intersect(area)).text(name_r.left_center(), Align2::LEFT_CENTER, &shown, font, ink);
+        out.shown = shown;
         if !right.is_empty() {
             p.with_clip_rect(r.intersect(area)).text(
                 pos2(r.max.x - 8.0, r.center().y),
