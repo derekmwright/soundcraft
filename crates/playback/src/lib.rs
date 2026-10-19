@@ -25,6 +25,7 @@
 
 pub mod devices;
 pub mod record;
+pub mod telemetry;
 
 pub use devices::AudioConfig;
 
@@ -108,6 +109,7 @@ pub enum OutputTrouble {
 /// How the audio output is doing, for the UI.
 #[derive(Default)]
 struct Fault {
+    telemetry: telemetry::Counters,
     /// A block panicked: output stays silent from then on.
     failed: AtomicBool,
     gone: AtomicBool,
@@ -199,6 +201,7 @@ fn render_held(holder: &Mutex<Option<AudioState>>, fault: &Fault, shared: &Share
         // the state is still whole enough to render or go silent.
         Err(TryLockError::Poisoned(p)) => p.into_inner(),
         Err(TryLockError::WouldBlock) => {
+            fault.telemetry.contention_silence_frames.fetch_add((out.len() / channels.max(1)) as u64, Ordering::Relaxed);
             out.fill(0.0);
             return true;
         }
@@ -210,9 +213,13 @@ fn render_held(holder: &Mutex<Option<AudioState>>, fault: &Fault, shared: &Share
                 st.discard_after_fault();
             }
             guarded_block(fault, shared, out, |o| st.fill(o, channels));
+            if fault.failed.load(Ordering::Relaxed) {
+                fault.telemetry.fault_silence_frames.fetch_add((out.len() / channels.max(1)) as u64, Ordering::Relaxed);
+            }
             true
         }
         None => {
+            fault.telemetry.unavailable_silence_frames.fetch_add((out.len() / channels.max(1)) as u64, Ordering::Relaxed);
             out.fill(0.0);
             false
         }
@@ -1074,6 +1081,13 @@ impl Player {
         self.shared.meters.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
+    /// Lifetime callback durations, deadline overruns, backend errors and render-silence reasons.
+    /// Nonblocking and allocation-free; independent fields may straddle a callback. A newly
+    /// opened Player starts from zero. See [`telemetry::CallbackTelemetry`] for measurement limits.
+    pub fn callback_telemetry(&self) -> telemetry::CallbackTelemetry {
+        self.fault.telemetry.snapshot()
+    }
+
     /// Copy meters into reusable UI storage. Once track/channel counts are stable this performs
     /// no allocation, unlike cloning a new snapshot every video frame.
     pub fn copy_meters(&self, out: &mut MeterSnapshot) {
@@ -1165,8 +1179,37 @@ fn fold_gains(s: &Session) -> [(f32, f32); MAX_CHANNELS] {
     g
 }
 
-/// The output stream: the mix renders f32 into a scratch buffer allocated here (so the callback
-/// never allocates), converted to the device's sample type.
+/// Callback-local storage, prepared before starting the stream. Keeping the entry point here
+/// lets tests exercise the same chunking, conversion and diagnostics as the real device.
+struct OutputCallback {
+    scratch: Vec<f32>,
+    channels: usize,
+    rate: u32,
+    timing: telemetry::Accumulator,
+}
+
+impl OutputCallback {
+    fn new(channels: usize, rate: u32) -> Self {
+        // Initialise the platform clock (including any frequency cache) before callbacks run.
+        let _ = telemetry::Timer::start().elapsed();
+        Self { scratch: vec![0.0; 8192 * channels.max(1)], channels: channels.max(1), rate, timing: telemetry::Accumulator::default() }
+    }
+
+    fn fill<T: cpal::SizedSample + cpal::FromSample<f32>>(&mut self, data: &mut [T], state: &Holder, fault: &Fault, shared: &Shared) {
+        let started = telemetry::Timer::start();
+        mark_audio_thread();
+        for out in data.chunks_mut(self.scratch.len()) {
+            let Some(s) = self.scratch.get_mut(..out.len()) else { break };
+            render_held(state, fault, shared, s, self.channels);
+            for (o, x) in out.iter_mut().zip(s.iter()) {
+                *o = T::from_sample(*x);
+            }
+        }
+        self.timing.record(&fault.telemetry, data.len() / self.channels, self.rate, started.elapsed());
+    }
+}
+
+/// The output stream: render through preallocated scratch and convert to the device format.
 fn build_output<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -1179,26 +1222,18 @@ where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
     use cpal::traits::DeviceTrait;
-    let frame = channels.max(1);
-    let mut scratch = vec![0.0f32; 8192 * frame];
-    let chunk = scratch.len();
+    let mut output = OutputCallback::new(channels, config.sample_rate.0);
     let (failed, guard, gone, held) = (Arc::clone(fault), Arc::clone(shared), Arc::clone(fault), Arc::clone(state));
     device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            mark_audio_thread();
-            for out in data.chunks_mut(chunk) {
-                let Some(s) = scratch.get_mut(..out.len()) else { return };
-                render_held(&held, &failed, &guard, s, channels);
-                for (o, x) in out.iter_mut().zip(s.iter()) {
-                    *o = T::from_sample(*x);
-                }
-            }
+            output.fill(data, &held, &failed, &guard);
         },
         // cpal may call this on the audio thread (on ALSA in a loop while the device stays
         // broken): marked, so the logger hands the record off instead of writing it.
         move |e: cpal::StreamError| {
             mark_audio_thread();
+            gone.telemetry.error(matches!(e, cpal::StreamError::DeviceNotAvailable));
             if matches!(e, cpal::StreamError::DeviceNotAvailable) {
                 gone.gone.store(true, Ordering::Relaxed);
             }
@@ -1305,6 +1340,43 @@ mod tests {
         assert!(!shared.playing.load(Ordering::Relaxed));
         assert_eq!((fault.trouble(false), fault.trouble(false)), (Some(OutputTrouble::Bug), None));
         assert_eq!(fault.beats.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn callback_telemetry_counts_device_blocks_and_silence_reasons() {
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
+        });
+        let holder: Holder =
+            Arc::new(Mutex::new(Some(AudioState::new(channel().1, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, channel().0))));
+        let fault = Fault::default();
+        let mut callback = OutputCallback::new(2, 48_000);
+        let mut data = vec![1i16; 2 * (8192 + 64)];
+        // Two scratch chunks are still exactly one device callback, with conversion included.
+        let locked = holder.lock().unwrap();
+        callback.fill(&mut data, &holder, &fault, &shared);
+        drop(locked);
+        assert!(data.iter().all(|&x| x == 0));
+        let s = fault.telemetry.snapshot();
+        assert_eq!((s.callbacks, s.frames, s.contention_silence_frames), (1, 8256, 8256));
+        assert_eq!((s.unavailable_silence_frames, s.fault_silence_frames), (0, 0));
+        fault.failed.store(true, Ordering::Relaxed);
+        callback.fill(&mut data[..128], &holder, &fault, &shared);
+        holder.lock().unwrap().take();
+        callback.fill(&mut data[..128], &holder, &fault, &shared);
+        let s = fault.telemetry.snapshot();
+        assert_eq!((s.callbacks, s.frames), (3, 8384));
+        assert_eq!((s.contention_silence_frames, s.fault_silence_frames, s.unavailable_silence_frames), (8256, 64, 64));
+        assert_eq!(s.backend_errors, 0);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            assert_eq!(s.timed_callbacks, 3);
+            assert_eq!(s.duration_histogram.iter().sum::<u64>(), 3);
+        }
     }
 
     #[test]
