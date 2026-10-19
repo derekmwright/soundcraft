@@ -1,0 +1,40 @@
+[package]
+name = "soundcraft-rt"
+description = "SoundCraft realtime OS support: promotes audio worker threads (MMCSS, SCHED_FIFO, Mach time constraint) behind a safe API (ADR 0013: the only home for new unsafe)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[features]
+# Use the portable fallback on every platform (tests and builds that must never touch thread
+# scheduling). `promote_audio_thread` then always returns `Promotion::Unsupported`.
+force-fallback = []
+
+[dependencies]
+log.workspace = true
+
+# Both already in the dependency tree (cpal, clap-host, vst3-host): no new dependency family.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
+# ADR 0013: this crate is where new `unsafe` lives. It opts out of the workspace
+# `unsafe_code = "forbid"` for itself only; every block carries a `// SAFETY:` comment and every
+# `unsafe fn` a `# Safety` section. The rest mirrors `[workspace.lints]`, plus clippy pedantic.
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
