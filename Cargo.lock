@@ -3743,6 +3743,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-rt"
+version = "0.8.0"
+dependencies = [
+ "libc",
+ "log",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "soundcraft-time"
 version = "0.8.0"
 dependencies = [
