@@ -40,7 +40,7 @@ jobs:
       - name: Linux system libraries
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: clippy (rt)
         run: cargo clippy -p soundcraft-rt --all-targets -- -D warnings
       - name: clippy (rt, force-fallback)
