@@ -18,7 +18,10 @@ pub fn specs() -> Vec<CommandSpec> {
             // Unit tests never scan the machine's plug-in folders: that loads every installed
             // plug-in in-process, and some never unload, which hangs the test binary at exit.
             #[cfg(test)]
-            return Ok(json!([]));
+            {
+                let _ = p;
+                Ok(json!([]))
+            }
             #[cfg(not(test))]
             {
             let list = if p.get("rescan").and_then(Value::as_bool).unwrap_or(false) {
