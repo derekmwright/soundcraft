@@ -49,6 +49,13 @@ pub struct TrackRow {
     pub arm: R4,
     pub monitor: R4,
     pub volume: R4,
+    /// The group this track sits in (slice 2c), its depth, and for a group: collapsed or not,
+    /// its disclosure triangle, and how many member clips its collapsed lane summarizes.
+    pub folder: Option<u64>,
+    pub depth: usize,
+    pub collapsed: bool,
+    pub disclosure: R4,
+    pub summary_bars: usize,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -74,6 +81,8 @@ pub struct Layout {
     pub add_instrument: R4,
     /// Transport bar buttons (`play`, `stop`, `record`, `rtz`, `cycle`).
     pub transport: std::collections::BTreeMap<String, R4>,
+    /// Where a dragged track header would land: a line between rows or a group header's outline.
+    pub drop: Option<R4>,
 }
 
 #[derive(Debug, Default)]
@@ -84,6 +93,16 @@ pub struct ArrangeState {
     pub layout: Layout,
     /// The track menu's open "Instrument" submenu entries (`value` is the plug-in id).
     pub menu: Vec<crate::mixer::MenuItem>,
+    /// A track header being dragged (slice 2c).
+    pub header_drag: Option<crate::groups::HeaderDrag>,
+    /// The track rows in display order (Shift-click ranges over them).
+    pub order: Vec<TrackId>,
+    /// The track a plain or Ctrl click on a header last picked (Shift-click ranges from it).
+    pub anchor: Option<TrackId>,
+    /// Composite gestures started, to give each its own merge key.
+    pub serial: u64,
+    /// The menu bar's Track menu and its group entries as last drawn (slice 2c).
+    pub bar_menu: Vec<crate::mixer::MenuItem>,
 }
 
 /// Timeline mapping: x ↔ samples, from the session's shared zoom (`edit.zoom`).
@@ -103,8 +122,9 @@ impl Map {
     }
 }
 
-fn shown(s: &Session, t: &Track) -> bool {
-    !t.hidden && t.folder.and_then(|f| s.track(f)).is_none_or(|f| f.folder_open)
+/// A row in the track list: not hidden, and not in a collapsed group (view state, slice 2c).
+fn shown(app: &StudioApp, s: &Session, t: &Track) -> bool {
+    !t.hidden && !app.tucked(s, t)
 }
 
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
@@ -126,7 +146,8 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     p.rect_filled(list, 0.0, TOKENS.panel);
 
     // Rows.
-    let rows: Vec<&Track> = s.tracks.iter().filter(|t| shown(&s, t)).collect();
+    let rows: Vec<&Track> = s.tracks.iter().filter(|t| shown(app, &s, t)).collect();
+    app.arrange.order = rows.iter().map(|t| t.id).collect();
     let content_h = rows.len() as f32 * rh + 60.0;
     app.arrange.vscroll = app.arrange.vscroll.clamp(0.0, (content_h - tl.height()).max(0.0));
     let mut layout = Layout {
@@ -145,7 +166,17 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
         let y0 = tl.min.y + i as f32 * rh - app.arrange.vscroll;
         let header = Rect::from_min_max(pos2(list.min.x, y0), pos2(list.max.x, y0 + rh));
         let lane = Rect::from_min_max(pos2(tl.min.x, y0), pos2(tl.max.x, y0 + rh));
-        let mut row = TrackRow { id: t.id.0, name: t.name.clone(), kind: t.kind, header: r4(header), lane: r4(lane), ..TrackRow::default() };
+        let mut row = TrackRow {
+            id: t.id.0,
+            name: t.name.clone(),
+            kind: t.kind,
+            header: r4(header),
+            lane: r4(lane),
+            folder: crate::groups::parent_of(&s, t).map(|f| f.0),
+            depth: crate::groups::depth(&s, t),
+            collapsed: t.is_folder() && app.collapsed(t.id),
+            ..TrackRow::default()
+        };
         if header.max.y >= list.min.y && header.min.y <= list.max.y {
             let selected = selected_tracks.contains(&t.id) || focus == Some(t.id);
             track_header(app, ui, t, header, list, selected, &mut row);
@@ -175,6 +206,8 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
 
     grid_and_ruler(app, ui, &s, map, ruler, tl);
     clips(app, ui, &s, map, tl, &rows, rh, &mut layout);
+    group_summaries(app, ui, &s, map, tl, &mut layout);
+    header_drag(app, ui, &s, &mut layout);
     crate::keys::lane_hints(app, ui, tl, &layout.tracks);
     timeline_input(app, ui, &s, map, tl, &rows, rh, &layout);
     ruler_input(app, ui, map, ruler);
@@ -189,17 +222,25 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     let p = ui.painter().with_clip_rect(list);
     let bg = if selected { TOKENS.header_selected } else { TOKENS.header };
     p.rect_filled(r.shrink2(vec2(0.0, 0.5)), 0.0, bg);
-    p.rect_filled(Rect::from_min_size(r.min, vec2(5.0, r.height())), 0.0, theme::rgb(t.color));
+    // Group members sit indented under their group (slice 2c); a group has a disclosure triangle.
+    let indent = row.depth as f32 * crate::groups::INDENT;
+    let tri = if t.is_folder() { 14.0 } else { 0.0 };
+    let tx = r.min.x + indent + tri;
+    p.rect_filled(Rect::from_min_size(pos2(r.min.x + indent, r.min.y), vec2(5.0, r.height())), 0.0, theme::rgb(t.color));
     p.line_segment([pos2(r.min.x, r.max.y), pos2(r.max.x, r.max.y)], Stroke::new(1.0, TOKENS.line));
-    let name_rect = Rect::from_min_max(pos2(r.min.x + 12.0, r.min.y + 4.0), pos2(r.max.x - 92.0, r.min.y + 20.0));
+    let name_rect = Rect::from_min_max(pos2(tx + 12.0, r.min.y + 4.0), pos2(r.max.x - 92.0, r.min.y + 20.0));
     p.with_clip_rect(name_rect.intersect(list)).text(name_rect.left_center(), Align2::LEFT_CENTER, &t.name, FontId::proportional(13.0), TOKENS.text);
     let kind = match t.kind {
         TrackKind::Instrument => t.instrument.as_ref().map_or("Instrument".to_string(), |i| short_plugin(&app.plugin_name(&i.plugin, true))),
         TrackKind::Audio => format!("Audio · {}", t.format.label()),
+        TrackKind::Folder => {
+            let n = app.engine.session().tracks.iter().filter(|x| x.folder == Some(t.id) && x.id != t.id).count();
+            format!("Group · {n} track{}", if n == 1 { "" } else { "s" })
+        }
         k => format!("{k:?}"),
     };
     row.subtitle = kind.clone();
-    p.text(pos2(r.min.x + 12.0, r.min.y + 30.0), Align2::LEFT_CENTER, kind, FontId::proportional(10.5), TOKENS.text_dim);
+    p.text(pos2(tx + 12.0, r.min.y + 30.0), Align2::LEFT_CENTER, kind, FontId::proportional(10.5), TOKENS.text_dim);
     // Toggles, right-aligned on the first line.
     let m = &t.mixer;
     let mut x = r.max.x - 6.0;
@@ -269,17 +310,92 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
         let bar = Rect::from_min_max(pos2(r.max.x - 3.0, r.max.y - 2.0 - h), pos2(r.max.x - 1.0, r.max.y - 2.0));
         p.rect_filled(bar, 0.0, if d.clip { TOKENS.record } else { TOKENS.monitor });
     }
-    // Name area: click selects the track; right-click opens the track menu.
+    // Name area: click selects the track (Shift ranges, Ctrl adds); a drag moves it (slice 2c);
+    // right-click opens the track menu.
     let name_area = Rect::from_min_max(r.min, pos2(r.max.x - 92.0, r.max.y));
-    let resp = ui.interact(name_area.intersect(list), ui.id().with(("hdr", t.id.0)), Sense::click());
+    let resp = ui.interact(name_area.intersect(list), ui.id().with(("hdr", t.id.0)), Sense::click_and_drag());
     if resp.clicked() {
-        let shift = ui.input(|i| i.modifiers.shift);
-        app.focus_header(t.id, shift);
+        let m = ui.input(|i| i.modifiers);
+        app.click_header(t.id, m.shift, m.command || m.ctrl);
+    }
+    if resp.drag_started() && t.kind != TrackKind::Master {
+        app.arrange.header_drag = Some(crate::groups::HeaderDrag { track: t.id, drop: None });
+    }
+    if t.is_folder() {
+        disclosure(app, ui, t, Rect::from_min_size(pos2(r.min.x + indent + 8.0, r.min.y + 5.0), vec2(14.0, 14.0)), list, row);
     }
     let id = t.id;
     let kind = t.kind;
     let has_instrument = t.instrument.is_some();
     resp.context_menu(|ui| track_menu(app, ui, id, kind, has_instrument));
+}
+
+/// A group's disclosure triangle: collapses or expands its members (view state only).
+fn disclosure(app: &mut StudioApp, ui: &mut Ui, t: &Track, b: Rect, list: Rect, row: &mut TrackRow) {
+    row.disclosure = r4(b);
+    let resp = ui.interact(b.intersect(list), ui.id().with(("disclose", t.id.0)), Sense::click());
+    let c = b.center();
+    let pts = if row.collapsed {
+        vec![pos2(c.x - 3.0, c.y - 5.0), pos2(c.x + 4.0, c.y), pos2(c.x - 3.0, c.y + 5.0)]
+    } else {
+        vec![pos2(c.x - 5.0, c.y - 3.0), pos2(c.x + 5.0, c.y - 3.0), pos2(c.x, c.y + 4.0)]
+    };
+    let ink = if resp.hovered() { TOKENS.text } else { TOKENS.text_dim };
+    ui.painter().with_clip_rect(list).add(egui::Shape::convex_polygon(pts, ink, Stroke::NONE));
+    if resp.clicked() {
+        app.toggle_group(t.id);
+    }
+}
+
+/// A collapsed group's lane: its members' clips as thin bars in their colors, one row of bars per
+/// member, read-only (they are not in `layout.clips`, so a click there is a click on the lane).
+fn group_summaries(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, layout: &mut Layout) {
+    let p = ui.painter().with_clip_rect(tl);
+    for row in layout.tracks.iter_mut().filter(|r| r.collapsed) {
+        let g = TrackId(row.id);
+        let members: Vec<&Track> = s.tracks.iter().filter(|t| t.id != g && crate::groups::within(s, t.id, g) && t.kind.has_playlist()).collect();
+        let lane = Rect::from_min_max(pos2(row.lane[0], row.lane[1]), pos2(row.lane[2], row.lane[3]));
+        let n = members.len().max(1) as f32;
+        let h = ((lane.height() - 8.0) / n).clamp(1.0, 5.0);
+        let pitch = ((lane.height() - 8.0) / n).max(h);
+        for (k, t) in members.iter().enumerate() {
+            let y = lane.min.y + 4.0 + k as f32 * pitch;
+            for c in t.clips() {
+                let bar = Rect::from_min_max(pos2(map.x(c.start), y), pos2(map.x(c.end()).max(map.x(c.start) + 2.0), y + h));
+                row.summary_bars += 1;
+                if bar.max.x >= tl.min.x && bar.min.x <= tl.max.x {
+                    p.rect_filled(bar, 1.0, theme::rgb(c.color.unwrap_or(t.color)));
+                }
+            }
+        }
+    }
+    let _ = app;
+}
+
+/// A track header drag in progress (slice 2c): show where it would land; on release, move it
+/// there (`StudioApp::drop_track`, one undo step).
+fn header_drag(app: &mut StudioApp, ui: &Ui, s: &Session, layout: &mut Layout) {
+    let Some(drag) = app.arrange.header_drag else { return };
+    let (down, pos) = ui.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos()));
+    let at = pos.and_then(|p| crate::groups::drop_at(s, &layout.tracks, drag.track, p.y));
+    if down {
+        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        app.arrange.header_drag = Some(crate::groups::HeaderDrag { drop: at.map(|a| a.0), ..drag });
+        if let Some((d, r)) = at {
+            let rect = Rect::from_min_max(pos2(r[0], r[1]), pos2(r[2], r[3]));
+            let p = ui.painter();
+            match d {
+                crate::groups::Drop::Gap { .. } => p.rect_filled(rect, 0.0, TOKENS.accent),
+                crate::groups::Drop::Into(_) => p.rect_stroke(rect.shrink(1.0), 2.0, Stroke::new(2.0, TOKENS.accent), StrokeKind::Inside),
+            };
+            layout.drop = Some(r);
+        }
+        return;
+    }
+    app.arrange.header_drag = None;
+    if let Some((d, _)) = at {
+        let _ = app.drop_track(drag.track, d);
+    }
 }
 
 /// The track's right-click menu.
@@ -314,6 +430,10 @@ fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, ha
     if kind.is_midi() && ui.button("New MIDI Clip at Cursor").clicked() {
         let _ = app.new_midi_clip(Some(id));
         ui.close();
+    }
+    if kind != TrackKind::Master {
+        crate::groups::menu_items(app, ui, Some(id));
+        ui.separator();
     }
     ui.menu_button("Color", |ui| {
         for (i, c) in PALETTE.iter().enumerate() {

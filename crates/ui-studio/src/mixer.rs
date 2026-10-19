@@ -136,6 +136,8 @@ pub struct StripLayout {
     pub add_insert: R4,
     /// The strip is the focused track's (the device chain follows it).
     pub focused: bool,
+    /// The group this track sits in (slice 2c).
+    pub folder: Option<u64>,
 }
 
 /// One insert row of a strip.
@@ -159,6 +161,16 @@ pub struct MixerLayout {
     pub add_fx: R4,
     /// The open dropdown's entries.
     pub menu: Vec<MenuItem>,
+    /// The bars above a group's strip and its members' strips (slice 2c).
+    pub groups: Vec<GroupLink>,
+}
+
+/// The thin accent bar that links a group's strip to its members' strips.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct GroupLink {
+    pub folder: u64,
+    pub members: Vec<u64>,
+    pub rect: R4,
 }
 
 /// One device card as last drawn.
@@ -303,7 +315,8 @@ fn push_unused_entry(s: &Session, choices: &mut Vec<(String, String)>) {
 
 /// The aux track fed by `bus`, if any: an FX or group channel.
 fn channel_of_bus(s: &Session, bus: BusId) -> Option<&Track> {
-    s.tracks.iter().find(|t| t.kind == TrackKind::Aux && t.mixer.input == Route::Bus(bus))
+    // A group's own bus reads as the group (slice 2c).
+    s.tracks.iter().find(|t| matches!(t.kind, TrackKind::Aux | TrackKind::Folder) && t.mixer.input == Route::Bus(bus))
 }
 
 /// A bus as a routing target reads: the FX channel it feeds, else "Bus: name".
@@ -349,9 +362,10 @@ pub fn listening_loops(s: &Session, t: &Track, b: BusId) -> bool {
     bus_targets(t).any(|o| reaches(s, o, b))
 }
 
-/// Whether a track kind has sends here: audio, instrument and FX channels.
+/// Whether a track kind has sends here: audio, instrument, FX channels and groups (a group sums
+/// its members like an FX channel, and the mix runs its sends the same way).
 pub fn takes_sends(kind: TrackKind) -> bool {
-    matches!(kind, TrackKind::Audio | TrackKind::Instrument | TrackKind::Aux)
+    matches!(kind, TrackKind::Audio | TrackKind::Instrument | TrackKind::Aux | TrackKind::Folder)
 }
 
 /// Where a send from `t` can go: `(label, bus name)` for every bus that is not already one of its
@@ -778,7 +792,8 @@ fn strips(app: &mut StudioApp, ui: &mut Ui) {
     let s = app.engine.session_arc();
     let focus = app.focus_track();
     let master = s.tracks.iter().find(|t| t.kind == TrackKind::Master && !t.hidden);
-    let channels: Vec<&Track> = s.tracks.iter().filter(|t| t.kind != TrackKind::Master && !t.hidden).collect();
+    // Session order, which is the arrangement's; members of a collapsed group are out (slice 2c).
+    let channels: Vec<&Track> = s.tracks.iter().filter(|t| t.kind != TrackKind::Master && !t.hidden && !app.tucked(&s, t)).collect();
     // The master strip is pinned right; the others scroll under it.
     let master_rect = Rect::from_min_max(pos2(area.max.x - STRIP_W - 6.0, area.min.y + 4.0), pos2(area.max.x - 6.0, area.max.y - 4.0));
     let lane = Rect::from_min_max(pos2(area.min.x + 4.0, area.min.y + 4.0), pos2(master_rect.min.x - 10.0, area.max.y - 4.0));
@@ -802,6 +817,7 @@ fn strips(app: &mut StudioApp, ui: &mut Ui) {
         let sl = strip(app, ui, &s, t, r, lane, focus == Some(t.id), (rows, ins_rows), &mut layout.menu);
         layout.strips.push(sl);
     }
+    layout.groups = group_links(ui, &s, &channels, lane, area, app.mixer.hscroll);
     // "Add FX Channel" after the last strip.
     let ax = lane.min.x + channels.len() as f32 * (STRIP_W + GAP) - app.mixer.hscroll + 6.0;
     let add = Rect::from_min_size(pos2(ax, lane.min.y + 4.0), vec2(96.0, 24.0));
@@ -841,6 +857,29 @@ fn strips(app: &mut StudioApp, ui: &mut Ui) {
         }
     }
     app.mixer.layout = layout;
+}
+
+/// Above the strips, a thin accent bar from each group's strip over its members' strips.
+fn group_links(ui: &Ui, s: &Session, channels: &[&Track], lane: Rect, area: Rect, hscroll: f32) -> Vec<GroupLink> {
+    let x = |i: usize| lane.min.x + i as f32 * (STRIP_W + GAP) - hscroll;
+    let p = ui.painter().with_clip_rect(Rect::from_min_max(pos2(lane.min.x, area.min.y), pos2(lane.max.x, lane.min.y)));
+    let mut out = Vec::new();
+    for (i, g) in channels.iter().enumerate().filter(|(_, t)| t.is_folder()) {
+        let members: Vec<u64> = channels[i + 1..]
+            .iter()
+            .take_while(|t| crate::groups::within(s, t.id, g.id))
+            .filter(|t| t.folder == Some(g.id))
+            .map(|t| t.id.0)
+            .collect();
+        let last = channels[i + 1..].iter().take_while(|t| crate::groups::within(s, t.id, g.id)).count();
+        if last == 0 {
+            continue;
+        }
+        let r = Rect::from_min_max(pos2(x(i) + 2.0, area.min.y + 1.0), pos2(x(i + last) + STRIP_W - 2.0, area.min.y + 3.0));
+        p.rect_filled(r, 1.0, TOKENS.accent);
+        out.push(GroupLink { folder: g.id.0, members, rect: r4(r) });
+    }
+    out
 }
 
 /// The main-out strip when the session has no master track: the main meter and an offer.
@@ -1384,6 +1423,7 @@ fn strip(
         level: app.meters.get(&id).map_or([0.0; 2], |d| d.level),
         fx: t.kind == TrackKind::Aux,
         focused,
+        folder: t.folder.map(|f| f.0),
         ..StripLayout::default()
     };
     let x0 = r.min.x + 4.0;

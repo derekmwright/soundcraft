@@ -44,6 +44,7 @@ impl StudioApp {
 }
 
 pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
+    app.arrange.bar_menu.clear();
     egui::Panel::top("menu_bar").exact_size(24.0).frame(egui::Frame::NONE.fill(TOKENS.panel).inner_margin(egui::Margin::symmetric(8, 2))).show(
         ui,
         |ui| {
@@ -89,7 +90,7 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         }
                     }
                 });
-                ui.menu_button("Track", |ui| {
+                let track_menu = ui.menu_button("Track", |ui| {
                     if ui.button("Add Audio Track").clicked() {
                         let _ = app.add_track("audio");
                         ui.close();
@@ -111,7 +112,12 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         let _ = app.remove_unused_busses();
                         ui.close();
                     }
+                    ui.separator();
+                    crate::groups::menu_items(app, ui, None);
                 });
+                // Where the Track menu sits, for `ui.inspect` and tests (slice 2c).
+                app.arrange.bar_menu.retain(|m| m.label != "Track");
+                app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Track".into(), String::new(), track_menu.response.rect));
                 ui.menu_button("View", |ui| {
                     let u = &mut app.ui;
                     for (label, key, flag) in [

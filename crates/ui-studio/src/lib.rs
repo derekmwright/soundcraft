@@ -11,6 +11,7 @@ pub mod arrange;
 pub mod control;
 pub mod devices;
 pub mod fine;
+pub mod groups;
 pub mod host;
 pub mod keys;
 pub mod menus;
@@ -71,6 +72,10 @@ pub struct UiState {
     pub focus_track: Option<TrackId>,
     /// The piano roll's view preferences (slice 3).
     pub keys: keys::KeysPrefs,
+    /// Collapsed groups (slice 2c): their members are out of the track list and the mixer. View
+    /// state of the open session, never in the document; shown by `ui.inspect`, never loaded.
+    #[serde(skip_deserializing)]
+    pub collapsed: Vec<TrackId>,
 }
 
 impl Default for UiState {
@@ -91,6 +96,7 @@ impl Default for UiState {
             cursor_track: None,
             focus_track: None,
             keys: keys::KeysPrefs::default(),
+            collapsed: Vec::new(),
         }
     }
 }
@@ -308,6 +314,10 @@ impl StudioApp {
         }
         match result {
             Ok(v) => {
+                if replacing {
+                    // Collapsed groups belong to the session that was open.
+                    self.ui.collapsed.clear();
+                }
                 if replacing || (id.starts_with("session.save") && !self.engine.is_dirty()) {
                     self.release_autosave(false);
                 }
@@ -338,6 +348,7 @@ impl StudioApp {
         }
         let mut ns = ns;
         (ns.cursor, ns.cursor_track, ns.focus_track) = (self.ui.cursor, self.ui.cursor_track, self.ui.focus_track);
+        ns.collapsed = std::mem::take(&mut self.ui.collapsed);
         let before = std::mem::replace(&mut self.ui, ns);
         // Editors no longer listed close; newly listed ones open (retried until loaded).
         for key in before.plugin_windows.iter().filter(|k| !self.ui.plugin_windows.contains(k)) {
@@ -528,6 +539,7 @@ impl StudioApp {
         let ctx = ui.ctx().clone();
         ui.set_style(ctx.global_style());
         keys::shortcuts(self, &ctx); // slice 3: before the arrangement's keys
+        groups::shortcuts(self, &ctx);
         menus::shortcuts(self, &ctx);
         menus::menu_bar(self, ui);
         transport::bar(self, ui);
@@ -581,6 +593,7 @@ impl StudioApp {
             "mixer": self.mixer.layout,
             "devices": self.mixer.devices,
             "track_menu": self.arrange.menu,
+            "bar_menu": self.arrange.bar_menu,
             "menu_state": {"filter_rect": self.mixer.filter_rect},
             "readout_edit": self.mixer.edit.as_ref().map(|e| json!({
                 "control": format!("{:?}", e.target),
@@ -594,6 +607,8 @@ impl StudioApp {
     }
 }
 
+#[cfg(test)]
+mod groups_tests;
 #[cfg(test)]
 mod keys_tests;
 #[cfg(test)]
