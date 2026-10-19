@@ -256,12 +256,16 @@ pub fn add_search_dir(dir: &Path) -> usize {
     }
     let found = scan_paths(&[dir.to_path_buf()]);
     let n = found.len();
-    // Not scanned yet: the next scan covers the folder along with the others.
-    if let Some(list) = lock().scanned.as_mut() {
-        for d in found {
-            if !list.iter().any(|o| o.id == d.id) {
-                list.push(d);
-            }
+    // Not scanned yet: the next scan covers the folder along with the others. Meanwhile the
+    // plug-ins are remembered, so that creating one by id does not scan every machine folder.
+    let mut r = lock();
+    let list = match r.scanned.as_mut() {
+        Some(list) => list,
+        None => &mut r.remembered,
+    };
+    for d in found {
+        if !list.iter().any(|o| o.id == d.id) {
+            list.push(d);
         }
     }
     n

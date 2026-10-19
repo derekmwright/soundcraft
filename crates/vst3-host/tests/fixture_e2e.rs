@@ -31,8 +31,11 @@ fn scan_lists_both_audio_modules_but_not_the_controller_class() {
     let s = found.iter().find(|d| d.name == "Fixture Synth").unwrap();
     assert_eq!(s.category, Category::Instrument);
     assert!(s.is_instrument);
-    let global = soundcraft_vst3_host::scan();
-    assert!(global.iter().any(|d| d.id == g.id) && global.iter().any(|d| d.id == s.id));
+    // The folder joins every later scan, and its plug-ins are known by id without one. (No global
+    // `scan()` here: it would load every plug-in installed on the machine, and some never unload,
+    // which hangs the test binary at exit.)
+    assert!(soundcraft_vst3_host::search_dirs().1.iter().any(|d| d == dir));
+    assert!(soundcraft_vst3_host::plugin_info(&g.id).is_some() && soundcraft_vst3_host::plugin_info(&s.id).is_some());
 }
 
 #[test]
