@@ -96,3 +96,50 @@ fn forced_fallback_is_unsupported() {
     assert_eq!(p, Promotion::Unsupported("platform"));
     assert_eq!(current_level(), None);
 }
+
+/// Linux without `CAP_SYS_NICE` or an `RLIMIT_RTPRIO` gets `Denied(EPERM)`; with them (CI runs
+/// this suite again under `sudo -E` with `SOUNDCRAFT_RT_EXPECT_PROMOTED=1`) it gets `SCHED_FIFO`.
+/// The test asserts the variant set, and success only when the environment says it must succeed.
+#[cfg(all(target_os = "linux", not(feature = "force-fallback")))]
+mod linux {
+    use super::*;
+
+    const EPERM: i32 = 1;
+
+    #[test]
+    fn linux_promotes_or_is_denied_never_anything_else() {
+        let (p, during) = on_new_thread(|| {
+            let p = promote_audio_thread();
+            let during = current_level();
+            demote(p);
+            (p, during)
+        });
+        assert!(matches!(p, Promotion::Priority(_) | Promotion::Denied(EPERM) | Promotion::Unsupported(_)), "{p:?}");
+        if p.is_promoted() {
+            assert!(during.is_some_and(|l| l.realtime), "{p:?} but level {during:?}");
+        }
+        if std::env::var("SOUNDCRAFT_RT_EXPECT_PROMOTED").is_ok_and(|v| v == "1") {
+            assert!(matches!(p, Promotion::Priority(_)), "expected SCHED_FIFO under sudo, got {p:?}");
+        }
+    }
+}
+
+/// macOS needs no privilege for the time-constraint policy; a refusal is still a value.
+#[cfg(all(target_os = "macos", not(feature = "force-fallback")))]
+mod macos {
+    use super::*;
+
+    #[test]
+    fn macos_promotes_or_reports_why() {
+        let (p, during) = on_new_thread(|| {
+            let p = promote_audio_thread();
+            let during = current_level();
+            demote(p);
+            (p, during)
+        });
+        assert!(matches!(p, Promotion::TimeConstraint { .. } | Promotion::Denied(_) | Promotion::Unsupported(_)), "{p:?}");
+        if p.is_promoted() {
+            assert!(during.is_some_and(|l| l.realtime), "{p:?} but level {during:?}");
+        }
+    }
+}

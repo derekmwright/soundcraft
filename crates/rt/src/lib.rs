@@ -53,10 +53,13 @@ use fallback as imp;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Promotion {
     /// Windows: the thread joined the MMCSS "Pro Audio" task (`task_index` is the index MMCSS
-    /// assigned). The priority within the task is critical when MMCSS allowed it.
+    /// assigned); `critical` says whether the critical priority within the task was granted.
     Mmcss {
         /// The MMCSS task index returned by `AvSetMmThreadCharacteristicsW`.
         task_index: u32,
+        /// True when `AvSetMmThreadPriority(AVRT_PRIORITY_CRITICAL)` was granted; false means
+        /// the thread is in the task at the task's default priority.
+        critical: bool,
     },
     /// A raised OS priority: on Windows the `SetThreadPriority` level (15, time critical) used
     /// when MMCSS is unavailable; on Linux the `SCHED_FIFO` priority.
