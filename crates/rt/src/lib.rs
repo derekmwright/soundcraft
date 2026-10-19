@@ -28,6 +28,21 @@
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+/// Test support: counts OS promotion attempts. Not in release builds (feature `testing`).
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(crate) static PROMOTION_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// How many times [`crate::promote_audio_thread`] has been called in this process, counted
+    /// before the platform call. A render path that must make no OS call asserts it stays put.
+    #[must_use]
+    pub fn promotion_calls() -> usize {
+        PROMOTION_CALLS.load(Ordering::Relaxed)
+    }
+}
+
 #[cfg(all(windows, not(feature = "force-fallback")))]
 mod windows;
 #[cfg(all(windows, not(feature = "force-fallback")))]
@@ -110,7 +125,7 @@ pub struct Level {
 /// Call it once, at thread start (the render pool's start handler). It never panics. A second
 /// call on a thread already promoted makes no OS call and returns the first result; a call after
 /// a failed attempt tries again. The crate allocates nothing; the OS call itself may (see the
-/// crate docs), so do not call it from inside a render.
+/// crate docs), so never call it from inside a render or an audio callback.
 ///
 /// ```
 /// let p = soundcraft_rt::promote_audio_thread();
@@ -120,6 +135,8 @@ pub struct Level {
 /// ```
 #[must_use = "the result says whether the thread is realtime; pass it to `demote` to undo"]
 pub fn promote_audio_thread() -> Promotion {
+    #[cfg(any(test, feature = "testing"))]
+    testing::PROMOTION_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     imp::promote()
 }
 
