@@ -63,7 +63,7 @@ pub struct Tokens {
     pub solo: Color32,
     pub monitor: Color32,
     pub button: Color32,
-    /// Hover fill for buttons and rows.
+    /// The hover token: fill for hovered buttons and rows.
     pub button_hover: Color32,
     pub selection_outline: Color32,
     /// Keyboard focus ring (and the active pane's outline).
@@ -164,6 +164,21 @@ pub fn current() -> egui::Theme {
     if LIGHT_NOW.with(Cell::get) { egui::Theme::Light } else { egui::Theme::Dark }
 }
 
+/// The spacing grid: margins and gaps are multiples of 8 px (4 px half steps inside dense rows).
+pub const SPACE: f32 = 8.0;
+/// Corner radius of buttons, cards, clips, menus and windows.
+pub const RADIUS: f32 = 4.0;
+/// Corner radius of small controls (header toggles, readouts, meters, send rows).
+pub const RADIUS_SM: f32 = 2.0;
+/// Keyboard focus ring width.
+pub const FOCUS_W: f32 = 1.5;
+
+/// Rounded top corners only (a card's title, a clip's name strip).
+pub fn top_corners() -> egui::CornerRadius {
+    let r = RADIUS as u8;
+    egui::CornerRadius { nw: r, ne: r, sw: 0, se: 0 }
+}
+
 /// Track list row metrics (Cubase-like density).
 pub const RULER_H: f32 = 26.0;
 pub const TRANSPORT_H: f32 = 40.0;
@@ -178,7 +193,7 @@ fn visuals(t: &Tokens, light: bool) -> egui::Visuals {
     v.extreme_bg_color = t.bg;
     v.faint_bg_color = t.lane_alt;
     v.selection.bg_fill = t.accent.gamma_multiply(if light { 0.35 } else { 0.6 });
-    v.selection.stroke = egui::Stroke::new(1.0, t.focus_ring);
+    v.selection.stroke = egui::Stroke::new(FOCUS_W, t.focus_ring);
     v.hyperlink_color = t.accent;
     v.window_stroke = egui::Stroke::new(1.0, t.line);
     v.widgets.noninteractive.bg_fill = t.panel;
@@ -193,14 +208,37 @@ fn visuals(t: &Tokens, light: bool) -> egui::Visuals {
     v.widgets.active.bg_fill = t.accent.gamma_multiply(0.7);
     v.widgets.active.weak_bg_fill = t.accent.gamma_multiply(0.7);
     v.widgets.open.weak_bg_fill = t.button_hover;
+    // Flat: no shadows (the 1 px separator is the only edge), one corner radius.
+    v.window_shadow = egui::Shadow::NONE;
+    v.popup_shadow = egui::Shadow::NONE;
+    v.window_corner_radius = egui::CornerRadius::same(RADIUS as u8);
+    v.menu_corner_radius = egui::CornerRadius::same(RADIUS as u8);
+    for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
+        w.corner_radius = egui::CornerRadius::same(RADIUS_SM as u8);
+        w.expansion = 0.0;
+    }
     v
+}
+
+/// The spacing grid on egui's own widgets.
+fn spacing(st: &mut egui::Style) {
+    let sp = &mut st.spacing;
+    sp.item_spacing = egui::vec2(SPACE, SPACE / 2.0);
+    sp.button_padding = egui::vec2(SPACE, SPACE / 4.0);
+    sp.menu_margin = egui::Margin::same(SPACE as i8);
+    sp.window_margin = egui::Margin::same(SPACE as i8);
+    sp.indent = 2.0 * SPACE;
 }
 
 /// Install both themes' visuals and follow `appearance` (System: the OS setting, through egui's
 /// `system_theme`). Call when the appearance changes; [`follow`] runs every frame.
 pub fn apply(ctx: &egui::Context, appearance: Appearance) {
-    ctx.set_visuals_of(egui::Theme::Dark, visuals(&DARK, false));
-    ctx.set_visuals_of(egui::Theme::Light, visuals(&LIGHT, true));
+    for (theme, tokens) in [(egui::Theme::Dark, &DARK), (egui::Theme::Light, &LIGHT)] {
+        ctx.style_mut_of(theme, |st| {
+            st.visuals = visuals(tokens, theme == egui::Theme::Light);
+            spacing(st);
+        });
+    }
     ctx.set_theme(appearance.preference());
     set_current(ctx.theme());
 }

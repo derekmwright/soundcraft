@@ -309,3 +309,45 @@ fn the_shortcuts_window_closes_from_its_title_bar() {
     assert_eq!(t.inspect()["shortcuts"]["open"], false);
     assert!(!t.app.ui.show_shortcuts);
 }
+
+#[test]
+fn both_themes_are_flat_on_the_spacing_grid() {
+    let t = T::new();
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        let st = t.ctx.style_of(theme);
+        let v = &st.visuals;
+        assert_eq!(v.window_shadow, egui::Shadow::NONE, "{theme:?}: no window shadow");
+        assert_eq!(v.popup_shadow, egui::Shadow::NONE, "{theme:?}: no popup shadow");
+        assert_eq!(v.window_corner_radius, egui::CornerRadius::same(crate::theme::RADIUS as u8));
+        assert_eq!(v.widgets.inactive.corner_radius, egui::CornerRadius::same(crate::theme::RADIUS_SM as u8));
+        assert_eq!(v.selection.stroke.width, crate::theme::FOCUS_W, "{theme:?}: focus ring token");
+        assert_eq!(st.spacing.item_spacing.x % (crate::theme::SPACE / 2.0), 0.0);
+        assert_eq!(st.spacing.menu_margin, egui::Margin::same(crate::theme::SPACE as i8));
+    }
+}
+
+#[test]
+fn painted_corners_use_the_radius_tokens() {
+    for src in [
+        include_str!("arrange.rs"),
+        include_str!("browser.rs"),
+        include_str!("devices.rs"),
+        include_str!("keys.rs"),
+        include_str!("menus.rs"),
+        include_str!("mixer.rs"),
+        include_str!("transport.rs"),
+    ] {
+        for line in src.lines().filter(|l| l.contains("rect_filled(") || l.contains("rect_stroke(")) {
+            for n in ["1.0, ", "2.0, ", "3.0, ", "4.0, ", "6.0, "] {
+                let lit = format!(", {n}");
+                if let Some(at) = line.find(&lit) {
+                    // Only the radius argument counts: the second top-level argument.
+                    let head = &line[..at];
+                    let depth = head.matches('(').count() - head.matches(')').count();
+                    assert!(depth != 1, "literal corner radius: {line}");
+                }
+            }
+        }
+        assert!(!src.contains("CornerRadius { nw"), "top corners go through theme::top_corners");
+    }
+}

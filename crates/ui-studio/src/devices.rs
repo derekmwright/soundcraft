@@ -205,7 +205,7 @@ pub fn chain(app: &mut StudioApp, ui: &mut Ui) {
     let full = used >= t.mixer.inserts.len();
     let resp = ui.interact(add.intersect(lane), ui.id().with(("add_device", tid.0)), Sense::click());
     let pc = p.with_clip_rect(lane);
-    pc.rect_filled(add, 4.0, if resp.hovered() && !full { TOKENS.button_hover } else { TOKENS.button });
+    pc.rect_filled(add, crate::theme::RADIUS, if resp.hovered() && !full { TOKENS.button_hover } else { TOKENS.button });
     crate::icons::paint(&pc, add.center(), Icon::Plus, 20.0, if full { TOKENS.text_dim } else { TOKENS.text });
     let resp = resp.on_hover_text(if full { "All ten device slots are in use" } else { "Add an effect" });
     if !full {
@@ -238,9 +238,9 @@ fn card(
 ) -> DeviceCard {
     let pc = p.with_clip_rect(lane);
     let on = ins.is_some_and(|i| !i.bypass);
-    pc.rect_filled(r, 4.0, TOKENS.panel_raised);
+    pc.rect_filled(r, crate::theme::RADIUS, TOKENS.panel_raised);
     let title = Rect::from_min_size(r.min, vec2(r.width(), 22.0));
-    pc.rect_filled(title, egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 }, if on { TOKENS.button } else { TOKENS.bg });
+    pc.rect_filled(title, crate::theme::top_corners(), if on { TOKENS.button } else { TOKENS.bg });
     let plugin = ins.map(|i| i.plugin.clone()).unwrap_or_default();
     let name = if plugin.is_empty() { "No instrument".to_string() } else { app.plugin_name(&plugin, slot.is_none()) };
     let mut c =
@@ -300,7 +300,7 @@ fn card(
         let resp = ui.interact(pick.intersect(lane), ui.id().with(("pick_instrument", t.0)), Sense::click());
         if ins.is_some() {
             if resp.hovered() {
-                pc.rect_filled(pick, egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 }, TOKENS.button_hover);
+                pc.rect_filled(pick, crate::theme::top_corners(), TOKENS.button_hover);
                 pc.with_clip_rect(name_r.intersect(lane)).text(
                     name_r.left_center(),
                     Align2::LEFT_CENTER,
@@ -311,7 +311,7 @@ fn card(
             }
             crate::icons::paint(&pc, pos2(pick.max.x - 10.0, pick.center().y), Icon::ChevronDown, 12.0, TOKENS.text_dim);
         } else {
-            pc.rect_filled(eb, 3.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+            pc.rect_filled(eb, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
             pc.text(eb.center(), Align2::CENTER_CENTER, "Choose…", FontId::proportional(10.5), TOKENS.text);
         }
         c.pick_button = r4(pick);
@@ -338,7 +338,7 @@ fn card(
     let enabled = app.player.as_ref().is_some_and(|pl| hosted(&plugin) || pl.has_editor(t, key_slot));
     let open = app.ui.plugin_windows.contains(&(t, key_slot));
     let resp = ui.interact(eb.intersect(lane), ui.id().with(("editor", t.0, salt)), Sense::click());
-    pc.rect_filled(eb, 3.0, if resp.hovered() && enabled { TOKENS.button_hover } else { TOKENS.button });
+    pc.rect_filled(eb, crate::theme::RADIUS, if resp.hovered() && enabled { TOKENS.button_hover } else { TOKENS.button });
     let label = if open { "Editor open" } else { "Open editor" };
     let ink = if enabled { TOKENS.text } else { TOKENS.text_dim.gamma_multiply(0.6) };
     let font = FontId::proportional(10.5);

@@ -751,7 +751,7 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
         let on = which == 0;
         let p = ui.painter();
         if resp.hovered() && !on {
-            p.rect_filled(b, 3.0, TOKENS.button_hover);
+            p.rect_filled(b, crate::theme::RADIUS, TOKENS.button_hover);
         }
         p.text(b.center(), Align2::CENTER_CENTER, label, font.clone(), if on { TOKENS.text } else { TOKENS.text_dim });
         if on {
@@ -773,7 +773,7 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
     let title = if cv.name.is_empty() || cv.name == track_name { track_name } else { format!("{track_name} · {}", cv.name) };
     let p = ui.painter();
     p.line_segment([pos2(x + 8.0, r.min.y + 7.0), pos2(x + 8.0, r.max.y - 7.0)], Stroke::new(1.0, TOKENS.line));
-    p.rect_filled(Rect::from_center_size(pos2(x + 22.0, r.center().y), vec2(8.0, 8.0)), 2.0, theme::rgb(color));
+    p.rect_filled(Rect::from_center_size(pos2(x + 22.0, r.center().y), vec2(8.0, 8.0)), crate::theme::RADIUS_SM, theme::rgb(color));
     p.text(pos2(x + 32.0, r.center().y), Align2::LEFT_CENTER, title, FontId::proportional(11.5), TOKENS.text_dim);
 
     // Right side, right to left: Audition, Quantize, Grid.
@@ -806,7 +806,7 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
     }
     let (b, resp) = button(ui, 72.0, "quantize");
     let p = ui.painter();
-    p.rect_filled(b, 3.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+    p.rect_filled(b, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
     p.text(b.center(), Align2::CENTER_CENTER, "Quantize", small.clone(), TOKENS.text);
     layout.quantize = r4(b);
     if resp
@@ -817,7 +817,7 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
     }
     let (b, resp) = button(ui, 84.0, "snap");
     let p = ui.painter();
-    p.rect_filled(b, 3.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+    p.rect_filled(b, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
     p.text(pos2(b.min.x + 8.0, b.center().y), Align2::LEFT_CENTER, format!("Grid {}", app.ui.keys.snap.label()), small, TOKENS.text);
     let c = pos2(b.max.x - 9.0, b.center().y);
     p.add(egui::Shape::convex_polygon(
@@ -995,9 +995,9 @@ fn paint_notes(
         let alpha = if outside { alpha * 0.4 } else { alpha };
         let a = 0.45 + 0.55 * f32::from(n.velocity) / 127.0;
         let fill = if selected { theme::lighten(TOKENS.accent, 0.25) } else { TOKENS.accent.gamma_multiply(a) };
-        p.rect_filled(r, 2.0, fill.gamma_multiply(alpha));
+        p.rect_filled(r, crate::theme::RADIUS_SM, fill.gamma_multiply(alpha));
         if selected {
-            p.rect_stroke(r, 2.0, Stroke::new(1.0, TOKENS.selection_outline.gamma_multiply(alpha)), StrokeKind::Inside);
+            p.rect_stroke(r, crate::theme::RADIUS_SM, Stroke::new(1.0, TOKENS.selection_outline.gamma_multiply(alpha)), StrokeKind::Inside);
         }
         if outside {
             // Diagonal hatch: past the clip's end the note is silent.
@@ -1011,7 +1011,7 @@ fn paint_notes(
         let s = stem(n);
         let c = if selected { TOKENS.selection_outline } else { TOKENS.accent };
         vp.rect_filled(s, 0.0, c.gamma_multiply(alpha * 0.9));
-        vp.rect_filled(Rect::from_min_size(pos2(s.min.x - 1.5, s.min.y - 1.5), vec2(6.0, 3.0)), 1.0, c.gamma_multiply(alpha));
+        vp.rect_filled(Rect::from_min_size(pos2(s.min.x - 1.5, s.min.y - 1.5), vec2(6.0, 3.0)), crate::theme::RADIUS_SM, c.gamma_multiply(alpha));
     };
     for (i, n) in notes.iter().enumerate() {
         let selected = sel_idx.contains(&i);

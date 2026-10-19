@@ -44,9 +44,10 @@ impl StudioApp {
 
 pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
     app.arrange.bar_menu.clear();
-    egui::Panel::top("menu_bar").exact_size(24.0).frame(egui::Frame::NONE.fill(TOKENS.panel).inner_margin(egui::Margin::symmetric(8, 2))).show(
-        ui,
-        |ui| {
+    egui::Panel::top("menu_bar")
+        .exact_size(24.0)
+        .frame(egui::Frame::NONE.fill(TOKENS.panel).inner_margin(egui::Margin::symmetric(crate::theme::SPACE as i8, 2)))
+        .show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New").clicked() {
@@ -195,14 +196,14 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                     ui.label(egui::RichText::new(format!("{}{dirty}", s.name)).color(TOKENS.text_dim));
                 });
             });
-        },
-    );
+        });
 }
 
 pub fn status_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
-    egui::Panel::bottom("status").exact_size(STATUS_H).frame(egui::Frame::NONE.fill(TOKENS.panel).inner_margin(egui::Margin::symmetric(10, 2))).show(
-        ui,
-        |ui| {
+    egui::Panel::bottom("status")
+        .exact_size(STATUS_H)
+        .frame(egui::Frame::NONE.fill(TOKENS.panel).inner_margin(egui::Margin::symmetric(crate::theme::SPACE as i8, 2)))
+        .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.label(egui::RichText::new(&app.status).color(TOKENS.text_dim).size(11.5));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -211,8 +212,7 @@ pub fn status_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                     ui.label(egui::RichText::new(text).color(TOKENS.text_dim).size(11.5).monospace());
                 });
             });
-        },
-    );
+        });
 }
 
 /// Keyboard shortcuts, unless a text field has the keyboard. Keys come from [`crate::shortcuts`].
@@ -321,7 +321,7 @@ pub fn dialogs(app: &mut StudioApp, ctx: &egui::Context) {
         ui.set_width(340.0);
         ui.label(egui::RichText::new(format!("Save changes to “{}”?", app.engine.session().name)).strong());
         ui.label(egui::RichText::new("Your changes are lost if you don't save them.").color(TOKENS.text_dim));
-        ui.add_space(8.0);
+        ui.add_space(crate::theme::SPACE);
         ui.horizontal(|ui| {
             if ui.button("Save").clicked() {
                 choice = Some(1);
@@ -372,7 +372,7 @@ fn delete_tracks_dialog(app: &mut StudioApp, ctx: &egui::Context, tracks: &[Trac
             (n, false) => format!("Delete {n} tracks?"),
         };
         ui.label(egui::RichText::new(what).strong());
-        ui.add_space(8.0);
+        ui.add_space(crate::theme::SPACE);
         ui.horizontal(|ui| {
             if ui.button("Delete").clicked() || ui.input(|i| crate::shortcuts::hit(i, A::DialogConfirm)) {
                 choice = Some(true);
@@ -463,7 +463,7 @@ pub fn shortcuts_window(app: &mut StudioApp, ctx: &egui::Context) {
                 })
                 .inner;
             layout.filter = crate::arrange::r4(resp.rect);
-            ui.add_space(8.0);
+            ui.add_space(crate::theme::SPACE);
             let groups = crate::shortcuts::filtered(&app.ui.shortcuts_filter);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 if groups.is_empty() {
@@ -472,17 +472,20 @@ pub fn shortcuts_window(app: &mut StudioApp, ctx: &egui::Context) {
                 for (scope, rows) in &groups {
                     layout.scopes.push(scope.label().into());
                     ui.label(egui::RichText::new(scope.label()).strong().color(TOKENS.text));
-                    egui::Grid::new(("shortcut_grid", scope.label())).num_columns(3).spacing([16.0, 4.0]).show(ui, |ui| {
-                        for s in rows {
-                            let keys = crate::shortcuts::text(s);
-                            ui.label(egui::RichText::new(s.label).color(TOKENS.text));
-                            ui.label(egui::RichText::new(&keys).font(crate::theme::mono(ui.ctx(), 12.0)).color(TOKENS.accent));
-                            ui.label(egui::RichText::new(s.note).color(TOKENS.text_dim).size(11.0));
-                            ui.end_row();
-                            layout.rows.push(format!("{} · {} · {keys}", scope.label(), s.label));
-                        }
-                    });
-                    ui.add_space(8.0);
+                    egui::Grid::new(("shortcut_grid", scope.label()))
+                        .num_columns(3)
+                        .spacing([2.0 * crate::theme::SPACE, crate::theme::SPACE / 2.0])
+                        .show(ui, |ui| {
+                            for s in rows {
+                                let keys = crate::shortcuts::text(s);
+                                ui.label(egui::RichText::new(s.label).color(TOKENS.text));
+                                ui.label(egui::RichText::new(&keys).font(crate::theme::mono(ui.ctx(), 12.0)).color(TOKENS.accent));
+                                ui.label(egui::RichText::new(s.note).color(TOKENS.text_dim).size(11.0));
+                                ui.end_row();
+                                layout.rows.push(format!("{} · {} · {keys}", scope.label(), s.label));
+                            }
+                        });
+                    ui.add_space(crate::theme::SPACE);
                 }
             });
         });

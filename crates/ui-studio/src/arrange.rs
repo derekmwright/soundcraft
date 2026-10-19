@@ -196,7 +196,7 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
         let clip = ui.painter().with_clip_rect(list);
         for (r, label, kind, salt) in [(add_a, "+ Audio", "audio", "add_audio"), (add_i, "+ Instrument", "instrument", "add_instrument")] {
             let resp = ui.interact(r.intersect(list), ui.id().with(salt), Sense::click());
-            clip.rect_filled(r, 3.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+            clip.rect_filled(r, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
             clip.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.0), TOKENS.text);
             if resp.clicked() {
                 let _ = app.add_track(kind);
@@ -258,7 +258,7 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
         } else {
             TOKENS.button
         };
-        p.rect_filled(b, 2.0, fill);
+        p.rect_filled(b, crate::theme::RADIUS_SM, fill);
         let fg = if on {
             theme::text_on(color)
         } else if enabled {
@@ -281,7 +281,7 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     let vol = Rect::from_min_size(pos2(r.max.x - 72.0, r.min.y + 23.0), vec2(66.0, 15.0));
     row.volume = r4(vol);
     let resp = ui.interact(vol.intersect(list), ui.id().with(("vol", t.id.0)), Sense::click_and_drag());
-    p.rect_filled(vol, 2.0, TOKENS.bg);
+    p.rect_filled(vol, crate::theme::RADIUS_SM, TOKENS.bg);
     let db = m.volume_db;
     let text = if db <= -144.0 { "-inf dB".to_string() } else { format!("{db:+.1} dB") };
     p.text(vol.center(), Align2::CENTER_CENTER, text, crate::theme::mono(ui.ctx(), 10.5), if resp.hovered() { TOKENS.accent } else { TOKENS.text });
@@ -362,7 +362,7 @@ fn group_summaries(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, la
                 let bar = Rect::from_min_max(pos2(map.x(c.start), y), pos2(map.x(c.end()).max(map.x(c.start) + 2.0), y + h));
                 row.summary_bars += 1;
                 if bar.max.x >= tl.min.x && bar.min.x <= tl.max.x {
-                    p.rect_filled(bar, 1.0, theme::rgb(c.color.unwrap_or(t.color)));
+                    p.rect_filled(bar, crate::theme::RADIUS_SM, theme::rgb(c.color.unwrap_or(t.color)));
                 }
             }
         }
@@ -384,7 +384,9 @@ fn header_drag(app: &mut StudioApp, ui: &Ui, s: &Session, layout: &mut Layout) {
             let p = ui.painter();
             match d {
                 crate::groups::Drop::Gap { .. } => p.rect_filled(rect, 0.0, TOKENS.accent),
-                crate::groups::Drop::Into(_) => p.rect_stroke(rect.shrink(1.0), 2.0, Stroke::new(2.0, TOKENS.accent), StrokeKind::Inside),
+                crate::groups::Drop::Into(_) => {
+                    p.rect_stroke(rect.shrink(1.0), crate::theme::RADIUS_SM, Stroke::new(2.0, TOKENS.accent), StrokeKind::Inside)
+                }
             };
             layout.drop = Some(r);
         }
@@ -436,7 +438,7 @@ fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, ha
     ui.menu_button("Color", |ui| {
         for (i, c) in PALETTE.iter().enumerate() {
             let (r, resp) = ui.allocate_exact_size(vec2(120.0, 16.0), Sense::click());
-            ui.painter().rect_filled(r.shrink(1.0), 2.0, theme::rgb(*c));
+            ui.painter().rect_filled(r.shrink(1.0), crate::theme::RADIUS_SM, theme::rgb(*c));
             if resp.clicked() {
                 let _ = app.run("track.color", json!({"tracks": [id.0], "color": c}));
                 ui.close();
@@ -579,9 +581,9 @@ fn draw_clip(p: &egui::Painter, s: &Session, map: Map, tl: Rect, t: &Track, c: &
     let base = if c.muted { theme::darken(base, 0.5) } else { base };
     let (body_col, strip_col, name_col) = theme::clip_colors(base, selected);
     let p = p.with_clip_rect(rect.intersect(tl));
-    p.rect_filled(rect, 3.0, body_col.gamma_multiply(alpha));
+    p.rect_filled(rect, crate::theme::RADIUS, body_col.gamma_multiply(alpha));
     let strip = Rect::from_min_max(rect.min, pos2(rect.max.x, (rect.min.y + CLIP_NAME_H).min(rect.max.y)));
-    p.rect_filled(strip, egui::CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 }, strip_col.gamma_multiply(alpha));
+    p.rect_filled(strip, crate::theme::top_corners(), strip_col.gamma_multiply(alpha));
     let name_x = rect.min.x.max(tl.min.x) + 4.0;
     p.with_clip_rect(strip.intersect(tl)).text(pos2(name_x, strip.center().y), Align2::LEFT_CENTER, &c.name, FontId::proportional(11.0), name_col);
     let body = Rect::from_min_max(pos2(rect.min.x, strip.max.y), rect.max).shrink2(vec2(0.0, 2.0));
@@ -613,7 +615,7 @@ fn draw_clip(p: &egui::Painter, s: &Session, map: Map, tl: Rect, t: &Track, c: &
         }
     }
     let stroke = if selected { Stroke::new(2.0, TOKENS.selection_outline) } else { Stroke::new(1.0, theme::darken(base, 0.45)) };
-    p.rect_stroke(rect, 3.0, stroke, StrokeKind::Inside);
+    p.rect_stroke(rect, crate::theme::RADIUS, stroke, StrokeKind::Inside);
 }
 
 /// What is under a point: a clip (and whether near its start or end edge) and the row's track.
@@ -770,7 +772,7 @@ fn overlays(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, tl: Re
     let sel = s.edit.selection;
     if s.edit.loop_playback && !sel.is_empty() {
         let r = Rect::from_min_max(pos2(map.x(sel.start), ruler.min.y + 14.0), pos2(map.x(sel.end), ruler.max.y - 1.0)).intersect(ruler);
-        p.rect_filled(r, 2.0, TOKENS.accent.gamma_multiply(0.55));
+        p.rect_filled(r, crate::theme::RADIUS_SM, TOKENS.accent.gamma_multiply(0.55));
     }
     if app.engine.transport.recording {
         let rp = p.with_clip_rect(tl);
@@ -778,7 +780,7 @@ fn overlays(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, tl: Re
             if t.mixer.record_arm {
                 let y0 = tl.min.y + i as f32 * rh - app.arrange.vscroll;
                 let r = Rect::from_min_max(pos2(map.x(app.record_start), y0 + 1.0), pos2(map.x(app.position()), y0 + rh - 1.0));
-                rp.rect_filled(r, 3.0, TOKENS.record.gamma_multiply(0.45));
+                rp.rect_filled(r, crate::theme::RADIUS, TOKENS.record.gamma_multiply(0.45));
             }
         }
     }

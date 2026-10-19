@@ -1043,7 +1043,7 @@ fn drive_drag(app: &mut StudioApp, ctx: &egui::Context) {
         }
         let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("browser-drag")));
         if let Some((_, r)) = target {
-            p.rect_stroke(rect(r).shrink(1.0), 2.0, Stroke::new(2.0, TOKENS.accent), StrokeKind::Inside);
+            p.rect_stroke(rect(r).shrink(1.0), crate::theme::RADIUS_SM, Stroke::new(2.0, TOKENS.accent), StrokeKind::Inside);
         }
         if let Some(pos) = pos {
             let label = match &drag.payload {
@@ -1054,7 +1054,7 @@ fn drive_drag(app: &mut StudioApp, ctx: &egui::Context) {
             let at = pos + vec2(14.0, 10.0);
             let galley = p.layout_no_wrap(label, FontId::proportional(12.0), TOKENS.text);
             let r = Rect::from_min_size(at, galley.size() + vec2(12.0, 6.0));
-            p.rect_filled(r, 3.0, TOKENS.panel_raised);
+            p.rect_filled(r, crate::theme::RADIUS, TOKENS.panel_raised);
             p.galley(at + vec2(6.0, 3.0), galley, TOKENS.text);
         }
         ctx.set_cursor_icon(if target.is_some() { CursorIcon::Grabbing } else { CursorIcon::NoDrop });
@@ -1142,7 +1142,7 @@ fn locations_bar(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, area: Rect
     p.text(bar.left_center(), Align2::LEFT_CENTER, "Locations", FontId::proportional(10.5), TOKENS.text_dim);
     let plus = Rect::from_min_size(pos2(bar.max.x - 20.0, bar.min.y + 1.0), vec2(20.0, 18.0));
     let resp = ui.interact(plus, ui.id().with("browser_add_folder"), Sense::click());
-    p.rect_filled(plus, 3.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+    p.rect_filled(plus, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
     crate::icons::paint(p, plus.center(), Icon::Plus, 14.0, TOKENS.text);
     if resp.on_hover_text("Add Folder…").clicked() {
         app.browser.adding = if app.browser.adding.is_some() { None } else { Some(String::new()) };
@@ -1158,7 +1158,7 @@ fn locations_bar(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, area: Rect
         let fresp = ui.put(field, egui::TextEdit::singleline(&mut text).id(id).hint_text("Folder path, e.g. D:\\").desired_width(field.width()));
         let enter = fresp.lost_focus() && ui.input(|i| crate::shortcuts::hit(i, A::BrowserAddFolder));
         let oresp = ui.interact(ok, ui.id().with("browser_add_ok"), Sense::click());
-        p.rect_filled(ok, 3.0, if oresp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+        p.rect_filled(ok, crate::theme::RADIUS, if oresp.hovered() { TOKENS.button_hover } else { TOKENS.button });
         p.text(ok.center(), Align2::CENTER_CENTER, "Add", FontId::proportional(11.5), TOKENS.text);
         let mut done = false;
         if (enter || oresp.clicked()) && app.add_location(&text) {
@@ -1167,7 +1167,7 @@ fn locations_bar(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, area: Rect
         if browse_w > 0.0 {
             let br = Rect::from_min_size(pos2(ok.max.x + 4.0, y), vec2(browse_w - 4.0, 22.0));
             let bresp = ui.interact(br, ui.id().with("browser_add_browse"), Sense::click());
-            p.rect_filled(br, 3.0, if bresp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+            p.rect_filled(br, crate::theme::RADIUS, if bresp.hovered() { TOKENS.button_hover } else { TOKENS.button });
             p.text(br.center(), Align2::CENTER_CENTER, "Browse…", FontId::proportional(11.5), TOKENS.text);
             if bresp.clicked()
                 && let Some(dir) = app.services.pick_open.as_ref().and_then(|f| f("folder"))

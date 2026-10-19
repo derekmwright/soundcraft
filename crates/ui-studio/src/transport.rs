@@ -19,7 +19,7 @@ fn button(app: &mut StudioApp, ui: &mut Ui, name: &str, which: Icon, on: bool, o
     } else {
         TOKENS.button
     };
-    p.rect_filled(r, 4.0, bg);
+    p.rect_filled(r, crate::theme::RADIUS, bg);
     icons::paint_in(p, r, which, if on { on_color } else { TOKENS.text });
     app.arrange.layout.transport.insert(name.to_string(), [r.min.x, r.min.y, r.max.x, r.max.y]);
     app.arrange.layout.transport_icons.insert(name.to_string(), which.name().to_string());
@@ -44,10 +44,10 @@ pub fn min_sec(app: &StudioApp, at: Samples) -> String {
 pub fn bar(app: &mut StudioApp, ui: &mut Ui) {
     egui::Panel::top("transport")
         .exact_size(TRANSPORT_H)
-        .frame(egui::Frame::NONE.fill(TOKENS.panel_raised).inner_margin(egui::Margin::symmetric(10, 6)))
+        .frame(egui::Frame::NONE.fill(TOKENS.panel_raised).inner_margin(egui::Margin::symmetric(crate::theme::SPACE as i8, 6)))
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing.x = crate::theme::SPACE / 2.0;
                 let playing = app.is_playing();
                 let recording = app.engine.transport.recording;
                 let cycle = app.engine.session().edit.loop_playback;
@@ -66,21 +66,21 @@ pub fn bar(app: &mut StudioApp, ui: &mut Ui) {
                 if button(app, ui, "cycle", Icon::Loop, cycle, TOKENS.accent) {
                     let _ = app.run("options.loop_playback", json!({"value": !cycle}));
                 }
-                ui.add_space(14.0);
+                ui.add_space(2.0 * crate::theme::SPACE);
                 let at = app.position();
                 readout(ui, &bars_beats(app, at), 128.0, TOKENS.text);
                 readout(ui, &min_sec(app, at), 92.0, TOKENS.text_dim);
-                ui.add_space(14.0);
+                ui.add_space(2.0 * crate::theme::SPACE);
                 let s = app.engine.session();
                 let tick = s.tempo.samples_to_ticks(at.max(0), s.sample_rate);
                 let bpm = s.tempo.tempo_at_tick(tick);
                 let m = s.tempo.meter_at_tick(tick);
                 readout(ui, &format!("{bpm:.2} BPM"), 92.0, TOKENS.text);
                 readout(ui, &format!("{}/{}", m.numerator, m.denominator), 40.0, TOKENS.text);
-                ui.add_space(14.0);
+                ui.add_space(2.0 * crate::theme::SPACE);
                 main_meter(app, ui);
                 if let Some(hint) = app.record_hint() {
-                    ui.add_space(10.0);
+                    ui.add_space(crate::theme::SPACE);
                     ui.label(egui::RichText::new(hint).color(TOKENS.record));
                 }
             });
@@ -89,7 +89,7 @@ pub fn bar(app: &mut StudioApp, ui: &mut Ui) {
 
 fn readout(ui: &mut Ui, text: &str, w: f32, color: Color32) {
     let (r, _) = ui.allocate_exact_size(vec2(w, 26.0), Sense::hover());
-    ui.painter().rect_filled(r, 3.0, TOKENS.bg);
+    ui.painter().rect_filled(r, crate::theme::RADIUS, TOKENS.bg);
     ui.painter().text(r.center(), Align2::CENTER_CENTER, text, crate::theme::mono(ui.ctx(), 13.0), color);
 }
 
@@ -103,7 +103,7 @@ fn main_meter(app: &mut StudioApp, ui: &mut Ui) {
         }
     }
     let p = ui.painter();
-    p.rect_filled(r, 2.0, TOKENS.bg);
+    p.rect_filled(r, crate::theme::RADIUS_SM, TOKENS.bg);
     for (i, lvl) in app.main_meter.level.iter().enumerate() {
         let h = (r.height() - 3.0) / 2.0;
         let y = r.min.y + 1.0 + i as f32 * (h + 1.0);

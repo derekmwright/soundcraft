@@ -824,7 +824,7 @@ fn strips(app: &mut StudioApp, ui: &mut Ui) {
     if add.min.x < lane.max.x {
         let resp = ui.interact(add.intersect(lane), ui.id().with("add_fx"), Sense::click());
         let p = ui.painter().with_clip_rect(lane);
-        p.rect_filled(add, 3.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+        p.rect_filled(add, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
         p.text(add.center(), Align2::CENTER_CENTER, "+ FX Channel", FontId::proportional(11.5), TOKENS.text);
         if resp.on_hover_text("A return channel with a send from the focused track").clicked() {
             let _ = app.add_fx_channel();
@@ -876,7 +876,7 @@ fn group_links(ui: &Ui, s: &Session, channels: &[&Track], lane: Rect, area: Rect
             continue;
         }
         let r = Rect::from_min_max(pos2(x(i) + 2.0, area.min.y + 1.0), pos2(x(i + last) + STRIP_W - 2.0, area.min.y + 3.0));
-        p.rect_filled(r, 1.0, TOKENS.accent);
+        p.rect_filled(r, crate::theme::RADIUS_SM, TOKENS.accent);
         out.push(GroupLink { folder: g.id.0, members, rect: r4(r) });
     }
     out
@@ -885,11 +885,11 @@ fn group_links(ui: &Ui, s: &Session, channels: &[&Track], lane: Rect, area: Rect
 /// The main-out strip when the session has no master track: the main meter and an offer.
 fn main_out(app: &mut StudioApp, ui: &mut Ui, r: Rect) -> (StripLayout, R4) {
     let p = ui.painter();
-    p.rect_filled(r, 3.0, TOKENS.panel);
+    p.rect_filled(r, crate::theme::RADIUS, TOKENS.panel);
     p.text(pos2(r.center().x, r.min.y + 12.0), Align2::CENTER_CENTER, "Main", FontId::proportional(12.0), TOKENS.text);
     let add = Rect::from_min_size(pos2(r.min.x + 6.0, r.min.y + 28.0), vec2(r.width() - 12.0, 34.0));
     let resp = ui.interact(add, ui.id().with("add_master"), Sense::click());
-    p.rect_filled(add, 3.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+    p.rect_filled(add, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
     p.text(add.center(), Align2::CENTER_CENTER, "+ Master\nfader", FontId::proportional(10.5), TOKENS.text);
     if resp.clicked() {
         let _ = app.run("track.new", json!({"kind": "master"}));
@@ -899,7 +899,7 @@ fn main_out(app: &mut StudioApp, ui: &mut Ui, r: Rect) -> (StripLayout, R4) {
     let peak_r = Rect::from_min_max(pos2(r.min.x + 6.0, r.min.y + 63.0), pos2(r.max.x - 6.0, r.min.y + 75.0));
     let (text, over) = peak_text(app.main_meter.peak);
     let resp = ui.interact(peak_r, ui.id().with("main_peak"), Sense::click());
-    p.rect_filled(peak_r, 2.0, TOKENS.bg);
+    p.rect_filled(peak_r, crate::theme::RADIUS_SM, TOKENS.bg);
     let color = if over || app.main_meter.clip { TOKENS.record } else { TOKENS.text_dim };
     p.text(peak_r.center(), Align2::CENTER_CENTER, &text, FontId::proportional(10.0), color);
     let on_meter = ui.interact(meter, ui.id().with("main_meter_click"), Sense::click());
@@ -924,7 +924,7 @@ fn main_out(app: &mut StudioApp, ui: &mut Ui, r: Rect) -> (StripLayout, R4) {
 }
 
 fn draw_meter(p: &egui::Painter, r: Rect, level: [f32; 2], clip: bool) {
-    p.rect_filled(r, 1.0, TOKENS.bg);
+    p.rect_filled(r, crate::theme::RADIUS_SM, TOKENS.bg);
     let w = (r.width() - 3.0) / 2.0;
     for (c, lvl) in level.iter().enumerate() {
         let x = r.min.x + 1.0 + c as f32 * (w + 1.0);
@@ -991,7 +991,7 @@ fn small_button(ui: &mut Ui, clip: Rect, r: Rect, id: egui::Id, label: &str, on:
     } else {
         TOKENS.button
     };
-    p.rect_filled(r, 2.0, fill);
+    p.rect_filled(r, crate::theme::RADIUS_SM, fill);
     let fg = if on {
         theme::text_on(color)
     } else if enabled {
@@ -1008,7 +1008,7 @@ fn small_button(ui: &mut Ui, clip: Rect, r: Rect, id: egui::Id, label: &str, on:
 fn dropdown(ui: &mut Ui, clip: Rect, r: Rect, id: egui::Id, current: &str, choices: &[(String, String)], menu: &mut Vec<MenuItem>) -> Option<String> {
     let resp = ui.interact(r.intersect(clip), id, Sense::click());
     let p = ui.painter().with_clip_rect(clip);
-    p.rect_filled(r, 2.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.bg });
+    p.rect_filled(r, crate::theme::RADIUS_SM, if resp.hovered() { TOKENS.button_hover } else { TOKENS.bg });
     let text_r = r.shrink2(vec2(4.0, 0.0));
     p.with_clip_rect(text_r.intersect(clip)).text(text_r.left_center(), Align2::LEFT_CENTER, current, FontId::proportional(10.5), TOKENS.text);
     crate::icons::paint(&p, pos2(r.max.x - 7.0, r.center().y), crate::icons::Icon::ChevronDown, 10.0, TOKENS.text_dim);
@@ -1092,7 +1092,7 @@ pub(crate) fn send_row(
         other => route_label(s, other, false, 0),
     };
     let mut row = SendRow { slot, target: target.clone(), level_db: snd.level_db, pre_fader: snd.pre_fader, rect: r4(r), ..SendRow::default() };
-    p.rect_filled(r, 2.0, TOKENS.bg);
+    p.rect_filled(r, crate::theme::RADIUS_SM, TOKENS.bg);
     // The level as a thin line along the bottom, so the row reads as a small fader.
     let k = db_to_k(snd.level_db);
     p.rect_filled(
@@ -1117,7 +1117,7 @@ pub(crate) fn send_row(
     let th = above(tr);
     let resp = ui.interact(th.intersect(clip), ui.id().with(("send_target", salt)), Sense::click());
     if resp.hovered() {
-        p.rect_filled(th, 2.0, TOKENS.button_hover);
+        p.rect_filled(th, crate::theme::RADIUS_SM, TOKENS.button_hover);
     }
     let text_r = tr.shrink2(vec2(4.0, 0.0));
     p.with_clip_rect(text_r.intersect(clip)).text(text_r.left_center(), Align2::LEFT_CENTER, &target, FontId::proportional(10.5), TOKENS.text);
@@ -1157,7 +1157,7 @@ pub(crate) fn send_row(
     // Pre/Post (device chain).
     if wide {
         let resp = ui.interact(pr.intersect(clip), ui.id().with(("send_pre", salt)), Sense::click());
-        p.rect_filled(pr, 2.0, if snd.pre_fader || resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+        p.rect_filled(pr, crate::theme::RADIUS_SM, if snd.pre_fader || resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
         p.text(
             pr.center(),
             Align2::CENTER_CENTER,
@@ -1226,7 +1226,7 @@ pub(crate) fn add_send_row(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Tr
     let resp = ui.interact(r.intersect(clip), ui.id().with(("add_send", t.id.0, r.min.x as i32)), Sense::click());
     let p = ui.painter().with_clip_rect(clip);
     if resp.hovered() {
-        p.rect_filled(r, 2.0, TOKENS.button_hover);
+        p.rect_filled(r, crate::theme::RADIUS_SM, TOKENS.button_hover);
     }
     p.text(pos2(r.min.x + 4.0, r.center().y), Align2::LEFT_CENTER, "+ Send", FontId::proportional(10.5), TOKENS.text_dim);
     let mut choices = send_targets(s, t, None);
@@ -1321,7 +1321,7 @@ fn inserts_block(
         let rr = row_r(i);
         let name = app.plugin_name(&ins.plugin, false);
         let resp = ui.interact(rr.intersect(clip), ui.id().with(("insert", id.0, *slot)), Sense::click());
-        p.rect_filled(rr, 2.0, if resp.hovered() { TOKENS.button_hover } else { TOKENS.bg });
+        p.rect_filled(rr, crate::theme::RADIUS_SM, if resp.hovered() { TOKENS.button_hover } else { TOKENS.bg });
         let text_r = rr.shrink2(vec2(4.0, 0.0));
         p.with_clip_rect(text_r.intersect(clip)).text(
             text_r.left_center(),
@@ -1377,7 +1377,7 @@ fn inserts_block(
         let rr = row_r(rows - 1);
         let resp = ui.interact(rr.intersect(clip), ui.id().with(("add_insert", id.0)), Sense::click());
         if resp.hovered() {
-            p.rect_filled(rr, 2.0, TOKENS.button_hover);
+            p.rect_filled(rr, crate::theme::RADIUS_SM, TOKENS.button_hover);
         }
         crate::icons::paint(&p, pos2(rr.min.x + 9.0, rr.center().y), crate::icons::Icon::Plus, 12.0, TOKENS.text_dim);
         let resp = resp.on_hover_text("Add an effect to this track");
@@ -1406,7 +1406,7 @@ fn strip(
     let id = t.id;
     let m = &t.mixer;
     let p = ui.painter().with_clip_rect(clip);
-    p.rect_filled(r, 3.0, if focused { TOKENS.header_selected } else { TOKENS.panel });
+    p.rect_filled(r, crate::theme::RADIUS, if focused { TOKENS.header_selected } else { TOKENS.panel });
     let mut sl = StripLayout {
         track: id.0,
         name: t.name.clone(),
@@ -1425,12 +1425,12 @@ fn strip(
     let w = r.width() - 8.0;
     // Name and color: click focuses the track.
     let name_r = Rect::from_min_size(pos2(r.min.x, r.min.y), vec2(r.width(), 22.0));
-    p.rect_filled(Rect::from_min_size(name_r.min, vec2(r.width(), 4.0)), egui::CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 }, theme::rgb(t.color));
+    p.rect_filled(Rect::from_min_size(name_r.min, vec2(r.width(), 4.0)), crate::theme::top_corners(), theme::rgb(t.color));
     let mut tr = name_r.shrink2(vec2(5.0, 0.0));
     if sl.fx {
         // FX channels: a small "FX" tag and a muted name.
         let tag = Rect::from_min_size(pos2(tr.max.x - 18.0, tr.center().y - 5.0), vec2(18.0, 13.0));
-        p.rect_filled(tag, 2.0, TOKENS.button);
+        p.rect_filled(tag, crate::theme::RADIUS_SM, TOKENS.button);
         p.text(tag.center(), Align2::CENTER_CENTER, "FX", FontId::proportional(9.5), TOKENS.text_dim);
         tr.max.x = tag.min.x - 3.0;
     }
@@ -1576,7 +1576,7 @@ fn strip(
     let (peak_text, over) = peak_text(held);
     let over = over || app.meters.get(&id).is_some_and(|d| d.clip);
     let resp = ui.interact(peak_r.intersect(clip), ui.id().with(("peak", id.0)), Sense::click());
-    p.rect_filled(peak_r, 2.0, TOKENS.bg);
+    p.rect_filled(peak_r, crate::theme::RADIUS_SM, TOKENS.bg);
     p.with_clip_rect(peak_r).text(
         peak_r.center(),
         Align2::CENTER_CENTER,
@@ -1614,7 +1614,7 @@ fn strip(
     let db = m.volume_db;
     let text = fine::db_text(db);
     let ro = Rect::from_min_max(pos2(x0, bottom), pos2(r.max.x - 4.0, r.max.y - 4.0));
-    p.rect_filled(ro, 2.0, TOKENS.bg);
+    p.rect_filled(ro, crate::theme::RADIUS_SM, TOKENS.bg);
     let fader_id = Target::Fader(id);
     let hot = app.mixer.gesture.is_some_and(|g| g.target == fader_id);
     readout(
@@ -1681,7 +1681,7 @@ fn fader_widget(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, clip: Rect,
     let resp = ui.interact(r.expand2(vec2(4.0, 6.0)).intersect(clip), ui.id().with(("fader", id.0)), Sense::click_and_drag());
     // Track and marks: a line across the track at 0 dB, fainter ticks at -6, -12 and -24.
     let groove = Rect::from_center_size(r.center(), vec2(4.0, r.height()));
-    p.rect_filled(groove, 2.0, TOKENS.bg);
+    p.rect_filled(groove, crate::theme::RADIUS_SM, TOKENS.bg);
     let y_of = |k: f32| r.max.y - k * r.height();
     for mark in fine::DB_MARKS {
         let yy = y_of(db_to_k(mark));
@@ -1694,7 +1694,7 @@ fn fader_widget(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, clip: Rect,
     let k = db_to_k(db);
     let cap = Rect::from_center_size(pos2(r.center().x, y_of(k)), vec2(r.width().min(26.0), 12.0));
     let hot = resp.hovered() || app.mixer.gesture.is_some_and(|g| g.target == me);
-    p.rect_filled(cap, 2.0, if hot { TOKENS.accent } else { TOKENS.text_dim });
+    p.rect_filled(cap, crate::theme::RADIUS_SM, if hot { TOKENS.accent } else { TOKENS.text_dim });
     if resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
     }
