@@ -201,6 +201,8 @@ impl IAudioProcessorTrait for GainProcessor {
                         self.gain.store(v.to_bits(), Ordering::Relaxed);
                     } else if id == 12 {
                         LAST_FREQ.store(v.to_bits(), Ordering::Relaxed);
+                    } else if id == FINE {
+                        LAST_FINE.store(v.to_bits(), Ordering::Relaxed);
                     }
                 }
             }
@@ -213,7 +215,16 @@ impl IAudioProcessorTrait for GainProcessor {
         let (ins, outs) = unsafe { (channels(&*d.inputs, frames), channels(&*d.outputs, frames)) };
         for (c, (i, o)) in ins.iter().zip(outs).enumerate() {
             if probes && c == 1 {
-                o.fill(f64::from_bits(LAST_FREQ.load(Ordering::Relaxed)) as f32);
+                if many() > 0 {
+                    // See `many`: controller calls so far, then the last Fine point.
+                    o.fill(0.0);
+                    if let [a, b, ..] = o {
+                        *a = CTRL_CALLS.load(Ordering::Relaxed) as f32;
+                        *b = f64::from_bits(LAST_FINE.load(Ordering::Relaxed)) as f32;
+                    }
+                } else {
+                    o.fill(f64::from_bits(LAST_FREQ.load(Ordering::Relaxed)) as f32);
+                }
                 continue;
             }
             for (x, y) in i.iter().zip(o.iter_mut()) {
@@ -322,6 +333,38 @@ const GAIN_PARAMS: [(u32, &str, &str, i32, f64, i32); 5] = [
     (12, "Freq", "Hz", 0, 0.5, 0),
 ];
 
+/// With `VST3_FIXTURE_PARAMS=N` (N > 0), Gain's controller also exposes N continuous parameters
+/// (ids 1000.., plain `1 + 9 n²`) and "Fine" (id 2000, 300 steps, plain = step index), and its
+/// processor reports the number of edit-controller calls made so far and the last Fine value it
+/// received (normalized) in the first two samples of the second output channel. For the
+/// large-plug-in tests of the host's lazy curve sampling.
+fn many() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VST3_FIXTURE_PARAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// Parameter `index` of Gain's controller: (id, title, units, stepCount, default, flags).
+fn gain_param(index: usize) -> Option<(u32, String, &'static str, i32, f64, i32)> {
+    if let Some(&(id, title, units, steps, def, flags)) = GAIN_PARAMS.get(index) {
+        return Some((id, title.to_string(), units, steps, def, flags));
+    }
+    let k = index - GAIN_PARAMS.len();
+    let automate = ParameterInfo_::ParameterFlags_::kCanAutomate;
+    match k.cmp(&many()) {
+        std::cmp::Ordering::Less => Some((1000 + k as u32, format!("Extra {k}"), "", 0, 0.5, automate)),
+        std::cmp::Ordering::Equal if many() > 0 => Some((FINE, "Fine".to_string(), "", FINE_STEPS, 0.5, automate)),
+        _ => None,
+    }
+}
+
+/// The 300-step parameter.
+const FINE: u32 = 2000;
+const FINE_STEPS: i32 = 300;
+static FINE_VALUE: AtomicU64 = AtomicU64::new(0);
+static LAST_FINE: AtomicU64 = AtomicU64::new(0);
+/// Edit-controller calls made so far (any thread).
+static CTRL_CALLS: AtomicU64 = AtomicU64::new(0);
+
 /// Gain's normalized → plain conversion (Freq follows the current shape).
 fn gain_to_plain(id: u32, n: f64) -> f64 {
     match id {
@@ -329,6 +372,8 @@ fn gain_to_plain(id: u32, n: f64) -> f64 {
         3 => (n * 2.0).round(),
         12 if FREQ_SQUARE.load(Ordering::SeqCst) => 20.0 + 19_980.0 * n * n,
         12 => 20.0 * 1000f64.powf(n),
+        FINE => (n * f64::from(FINE_STEPS)).round(),
+        1000..FINE => 1.0 + 9.0 * n * n,
         _ => n,
     }
 }
@@ -340,6 +385,8 @@ fn gain_to_normalized(id: u32, v: f64) -> f64 {
         3 => v / 2.0,
         12 if FREQ_SQUARE.load(Ordering::SeqCst) => ((v - 20.0) / 19_980.0).max(0.0).sqrt(),
         12 => (v / 20.0).ln() / 1000f64.ln(),
+        FINE => v / f64::from(FINE_STEPS),
+        1000..FINE => ((v - 1.0) / 9.0).max(0.0).sqrt(),
         _ => v,
     }
 }
@@ -374,15 +421,15 @@ impl IEditControllerTrait for GainController {
     }
     unsafe fn getParameterCount(&self) -> i32 {
         ctrl_call("getParameterCount");
-        GAIN_PARAMS.len() as i32
+        (GAIN_PARAMS.len() + if many() > 0 { many() + 1 } else { 0 }) as i32
     }
     unsafe fn getParameterInfo(&self, index: i32, info: *mut ParameterInfo) -> tresult {
         ctrl_call("getParameterInfo");
-        let Some(&(id, title, units, steps, def, flags)) = GAIN_PARAMS.get(index as usize) else { return kInvalidArgument };
+        let Some((id, title, units, steps, def, flags)) = gain_param(index as usize) else { return kInvalidArgument };
         let i = unsafe { &mut *info };
         i.id = id;
-        copy_c16(title, &mut i.title);
-        copy_c16(title, &mut i.shortTitle);
+        copy_c16(&title, &mut i.title);
+        copy_c16(&title, &mut i.shortTitle);
         copy_c16(units, &mut i.units);
         i.stepCount = steps;
         i.defaultNormalizedValue = def;
@@ -417,6 +464,7 @@ impl IEditControllerTrait for GainController {
         match id {
             7 => f64::from_bits(self.gain.load(Ordering::Relaxed)),
             12 => f64::from_bits(self.freq.load(Ordering::Relaxed)),
+            FINE => f64::from_bits(FINE_VALUE.load(Ordering::Relaxed)),
             _ => 0.0,
         }
     }
@@ -429,6 +477,8 @@ impl IEditControllerTrait for GainController {
             self.gain.store(v.to_bits(), Ordering::Relaxed);
         } else if id == 12 {
             self.freq.store(v.to_bits(), Ordering::Relaxed);
+        } else if id == FINE {
+            FINE_VALUE.store(v.to_bits(), Ordering::Relaxed);
         }
         kResultOk
     }
@@ -793,6 +843,7 @@ fn note_process_thread() {
 }
 
 fn ctrl_call(what: &str) {
+    CTRL_CALLS.fetch_add(1, Ordering::Relaxed);
     if probes() {
         let me = os_thread();
         if PROCESS_THREADS.iter().any(|t| t.load(Ordering::SeqCst) == me) {
@@ -854,9 +905,15 @@ impl Drop for Live {
     }
 }
 
-/// Ends the process at once with status 3 (no crash report: one test expects this).
+/// The first violation any thread reported: later ones (a second thread, a drop-time call) must
+/// not hide it.
+static FIRST_VIOLATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Ends the process at once with status 3 (no crash report: one test expects this), naming the
+/// first violation.
 fn violation(what: &str) -> ! {
-    eprintln!("vst3-fixture: host contract violation: {what}");
+    let first = FIRST_VIOLATION.get_or_init(|| what.to_string());
+    eprintln!("vst3-fixture: host contract violation: {first}");
     unsafe { _exit(3) }
 }
 

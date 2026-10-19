@@ -316,7 +316,19 @@ fn param_info(inst: &Instance, p: &RawParam) -> ParamInfo {
             ..base
         };
     }
-    // Continuous (or too many steps for a menu): plain range from the controller.
+    if p.step_count > MAX_CHOICES {
+        // Too many steps for a menu, but still stepped: the host value is the step index (exact
+        // up to f32's 2^24 integers), see `Mapping::Stepped`. The cap is the UI's, not the
+        // conversion's.
+        let steps = f64::from(p.step_count);
+        return ParamInfo {
+            max: p.step_count as f32,
+            default: (p.default_normalized * steps).round() as f32,
+            unit: unit_from_label(&p.units),
+            ..base
+        };
+    }
+    // Continuous: plain range from the controller.
     let unit = unit_from_label(&p.units);
     match (inst.to_plain(p.id, 0.0), inst.to_plain(p.id, 1.0)) {
         (Some(lo), Some(hi)) if hi > lo && (lo as f32).is_finite() && (hi as f32).is_finite() && (hi as f32) > (lo as f32) => {

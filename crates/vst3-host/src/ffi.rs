@@ -606,9 +606,13 @@ pub(crate) fn hex(cid: &[u8; 16]) -> String {
 pub(crate) struct HostContext {
     pub latency_changed: AtomicBool,
     pub restart_requested: AtomicBool,
-    /// `restartComponent` reported changed parameter values or infos: the editor handle re-samples
-    /// the conversion curves on the UI thread (`Vst3Editor::idle`).
-    pub params_changed: AtomicBool,
+    /// `restartComponent` carried `kParamTitlesChanged` (curve shapes can change): the editor handle
+    /// re-samples the conversion curves on the UI thread (`Vst3Editor::idle`).
+    pub titles_changed: AtomicBool,
+    /// `restartComponent` carried `kParamValuesChanged` (values changed, curves did not; many
+    /// plug-ins send it on every preset load): the host re-reads the values (audit F08), and the
+    /// curves stay.
+    pub values_changed: AtomicBool,
     /// `performEdit` values (normalized), bounded by `EDIT_CAP`.
     pub edits: Mutex<Vec<(u32, f64)>>,
 }
@@ -618,7 +622,8 @@ impl Default for HostContext {
         HostContext {
             latency_changed: AtomicBool::new(false),
             restart_requested: AtomicBool::new(false),
-            params_changed: AtomicBool::new(false),
+            titles_changed: AtomicBool::new(false),
+            values_changed: AtomicBool::new(false),
             edits: Mutex::new(Vec::with_capacity(EDIT_CAP)),
         }
     }
@@ -683,9 +688,11 @@ impl IComponentHandlerTrait for HostContext {
         if flags as u32 & sv::RestartFlags_::kLatencyChanged as u32 != 0 {
             self.latency_changed.store(true, Ordering::Relaxed);
         }
-        let params = sv::RestartFlags_::kParamValuesChanged as u32 | sv::RestartFlags_::kParamTitlesChanged as u32;
-        if flags as u32 & params != 0 {
-            self.params_changed.store(true, Ordering::Relaxed);
+        if flags as u32 & sv::RestartFlags_::kParamTitlesChanged as u32 != 0 {
+            self.titles_changed.store(true, Ordering::Relaxed);
+        }
+        if flags as u32 & sv::RestartFlags_::kParamValuesChanged as u32 != 0 {
+            self.values_changed.store(true, Ordering::Relaxed);
         }
         self.restart_requested.store(true, Ordering::Relaxed);
         sb::kResultOk
@@ -2281,13 +2288,14 @@ mod tests {
         }
         assert_eq!(read_c16(&name), "SoundCraft");
         assert!(h.latency_changed.load(Ordering::Relaxed));
-        assert!(!h.params_changed.load(Ordering::Relaxed), "latency alone leaves the curves");
-        for flag in [sv::RestartFlags_::kParamValuesChanged, sv::RestartFlags_::kParamTitlesChanged] {
-            h.params_changed.store(false, Ordering::Relaxed);
-            // SAFETY: as above.
-            assert_eq!(unsafe { h.restartComponent(flag as i32) }, sb::kResultOk);
-            assert!(h.params_changed.load(Ordering::Relaxed), "{flag}");
-        }
+        assert!(!h.titles_changed.load(Ordering::Relaxed) && !h.values_changed.load(Ordering::Relaxed), "latency alone leaves both");
+        // SAFETY: as above.
+        assert_eq!(unsafe { h.restartComponent(sv::RestartFlags_::kParamValuesChanged as i32) }, sb::kResultOk);
+        assert!(h.values_changed.load(Ordering::Relaxed), "values flag recorded");
+        assert!(!h.titles_changed.load(Ordering::Relaxed), "values alone leave the curves");
+        // SAFETY: as above.
+        assert_eq!(unsafe { h.restartComponent(sv::RestartFlags_::kParamTitlesChanged as i32) }, sb::kResultOk);
+        assert!(h.titles_changed.load(Ordering::Relaxed), "titles re-sample the curves");
         assert_eq!(hex(&[0xAB; 16]), "AB".repeat(16));
     }
 }

@@ -5,30 +5,56 @@
 //! `plainParamToNormalized`, `getParamStringByValue`) on the UI thread only, while
 //! `Plugin::set_param` runs on the audio thread (automation is evaluated per block). So the
 //! controller's curve of every plain-mapped parameter is sampled on the UI thread into
-//! [`ParamCurves`] (at creation, and again when the plugin signals `restartComponent` with
-//! `kParamValuesChanged` or `kParamTitlesChanged`), and the audio thread converts by interpolating
-//! those samples: no controller call, no lock, no allocation. Converted values wait in
-//! [`PendingParams`] for the next `process`, which hands them over as `IParameterChanges`.
+//! [`ParamCurves`], and the audio thread converts by interpolating those samples: no controller
+//! call, no lock, no allocation. Converted values wait in [`PendingParams`] for the next
+//! `process`, which hands them over as `IParameterChanges`.
+//!
+//! Sampling is lazy and budgeted ([`ParamCurves::step`], from the editor handle's idle): a plug-in
+//! with thousands of parameters must not stall creation, so no curve is sampled up front. A curve
+//! the audio thread needs before it exists is converted linearly for that block and flagged for
+//! priority sampling; the generation bump that ends the sampling makes `process` convert again.
+//! A plug-in that changes its curves (`kParamTitlesChanged`) has them all re-sampled the same way,
+//! keeping each old curve in use until its replacement is in.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// Samples per plain-mapped curve (normalized steps of 1/256). The inverse is piecewise linear, so
 /// its error in normalized units is at most `h² / 8 · max|f''/f'|` (h = 1/256): about 1.3e-5 for
 /// a 20 Hz–20 kHz exponential curve. 1 KB per plain-mapped parameter.
 pub(crate) const CURVE_POINTS: usize = 257;
 
+/// No curve sampled yet (conversions fall back to linear).
+const UNSAMPLED: u8 = 0;
+/// A finite curve.
+const VALID: u8 = 1;
+/// Sampled, but the controller gave no finite curve (conversions fall back to linear).
+const INVALID: u8 = 2;
+
 /// The sampled normalized → plain curves of the plain-mapped parameters. Written on the UI thread
-/// by [`ParamCurves::refresh`], read on the audio thread; every sample is an atomic, so a reader
-/// racing a refresh sees a mix of old and new samples for at most that one conversion, and the
-/// [`generation`](ParamCurves::generation) bump that ends the refresh tells it to convert again.
+/// by [`ParamCurves::step`], read on the audio thread; every sample is an atomic, so a reader
+/// racing a re-sampling sees a mix of old and new samples for one call, corrected by the
+/// generation re-send next block (the [`generation`](ParamCurves::generation) bump that ends the
+/// sampling tells the audio thread to convert again).
 pub(crate) struct ParamCurves {
     /// Table index of each parameter (same order as the plugin's ids); `None` when the parameter
     /// is not plain-mapped.
     slot: Vec<Option<usize>>,
     /// VST3 id of each table.
     ids: Vec<u32>,
-    /// Whether each table holds a finite curve (else conversions fall back to linear).
-    valid: Vec<AtomicBool>,
+    /// `UNSAMPLED`, `VALID` or `INVALID` per table.
+    state: Vec<AtomicU8>,
+    /// Tables that need (re-)sampling.
+    todo: Vec<AtomicBool>,
+    /// Tables the audio thread needed before they were sampled: sampled first.
+    want: Vec<AtomicBool>,
+    want_any: AtomicBool,
+    /// Number of `todo` tables.
+    pending: AtomicUsize,
+    /// Number of tables that left `UNSAMPLED`.
+    sampled: AtomicUsize,
+    /// Where the next background pass starts (UI thread only).
+    cursor: AtomicUsize,
     /// `CURVE_POINTS` plain values (f32 bits) per table: sample `k` is the plain value at
     /// normalized `k / (CURVE_POINTS - 1)`.
     plain: Vec<AtomicU32>,
@@ -36,8 +62,8 @@ pub(crate) struct ParamCurves {
 }
 
 impl ParamCurves {
-    /// Empty tables for the parameters `plain` marks (same order as `ids`). Call
-    /// [`ParamCurves::refresh`] to fill them.
+    /// Empty tables for the parameters `plain` marks (same order as `ids`). Nothing is sampled
+    /// until [`ParamCurves::step`] runs.
     pub fn new(ids: &[u32], plain: &[bool]) -> ParamCurves {
         let mut slot = Vec::with_capacity(ids.len());
         let mut table_ids = Vec::new();
@@ -52,47 +78,133 @@ impl ParamCurves {
         ParamCurves {
             slot,
             ids: table_ids,
-            valid: (0..tables).map(|_| AtomicBool::new(false)).collect(),
+            state: (0..tables).map(|_| AtomicU8::new(UNSAMPLED)).collect(),
+            todo: (0..tables).map(|_| AtomicBool::new(true)).collect(),
+            want: (0..tables).map(|_| AtomicBool::new(false)).collect(),
+            want_any: AtomicBool::new(false),
+            pending: AtomicUsize::new(tables),
+            sampled: AtomicUsize::new(0),
+            cursor: AtomicUsize::new(0),
             plain: (0..tables * CURVE_POINTS).map(|_| AtomicU32::new(0)).collect(),
             generation: AtomicU64::new(0),
         }
     }
 
-    /// Re-samples every curve through `to_plain` (the controller's `normalizedParamToPlain`, so UI
-    /// thread only), then bumps the generation.
-    pub fn refresh(&self, to_plain: impl Fn(u32, f64) -> Option<f64>) {
-        for (t, &id) in self.ids.iter().enumerate() {
-            let mut ok = true;
-            for k in 0..CURVE_POINTS {
-                let n = k as f64 / (CURVE_POINTS - 1) as f64;
-                let v = to_plain(id, n).map(|v| v as f32).filter(|v| v.is_finite());
-                ok &= v.is_some();
-                if let Some(cell) = self.plain.get(t * CURVE_POINTS + k) {
-                    cell.store(v.unwrap_or(0.0).to_bits(), Ordering::Relaxed);
-                }
-            }
-            if let Some(f) = self.valid.get(t) {
-                f.store(ok, Ordering::Relaxed);
-            }
-        }
-        self.generation.fetch_add(1, Ordering::Release);
+    /// Number of curves sampled at least once.
+    pub fn curves_sampled(&self) -> usize {
+        self.sampled.load(Ordering::Relaxed)
     }
 
-    /// Changes each time [`ParamCurves::refresh`] completes.
+    /// Number of plain-mapped parameters (curves to sample).
+    pub fn curves_total(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Marks every curve for re-sampling (the plug-in changed its curves). Each old curve stays in
+    /// use until [`ParamCurves::step`] replaces it.
+    pub fn invalidate(&self) {
+        for f in &self.todo {
+            if !f.swap(true, Ordering::Relaxed) {
+                self.pending.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.cursor.store(0, Ordering::Relaxed);
+    }
+
+    /// Samples curves through `to_plain` (the controller's `normalizedParamToPlain`, so UI thread
+    /// only): first those the audio thread asked for, then the others from a rotating cursor,
+    /// stopping after `max_tables` curves or once `max_time` has passed (always at least one when
+    /// any is due, so progress never stalls). Bumps the generation when it sampled anything and
+    /// returns how many curves it sampled.
+    pub fn step(&self, max_tables: usize, max_time: Duration, to_plain: impl Fn(u32, f64) -> Option<f64>) -> usize {
+        let start = Instant::now();
+        let mut done = 0usize;
+        let spent = |done: usize| done >= max_tables.max(1) || (done > 0 && start.elapsed() >= max_time);
+        let tables = self.ids.len();
+        if self.want_any.swap(false, Ordering::Relaxed) {
+            for t in 0..tables {
+                if !self.want.get(t).is_some_and(|w| w.load(Ordering::Relaxed)) {
+                    continue;
+                }
+                if spent(done) {
+                    self.want_any.store(true, Ordering::Relaxed);
+                    break;
+                }
+                self.sample_table(t, &to_plain);
+                done += 1;
+            }
+        }
+        if self.pending.load(Ordering::Relaxed) > 0 && tables > 0 {
+            let first = self.cursor.load(Ordering::Relaxed) % tables;
+            for k in 0..tables {
+                let t = (first + k) % tables;
+                if !self.todo.get(t).is_some_and(|f| f.load(Ordering::Relaxed)) {
+                    continue;
+                }
+                if spent(done) {
+                    self.cursor.store(t, Ordering::Relaxed);
+                    break;
+                }
+                self.sample_table(t, &to_plain);
+                done += 1;
+            }
+        }
+        if done > 0 {
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+        done
+    }
+
+    fn sample_table(&self, t: usize, to_plain: &impl Fn(u32, f64) -> Option<f64>) {
+        let Some(&id) = self.ids.get(t) else { return };
+        let mut ok = true;
+        for k in 0..CURVE_POINTS {
+            let n = k as f64 / (CURVE_POINTS - 1) as f64;
+            let v = to_plain(id, n).map(|v| v as f32).filter(|v| v.is_finite());
+            ok &= v.is_some();
+            if let Some(cell) = self.plain.get(t * CURVE_POINTS + k) {
+                cell.store(v.unwrap_or(0.0).to_bits(), Ordering::Relaxed);
+            }
+        }
+        if let Some(s) = self.state.get(t)
+            && s.swap(if ok { VALID } else { INVALID }, Ordering::Release) == UNSAMPLED
+        {
+            self.sampled.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(f) = self.todo.get(t)
+            && f.swap(false, Ordering::Relaxed)
+        {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+        }
+        if let Some(w) = self.want.get(t) {
+            w.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Changes each time [`ParamCurves::step`] sampled something.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// The samples of parameter `i`'s curve, when it has a valid one.
+    /// The samples of parameter `i`'s curve, when it has a valid one. An unsampled curve is
+    /// flagged for priority sampling.
     fn table(&self, i: usize) -> Option<&[AtomicU32]> {
         let t = (*self.slot.get(i)?)?;
-        if !self.valid.get(t)?.load(Ordering::Relaxed) {
-            return None;
+        match self.state.get(t)?.load(Ordering::Acquire) {
+            VALID => self.plain.get(t * CURVE_POINTS..(t + 1) * CURVE_POINTS),
+            UNSAMPLED => {
+                if let Some(w) = self.want.get(t) {
+                    w.store(true, Ordering::Relaxed);
+                    self.want_any.store(true, Ordering::Relaxed);
+                }
+                None
+            }
+            _ => None,
         }
-        self.plain.get(t * CURVE_POINTS..(t + 1) * CURVE_POINTS)
     }
 
     /// Normalized → plain for parameter `i` (`None` without a valid curve).
+    #[cfg(test)]
     pub fn to_plain(&self, i: usize, n: f64) -> Option<f64> {
         let table = self.table(i)?;
         let at = |k: usize| table.get(k).map_or(0.0, |c| f64::from(f32::from_bits(c.load(Ordering::Relaxed))));
@@ -193,6 +305,11 @@ impl PendingParams {
 mod tests {
     use super::*;
 
+    /// Samples every curve at once.
+    fn full(c: &ParamCurves, f: impl Fn(u32, f64) -> Option<f64>) {
+        c.step(usize::MAX, Duration::MAX, f);
+    }
+
     fn exp_curve(_id: u32, n: f64) -> Option<f64> {
         Some(20.0 * 1000f64.powf(n))
     }
@@ -200,9 +317,9 @@ mod tests {
     #[test]
     fn curves_match_the_controller_within_1e_4() {
         let c = ParamCurves::new(&[5, 12, 7], &[false, true, true]);
-        assert_eq!(c.to_normalized(1, 100.0), None, "empty until refreshed");
+        assert_eq!(c.to_normalized(1, 100.0), None, "empty until sampled");
         let g = c.generation();
-        c.refresh(|id, n| match id {
+        full(&c, |id, n| match id {
             12 => exp_curve(id, n),
             7 => Some(2.0 - 2.0 * n),
             _ => None,
@@ -229,10 +346,71 @@ mod tests {
     #[test]
     fn a_curve_with_holes_falls_back() {
         let c = ParamCurves::new(&[1], &[true]);
-        c.refresh(|_, n| (n < 0.5).then_some(n));
+        full(&c, |_, n| (n < 0.5).then_some(n));
         assert_eq!(c.to_plain(0, 0.25), None);
-        c.refresh(|_, n| Some(n));
-        assert!((c.to_plain(0, 0.25).unwrap() - 0.25).abs() < 1e-6, "a later refresh restores it");
+        c.invalidate();
+        full(&c, |_, n| Some(n));
+        assert!((c.to_plain(0, 0.25).unwrap() - 0.25).abs() < 1e-6, "a later sampling restores it");
+    }
+
+    #[test]
+    fn sampling_is_lazy_and_budgeted_per_step() {
+        let ids: Vec<u32> = (0..300).collect();
+        let c = ParamCurves::new(&ids, &vec![true; ids.len()]);
+        let calls = std::cell::Cell::new(0usize);
+        let f = |_: u32, n: f64| {
+            calls.set(calls.get() + 1);
+            Some(n)
+        };
+        assert_eq!((c.curves_sampled(), c.curves_total(), calls.get()), (0, 300, 0), "creation samples nothing");
+        let mut frames = 0;
+        while c.curves_sampled() < c.curves_total() {
+            let before = calls.get();
+            let n = c.step(64, Duration::MAX, f);
+            assert_eq!(calls.get() - before, n * CURVE_POINTS);
+            assert!(calls.get() - before <= 64 * CURVE_POINTS, "a frame samples at most 64 curves");
+            frames += 1;
+            assert!(frames <= 5);
+        }
+        assert_eq!((frames, calls.get()), (5, 300 * CURVE_POINTS));
+        assert_eq!(c.step(64, Duration::MAX, f), 0, "nothing left to do");
+    }
+
+    #[test]
+    fn a_time_budget_still_makes_progress() {
+        let c = ParamCurves::new(&[1, 2, 3], &[true; 3]);
+        assert_eq!(c.step(64, Duration::ZERO, |_, n| Some(n)), 1, "one curve per step at least");
+        assert_eq!(c.curves_sampled(), 1);
+    }
+
+    #[test]
+    fn the_audio_thread_falls_back_and_asks_for_priority_sampling() {
+        let ids: Vec<u32> = (0..200).collect();
+        let c = ParamCurves::new(&ids, &vec![true; ids.len()]);
+        let g = c.generation();
+        assert_eq!(c.to_plain(190, 0.5), None, "unsampled: the caller converts linearly this block");
+        assert_eq!(c.to_normalized(7, 1.0), None);
+        assert_eq!(c.step(2, Duration::MAX, |_, n| Some(2.0 * n)), 2);
+        assert_eq!(c.curves_sampled(), 2);
+        assert!(c.to_plain(190, 0.5).is_some() && c.to_plain(7, 0.5).is_some(), "the touched curves went first");
+        assert!(c.to_plain(0, 0.5).is_none(), "the cursor pass has not reached 0 yet");
+        assert_ne!(c.generation(), g, "the generation bump re-sends the value");
+    }
+
+    #[test]
+    fn invalidate_keeps_the_old_curve_until_its_replacement_is_in() {
+        let c = ParamCurves::new(&[1, 2], &[true; 2]);
+        full(&c, |_, n| Some(n));
+        let g = c.generation();
+        c.invalidate();
+        assert!((c.to_plain(0, 0.5).unwrap() - 0.5).abs() < 1e-6, "old curve still used");
+        assert_eq!(c.step(1, Duration::MAX, |_, n| Some(10.0 * n)), 1);
+        assert!((c.to_plain(0, 0.5).unwrap() - 5.0).abs() < 1e-5);
+        assert!((c.to_plain(1, 0.5).unwrap() - 0.5).abs() < 1e-6, "second not re-sampled yet");
+        assert_eq!(c.step(1, Duration::MAX, |_, n| Some(10.0 * n)), 1);
+        assert!((c.to_plain(1, 0.5).unwrap() - 5.0).abs() < 1e-5);
+        assert_eq!((c.curves_sampled(), c.step(8, Duration::MAX, |_, n| Some(n))), (2, 0));
+        assert_ne!(c.generation(), g);
     }
 
     #[test]
